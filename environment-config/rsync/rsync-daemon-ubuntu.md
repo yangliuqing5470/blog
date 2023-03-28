@@ -67,5 +67,5 @@ sudo systemctl start rsync.service
 
 # 使用示例
 ```bash
-rsync <src_path> <des_ip>::rsyncdata
+rsync -av <src_path> <des_ip>::rsyncdata
 ```
