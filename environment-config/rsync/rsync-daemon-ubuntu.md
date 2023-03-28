@@ -11,7 +11,7 @@ sudo vim /etc/default/rsync
 
 RSYNC_ENABLE=true  # false to true
 ```
-## 查看查看服务启动配置
+## 查看服务启动配置
 ```bash
 cat /lib/systemd/system/rsync.service
 
@@ -30,6 +30,7 @@ WantedBy=multi-user.target
 
 ## 配置文件`rsyncd.conf`
 配置文件说明--[官方文档](https://download.samba.org/pub/rsync/rsyncd.conf.5)
+<br>
 配置文件有三类: 注释, 参数, 模块
 + `#`表示注释;
 + 参数的格式: `name = value`;
