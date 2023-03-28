@@ -13,7 +13,7 @@ RSYNC_ENABLE=true  # false to true
 ```
 
 # 配置文件`rsyncd.conf`
-## 配置文件说明(官方文档)[https://download.samba.org/pub/rsync/rsyncd.conf.5]
+## 配置文件说明[官方文档](https://download.samba.org/pub/rsync/rsyncd.conf.5)
 配置文件有三类: 注释, 参数, 模块
 + `#`表示注释;
 + 参数的格式: `name = value`;
