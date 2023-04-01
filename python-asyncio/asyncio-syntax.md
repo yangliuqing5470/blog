@@ -59,7 +59,7 @@ Traceback (most recent call last):
 StopIteration
 ```
 协程有四个状态，当前状态可以使用`inspect.getgeneratorstate`函数查看
-- 'GEN_CREATED': 等待开始执行；
+- `GEN_CREATED`: 等待开始执行；
 - `GEN_RUNNING`: 正在执行；
 - `GEN_SUSPENDED`: 在`yield`处暂停；
 - `GEN_CLOSED`: 执行结束;
