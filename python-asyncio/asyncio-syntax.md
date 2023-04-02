@@ -255,3 +255,68 @@ Start ---
 >>> g.close()
 Get GeneratorExit
 ```
+
+# yield from & @asyncio.coroutine
+## yield from
+`yield from x`对 x 对象做的第一件事是调用`iter(x)`获取迭代器，因此 x 可以是任何可迭代对象；<br>
+`yield from`的主要功能是打开双向通道，把最外层的调用方与最内层的子生成器连接起来，二者可以直接发送和
+产出值，还可以直接传入异常；相关术语如下：
+- 委派生成器：包含`yield from <iterable>`表达式的**生成器函数**
+- 子生成器：从表达式`<iterable>`获取的生成器
+
+```python
+from collections import namedtuple
+Result = namedtuple("Result", "count average")
+
+# 子生成器
+def average():
+    total = 0.0
+    count = 0
+    average = None
+    while True:
+        term = yield
+        if term is None:
+            break
+        total += term
+        count += 1
+        average = total / count
+    return Result(count, average)
+
+# 委派生成器
+def grouper(result, key):
+    while True:
+        print("Start one grouper")
+        result[key] = yield from average()
+
+# 调用方(驱动方)
+def main(data):
+    result = {}
+    for key, values in data.items():
+        group = grouper(result, key)
+        next(group)
+        for value in values:
+            group.send(value)
+        group.send(None)  # 重要
+    print(result)
+
+data = {
+    "boys;kg": [39.0, 40.8, 28.2],
+    "girls:kg": [30.2, 26.3, 27.9]
+}
+
+if __name__ == "__main__":
+    main(data)
+
+----------------------------------
+➜  Workspace python3 test_run.py
+Start one grouper
+Start one grouper
+Start one grouper
+Start one grouper
+{'boys;kg': Result(count=3, average=36.0), 'girls:kg': Result(count=3, average=28.133333333333336)}
+# 注释调 main 函数中 group.send(None)
+➜  Workspace python3 test_run.py
+Start one grouper
+Start one grouper
+{}
+```
