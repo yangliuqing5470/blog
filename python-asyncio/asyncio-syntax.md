@@ -264,6 +264,11 @@ Get GeneratorExit
 - 委派生成器：包含`yield from <iterable>`表达式的**生成器函数**
 - 子生成器：从表达式`<iterable>`获取的生成器
 
+`yield from`语法功能：
+- `yield from <iterable>`会等子生成器(<iterable>)结束，如果子生成器不终止，则`yield from`会永远暂停；
+- `yield from`表达式的值是子生成器终止时传给`StopIteration`异常的第一个参数；
+
+**生成器退出时，会触发`StopIteration`异常** <br>
 ```python
 from collections import namedtuple
 Result = namedtuple("Result", "count average")
