@@ -460,3 +460,26 @@ Start one grouper
 Get GeneratorExit
 main end
 ```
+
+## @asyncio.coroutine
+`@asyncio.coroutine`装饰的函数显示被声明是一个协程(本质上是一个生成器对象) <br>
+直接调用协程不会执行，而是返回一个协程对象，需要通过外部`send`函数驱动执行 <br>
+```python
+>>> @asyncio.coroutine
+... def fun():
+...     print("hello")
+... 
+<stdin>:2: DeprecationWarning: "@coroutine" decorator is deprecated since Python 3.8, use "async def" instead
+>>> a = fun()
+>>> a
+<generator object fun at 0x7f4646fb8ba0>
+>>> a.send(None)
+hello
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+StopIteration
+```
+**目前介绍的协程相关都是基于生成器实现(`send`, `yield from`用来增强生成器，便于更好实现协程)**
+
+# async & await
+`async`代替`@asyncio.coroutine`，`await`代替`yield from`，从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分
