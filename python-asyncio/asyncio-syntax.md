@@ -325,3 +325,138 @@ Start one grouper
 Start one grouper
 {}
 ```
+
+`yield from`与异常和终止有关的行为
+- 传入委派生成器的异常，除了`GeneratorExit`异常(close函数抛出)，其他都传给子生成器的`throw`函数；如果子生成器调用`throw`抛出`StopIteration`异常(生成器正常退出)，委派生成器
+恢复运行，`StopIteration`之外的其它异常会传给委派生成器
+- 如果将`GeneratorExit`异常传入委派生成器，或者在委派生成器中调用`close`函数，那么在子生成器上调用`close`函数(如果有的话)，若`close`函数导致异常抛出，则会传给委派生成器；
+若子生成器调用`close`函数不抛出异常(被捕获)，那么委派生成器抛出`GeneratorExit`异常
+
+```python
+# 子生成器捕获异常并正常退出(抛出 StopIteration 异常) -- 委托生成器恢复运行
+from collections import namedtuple
+
+Result = namedtuple("Result", "count average")
+
+# 子生成器--捕获异常
+def average():
+    total = 0.0
+    count = 0
+    average = None
+    while True:
+        # term = yield "test"   # 不捕获异常
+        try:
+            term = yield "test" # 捕获异常
+        except:
+            print("Catch throw exception.")
+            term = None
+        if term is None:
+            break
+        total += term
+        count += 1
+        average = total / count
+    return Result(count, average)
+
+# 委派生成器
+def grouper(result, key):
+    while True:
+        print("Start one grouper")
+        result[key] = yield from average()
+
+# 调用throw抛出异常的驱动方
+def main_throw(data):
+    result = {}
+    for key, _ in data.items():
+        group = grouper(result, key)
+        next(group)
+        res = group.throw(Exception, "Need Exit.")
+        print(res)
+        break
+    print("main end")
+
+data = {
+    "boys;kg": [39.0, 40.8, 28.2],
+    "girls:kg": [30.2, 26.3, 27.9]
+}
+
+if __name__ == "__main__":
+    main_throw(data)
+
+-------------------------------------------
+➜  Workspace python3 test_run.py
+Start one grouper
+Catch throw exception.
+Start one grouper
+test
+main end
+Catch throw exception.  # 这里是python垃圾回收子生成器输出的
+-------------------------------------------
+
+# 子生成器不捕获异常--异常向上传递
+➜  Workspace python3 test_run.py
+Start one grouper
+Traceback (most recent call last):
+  File "test_run.py", line 42, in <module>
+    main_throw(data)
+  File "test_run.py", line 31, in main_throw
+    res = group.throw(Exception, "Need Exit.")
+  File "test_run.py", line 23, in grouper
+    result[key] = yield from average()
+  File "test_run.py", line 11, in average
+    term = yield "test"
+Exception: Need Exit.
+```
+```python
+# 子生成器不捕获close函数抛出的异常
+from collections import namedtuple
+Result = namedtuple("Result", "count average")
+
+# 子生成器--不捕获异常
+def average():
+    total = 0.0
+    count = 0
+    average = None
+    while True:
+        term = yield "test"
+        if term is None:
+            break
+        total += term
+        count += 1
+        average = total / count
+    return Result(count, average)
+
+# 委派生成器
+def grouper(result, key):
+    while True:
+        print("Start one grouper")
+        result[key] = yield from average()
+
+# 调用close抛出异常的驱动方
+def main_close(data):
+    result = {}
+    for key, _ in data.items():
+        group = grouper(result, key)
+        next(group)
+        group.close()  # 传入 GeeneratorExit 异常给委派生成器
+        break
+    print("main end")
+
+data = {
+    "boys;kg": [39.0, 40.8, 28.2],
+    "girls:kg": [30.2, 26.3, 27.9]
+}
+
+if __name__ == "__main__":
+    main_close(data)
+
+----------------------------------------
+➜  Workspace python3 test_run.py
+Start one grouper
+main end
+---------------------------------------
+# 子生成器捕获close的异常
+➜  Workspace python3 test_run.py
+Start one grouper
+Get GeneratorExit
+main end
+```
