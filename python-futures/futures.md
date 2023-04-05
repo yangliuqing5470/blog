@@ -8,7 +8,7 @@
 
 `Future` 表示一个未来的结果，在任务刚提交开始执行的时候(主线程的工作)，这个结果是空的，等任务异步(例如通过子线程)执行完后，子线程会将任务执行结果填充这个 `Future`，这样主线程可以通过 `Future` 获取结果。可以将 `Future` 看成是主线程和子线程通信的媒介。
 
-<img src="../images/python-futures/image-20221007132036991.png" alt="image-20221007132036991" style="zoom:50%;" />
+![](https://github.com/yangliuqing5470/blog/tree/master/python-futures/images/python-futures)
 
 在 python 中的 concurrent.futures 库中 `Future` 的实现主要包含如下功能
 
