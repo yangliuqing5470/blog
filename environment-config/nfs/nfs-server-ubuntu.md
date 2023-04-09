@@ -17,7 +17,7 @@ sudo apt-get install nfs-common
 ## 服务端
 ### 创建共享目录
 ```bash
-mkdir -p ~/nfs-share
+mkdir -p ~/Workspace
 ```
 ### 修改配置文件
 打开配置文件
@@ -44,6 +44,31 @@ sudo systemctl start nfs-kernel-server.service
 ```
 每次修改配置文件`/etc/exports`不需要重启服务，调用命令`sudo exportfs -r`即可
 
-
 ## 客户端
+### 查看NFS服务端共享信息
+```bash
+# 192.168.18.235 服务端的ip
+$ showmount -e 192.168.18.235
+Exports list on 192.168.18.235:
+/home/parallels/Workspace           192.168.18.0/24
+```
+### 客户端创建挂载的目录
+```bash
+mkdir -p ~/Workspace/Ubuntu20
+```
+### 挂载远程目录
+```bash
+sudo mount 192.168.18.235:/home/parallels/Workspace ~/Workspace/Ubuntu20
+```
+### 查看客户端挂载状态
+```bash
+$ df -h
+Filesystem                                 Size   Used  Avail Capacity iused      ifree %iused  Mounted
+......
+192.168.18.235:/home/parallels/Workspace   62Gi   14Gi   45Gi    24%  326861    3834675    8%   /Users/yangliuqing/Workspace/Yangliuqing/Ubuntu20
+```
+### 卸载挂载
+```bash
+sudo umount ~/Workspace/Ubuntu20
+```
 
