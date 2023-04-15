@@ -44,6 +44,12 @@ sudo systemctl start nfs-kernel-server.service
 ```
 每次修改配置文件`/etc/exports`不需要重启服务，调用命令`sudo exportfs -r`即可
 
+### 查看共享目录完整参数
+```bash
+➜  environment-config git:(master) cat /var/lib/nfs/etab
+/home/parallels/Workspace	192.168.18.0/24(rw,sync,wdelay,hide,nocrossmnt,insecure,root_squash,all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=1000,anongid=1000,sec=sys,rw,insecure,root_squash,all_squash)
+```
+
 ### 常用参数说明
 `exportfs`命令常用命令及参数
 - `exportfs -r`：重新导出所有共享目录，使得`/etc/exports`文件中的更改生效
