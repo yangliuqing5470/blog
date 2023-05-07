@@ -233,7 +233,7 @@ sudo systemctl restart smbd
 ## Linux 客户端
 使用`smbclient`命令来访问`samba`服务器上的共享资源，例如
 ```bash
-smbclient //servername/sharename
+smbclient //servername/sharename -U <samba-account>
 ```
 如果没有`smbclient`程序，需要安装
 ```bash
