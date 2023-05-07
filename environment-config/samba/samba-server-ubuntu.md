@@ -18,7 +18,7 @@ mkdir -p ~/Workspace/sambashare
 ## 修改配置文件
 配置文件的路径是`/etc/samba/smb.conf`，该文件包含多个段，每个段由段名开始，直到下个段名。每个段名
 放在方括号中间。每段的参数的格式是：`名称=值`。除了`[global]`段外，所有的段都可以看作是一个共享资
-源。段名是该共享资源的名字，段里的参数是该共享资源的属性。<br>
+源，段名是该共享资源的名字，段里的参数是该共享资源的属性。<br>
 
 ### Global Settings -- Browsing/Iedentification
 - `workgroup`：设定`samba`服务器所要加入的工作组或者域；
@@ -33,8 +33,7 @@ server string = %h server (Samba, Ubuntu)
 ### Global Settings -- Networking
 - `interfaces`：设置`samba`服务器监听哪些网卡，可以写网卡名，也可以写该网卡的`IP address/netmask`；
 - `bind interfaces only`：默认值是`yes`，确保`samba`服务只绑定到指定的接口；
-- hosts allow：表示允许连接到 Samba 服务器的客户端，多个参数以空格隔开。可以用一个 IP 表示，也可以
-用一个网段表示；
+- `hosts allow`：表示允许连接到`samba`服务器的客户端，多个参数以空格隔开。可以用一个`IP`或一个网段表示；
 
 配置样例
 ```bash
@@ -53,11 +52,10 @@ bind interfaces only = yes
     link/ether 02:42:ce:9e:f4:07 brd ff:ff:ff:ff:ff:ff
 ```
 ### Global Settings -- Debugging
-- `log file`：设置`samba`服务器日志文件的存储位置以及日志文件名称；
-- `max log size`：设置`samba`服务器日志文件的最大容量，单位为`kB`，`0`代表不限制；
+- `log file`：设置`samba`服务日志文件的存储位置以及日志文件名称；
+- `max log size`：设置`samba`服务日志文件的最大容量，单位为`kB`，`0`代表不限制；
 - `log level`：指定日志记录的详细程度。值越高，记录的信息就越详细。默认值为`0`，表示仅记录关键信息；
-- `panic action`：指定当`samba`服务器发生严重错误（例如崩溃）时要执行的操作。可以使用此配置项来
-运行脚本或命令；
+- `panic action`：指定`samba`服务发生严重错误（例崩溃）时要执行的操作，使用此配置项来运行脚本或命令；
 - `logging`：指定日志的类型；
 
 配置样例
@@ -73,12 +71,12 @@ logging = file
 panic action = /usr/local/bin/samba-panic-action %d
 ```
 ### Global Settings -- Authentication, Domains, Misc
-- `server role`：指定`samba`服务的模式，`server role = standalone server`，`samba`服务将作为
-一个独立的服务器运行，不加入任何域或目录；`server role` = member server`，`samba`服务将加入
-一个`Windows`域或`Active Directory`域，并作为域中的一个成员服务运行；`server role = classic primary domain controller`，
-`samba`服务将作为一个经典的`Windows NT4`风格的主域控制器运行；`server role = classic backup domain controller`，
-`samba`服务将作为一个经典的`Windows NT4`风格的备份域控制器运行；`server role = active directory domain controller`，
-`samba`服务将作为一个 Active Directory 域控制器运行；
+- `server role`：指定`samba`服务的模式 <br>
+`server role = standalone server`，`samba`服务将作为一个独立的服务运行，不加入任何域或目录；<br>
+`server role = member server`，`samba`服务将加入一个`Windows`域或`Active Directory`域，并作为域中的一个成员服务运行；<br>
+`server role = classic primary domain controller`，`samba`服务将作为一个经典的`Windows NT4`风格的主域控制器运行；<br>
+`server role = classic backup domain controller`，`samba`服务将作为一个经典的`Windows NT4`风格的备份域控制器运行；<br>
+`server role = active directory domain controller`，`samba`服务将作为一个`Active Directory`域控制器运行；<br>
 - `obey pam restrictions`：指定`samba`服务是否遵守`PAM`（可插拔认证模块）限制，`PAM`是一种用于管理
 应用程序身份验证的模块化框架。它允许系统管理员通过配置文件来控制应用程序如何处理身份验证请求；
 - `unix password sync`：指定`samba`服务是否将用户的`samba`密码与其`UNIX`密码同步。如果设置
@@ -87,11 +85,11 @@ panic action = /usr/local/bin/samba-panic-action %d
 - `passwd chat`：指定`samba`服务与`passwd program`程序之间的交互方式；
 - `pam password change`：指定`samba`服务是否使用`PAM`（可插拔认证模块）来更改用户的`UNIX`密码，如
 果设置为`yes`，则当用户更改其`samba`密码时，`samba`服务将使用`PAM`来更新用户的`UNIX`密码；
-- `map to guest`：指定如何将未经身份验证的用户映射到一个匿名账户，`map to guest = never`，从不将
-未经身份验证的用户映射到匿名账户；`map to guest = bad user`，仅当用户名不存在时，才将未经身份验证
-的用户映射到匿名账户；`map to guest = bad password`，仅当用户名存在但密码错误时，才将未经身份验证
-的用户映射到匿名账户；`map to guest = bad uid`，仅当用户名存在但`UID`无效时，才将未经身份验证的用
-户映射到匿名账户；
+- `map to guest`：指定如何将未经身份验证的用户映射到一个匿名账户 <br>
+`map to guest = never`，从不将未经身份验证的用户映射到匿名账户；<br>
+`map to guest = bad user`，仅当用户名不存在时，才将未经身份验证的用户映射到匿名账户；<br>
+`map to guest = bad password`，仅当用户名存在但密码错误时，才将未经身份验证的用户映射到匿名账户；<br>
+`map to guest = bad uid`，仅当用户名存在但`UID`无效时，才将未经身份验证的用户映射到匿名账户；<br>
 
 配置样例
 ```bash
@@ -230,7 +228,7 @@ sudo systemctl restart smbd
 
 # 客户端访问共享资源
 ## Windows 客户端
-在“资源管理器”中输入`\\servername\sharename`来访问`samba`服务上名为`sharename`的共享资源，
+在***资源管理器***中输入`\\servername\sharename`来访问`samba`服务上名为`sharename`的共享资源，
 其中，`servername`是`samba`服务器的主机名或`IP`地址
 
 ## Linux 客户端
@@ -244,5 +242,5 @@ sudo apt-get update & sudo apt-get install smbclient
 ```
 
 ## macOS 客户端
-在“访达”中选择“前往”>“连接服务器”，然后输入`smb://servername/sharename`来访问`samba`服务器上
+在***访达***中选择***前往***>***连接服务器***，然后输入`smb://servername/sharename`来访问`samba`服务器上
 的共享资源
