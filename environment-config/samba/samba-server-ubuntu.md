@@ -107,9 +107,6 @@ pam password change = yes
 
 map to guest = bad user
 ```
-
-`Domains`相关参数只有`server role`设置为相关域模式才会生效；<br>
-
 - `usershare path`：指定用于存储用户共享定义的目录，此目录必须存在，并且`samba`用
 户（通常是`nobody`）必须具有对其的写入权限；
 - `usershare max shares`：指定每个用户最多可以创建多少个用户共享；默认值为`0`，表示禁用用户共享功能；
@@ -121,6 +118,8 @@ usershare path = /home/parallels/Workspace/sambashare/usershares
 usershare max shares = 100
 usershare allow guests = yes
 ```
+
+`Domains`相关参数只有`server role`设置为相关域模式才会生效；<br>
 
 ### Share Definitions
 只对当前的共享资源起作用，一些常见的`[Share]`配置项包括：
@@ -137,7 +136,7 @@ usershare allow guests = yes
 ```bash
 [sambashare]
 comment = Samba Share Directory
-path = /home/parallels/Workspace/sambashare/usershares
+path = /home/parallels/Workspace/sambashare
 read only = no
 writable = yes
 browseable = yes
@@ -173,13 +172,13 @@ Press enter to see a dump of your service definitions
 	server string = %h server (Samba, Ubuntu)
 	unix password sync = Yes
 	usershare allow guests = Yes
-	usershare path = /home/parallels/Workspace/sambashare
+	usershare path = /home/parallels/Workspace/sambashare/usershares
 	idmap config * : backend = tdb
 
 
 [sambashare]
 	comment = Samba Share Directory
-	path = /home/parallels/Workspace/sambashare/usershares
+	path = /home/parallels/Workspace/sambashare
 	read only = No
 	valid users = @samba-user
 ```
