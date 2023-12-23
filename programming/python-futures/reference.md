@@ -68,7 +68,7 @@ print(my_queue.__dict__)
 
 `Multiprocessing.Queue`实现原理如下
 
-<img src="https://github.com/yangliuqing5470/blog/blob/master/python-futures/images/image-20221019224239247.png?raw=true" alt="multiprocessing-queue" style="width:50%;" />
+<img src="https://github.com/yangliuqing5470/blog/blob/master/programming/python-futures/images/image-20221019224239247.png?raw=true" alt="multiprocessing-queue" style="width:50%;" />
 
 实现源码如下
 

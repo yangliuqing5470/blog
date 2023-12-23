@@ -1,6 +1,6 @@
 # 进程池
 
-<img src="https://github.com/yangliuqing5470/blog/blob/master/python-futures/images/image-20221011220341438.png?raw=true" alt="process-pool" style="width:60%;" />
+<img src="https://github.com/yangliuqing5470/blog/blob/master/programming/python-futures/images/image-20221011220341438.png?raw=true" alt="process-pool" style="width:60%;" />
 
 ## 进程执行器
 

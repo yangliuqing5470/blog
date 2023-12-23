@@ -2,7 +2,7 @@
 
 主线程和子线程的交互分为两部分，第一个部分是主线程如何将任务提交给子线程，第二部分是子线程如何将任务执行结果传递给主线程；其中第二部分是通过 `Future` 对象实现，第一部分则通过任务队列实现。
 
-<img src="https://github.com/yangliuqing5470/blog/blob/master/python-futures/images/image-20221007154407377.png?raw=true" alt="thread-pool" style="width:50%;" />
+<img src="https://github.com/yangliuqing5470/blog/blob/master/programming/python-futures/images/image-20221007154407377.png?raw=true" alt="thread-pool" style="width:50%;" />
 
 需要注意的是，此任务队列没有上限，也就是任务队列长度可以无限增加，最终可能导致 OOM。
 
