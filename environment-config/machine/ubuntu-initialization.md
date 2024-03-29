@@ -36,9 +36,12 @@ sudo apt-get install build-essential
 # curl
 sudo apt-get install curl
 # node
-sudo apt-get install nodejs
+curl -sL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt-get install nodejs -y
 # npm
 sudo apt-get install npm
+# ripgrep
+sudo apt-get install ripgrep
 ```
 
 ## 安装 terminator 终端
