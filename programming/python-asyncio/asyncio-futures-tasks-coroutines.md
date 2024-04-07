@@ -1,4 +1,7 @@
 # 引言
+在 [协程&生成器基础语法](./asyncio-syntax.md) 中我们介绍了生成器和协程的语法原理，
+本章我们开始介绍 asyncio 库`Tasks`、`Futures`和`Coroutines`相关原理。
+
 ![asyncio基本框架](./images/asyncio抽象框架.png)
 Asyncio 库的核心是事件循环，调度的基本单位是`Task`，`Task` 是一个`Future` 的
 子类；在异步编程中，`Future` 一般用来表示未来结果对象 (可以理解为表示未来结果
