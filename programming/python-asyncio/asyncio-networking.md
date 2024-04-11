@@ -131,10 +131,96 @@ def _sock_read_done(self, fd, fut, handle=None):
     if handle is None or not handle.cancelled():
         self.remove_reader(fd)
 ```
-`sock_accept`内部会创建一个 Future 对象表示未来执行的结果，当新的连接建立后，会更新此 Future 结果以通知上层调用继续执行。
+`sock_accept`内部会添加`_sock_read_done`完成回调，确保在取消、异常或者成功都将
+注册的监听 sock 移除。为什么要移除呢？个人理解是：
++ 保证 socket API 幂等性，也就是说每次调用 `sock_accept`，
+执行的流程应该和第一次调用一样，不能因为上次调用而影响本次内部执行逻辑的变化。
+具体来说每次调用，`_add_reader`都是执行注册，而不是修改逻辑。
++ 不仅仅是`sock_accept`，下面介绍其它异步接口都有这个特性。
+
 继续看`sock_connect`的源码：
 ```python
+async def sock_connect(self, sock, address):
+    """Connect to a remote socket at address.
 
+    This method is a coroutine.
+    """
+    # 如果是 ssl socket 则抛出异常
+    base_events._check_ssl_socket(sock)
+    if self._debug and sock.gettimeout() != 0:
+        raise ValueError("the socket must be non-blocking")
+
+    if sock.family == socket.AF_INET or (
+            base_events._HAS_IPv6 and sock.family == socket.AF_INET6):
+        # DNS 解析，获取 ip + port
+        resolved = await self._ensure_resolved(
+            address, family=sock.family, type=sock.type, proto=sock.proto,
+            loop=self,
+        )
+        _, _, _, _, address = resolved[0]
+
+    # 创建一个 Future 对象，表示此操作未来结果
+    fut = self.create_future()
+    self._sock_connect(fut, sock, address)
+    try:
+        return await fut
+    finally:
+        # Needed to break cycles when an exception occurs.
+        fut = None
+
+def _sock_connect(self, fut, sock, address):
+    fd = sock.fileno()
+    try:
+        sock.connect(address)
+    except (BlockingIOError, InterruptedError):
+        # Issue #23618: When the C function connect() fails with EINTR, the
+        # connection runs in background. We have to wait until the socket
+        # becomes writable to be notified when the connection succeed or
+        # fails.
+        # 确保当前的 sock 没有绑定 在运行的 transport 对象
+        self._ensure_fd_no_transport(fd)
+        # 走到这里表示连接还没有完成，将连接 socket 注册到 epoll/iocp/select/... 可写事件
+        handle = self._add_writer(
+            fd, self._sock_connect_cb, fut, sock, address)
+        fut.add_done_callback(
+            functools.partial(self._sock_write_done, fd, handle=handle))
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        # 设置异常，传递给上层调用
+        fut.set_exception(exc)
+    else:
+        # 连接成功，设置 sock_connect 操作结果以通知上层调用恢复执行
+        fut.set_result(None)
+    finally:
+        fut = None
+
+def _sock_write_done(self, fd, fut, handle=None):
+    if handle is None or not handle.cancelled():
+        self.remove_writer(fd)
+
+def _sock_connect_cb(self, fut, sock, address):
+    if fut.done():
+        return
+
+    try:
+        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if err != 0:
+            # Jump to any except clause below.
+            raise OSError(err, f'Connect call failed {address}')
+    except (BlockingIOError, InterruptedError):
+        # socket is still registered, the callback will be retried later
+        pass
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        # 设置异常，传递给上层调用
+        fut.set_exception(exc)
+    else:
+        # 连接成功，设置 sock_connect 操作结果以通知上层调用恢复执行
+        fut.set_result(None)
+    finally:
+        fut = None
 ```
 
 # Transport&Prorocols
