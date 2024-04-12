@@ -135,7 +135,7 @@ def _sock_read_done(self, fd, fut, handle=None):
 注册的监听 sock 移除。为什么要移除呢？个人理解是：
 + 保证 socket API 幂等性，也就是说每次调用 `sock_accept`，
 执行的流程应该和第一次调用一样，不能因为上次调用而影响本次内部执行逻辑的变化。
-具体来说每次调用，`_add_reader`都是执行注册，而不是修改逻辑。
+具体来说每次调用`_add_reader`都是执行注册，而不是修改。
 + 不仅仅是`sock_accept`，下面介绍其它异步接口都有这个特性。
 
 继续看`sock_connect`的源码：
@@ -222,6 +222,162 @@ def _sock_connect_cb(self, fut, sock, address):
     finally:
         fut = None
 ```
+`sock_connect`首先会执行 dns 解析以获取 ip + port(ipv4)，dns 解析调用`_ensure_resolved`方法，源码如下：
+```python
+async def _ensure_resolved(self, address, *,
+                           family=0, type=socket.SOCK_STREAM,
+                           proto=0, flags=0, loop):
+    host, port = address[:2]
+    # 如果 host 已经是一个IP地址，则跳过 getaddrinfo 执行
+    info = _ipaddr_info(host, port, family, type, proto, *address[2:])
+    if info is not None:
+        # "host" is already a resolved IP.
+        return [info]
+    else:
+        return await loop.getaddrinfo(host, port, family=family, type=type,
+                                      proto=proto, flags=flags)
+
+# loop.getaddrinfo
+async def getaddrinfo(self, host, port, *,
+                      family=0, type=0, proto=0, flags=0):
+    if self._debug:
+        getaddr_func = self._getaddrinfo_debug
+    else:
+        getaddr_func = socket.getaddrinfo
+
+    return await self.run_in_executor(
+        None, getaddr_func, host, port, family, type, proto, flags)
+
+def run_in_executor(self, executor, func, *args):
+    self._check_closed()
+    if self._debug:
+        self._check_callback(func, 'run_in_executor')
+    if executor is None:
+        executor = self._default_executor
+        # Only check when the default executor is being used
+        # 如果执行器已经 shutdown 则抛出异常
+        self._check_default_executor()
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                thread_name_prefix='asyncio'
+            )
+            self._default_executor = executor
+    # 将 concurrent.futures.Future 对象包装为 asyncio.Future 对象并返回
+    return futures.wrap_future(
+        executor.submit(func, *args), loop=self)
+```
+由于`socket.getaddrinfo`是阻塞的方法，为了避免其阻塞整个事件循环，需要将其放到`run_in_executor`中执行，`run_in_executor`
+内部使用一个线程池，返回一个`Asyncio.Future`可等待对象。<br>
+
+数据交互涉及的方法有`sock_sendall`、`sock_recv`等。先看`sock_sendall`，相关源码如下：
+```python
+async def sock_sendall(self, sock, data):
+    """Send data to the socket.
+
+    The socket must be connected to a remote socket. This method continues
+    to send data from data until either all data has been sent or an
+    error occurs. None is returned on success. On error, an exception is
+    raised, and there is no way to determine how much data, if any, was
+    successfully processed by the receiving end of the connection.
+    """
+    _check_ssl_socket(sock)
+    if self._debug and sock.gettimeout() != 0:
+        raise ValueError("the socket must be non-blocking")
+    try:
+        # 先尝试发送，如果发送部分数据(发送缓存区有空闲空间)或者发送缓存区满，则执行下面当注册回调机制
+        n = sock.send(data)
+    except (BlockingIOError, InterruptedError):
+        # 遇到发送缓冲区满
+        n = 0
+
+    if n == len(data):
+        # all data sent
+        return
+
+    fut = self.create_future()
+    fd = sock.fileno()
+    self._ensure_fd_no_transport(fd)
+    # use a trick with a list in closure to store a mutable state
+    # 往 epoll/iocp/select 等注册此 sock 写事件，当发送缓存区空闲时候触发 self._sock_sendall
+    handle = self._add_writer(fd, self._sock_sendall, fut, sock,
+                              memoryview(data), [n])
+    fut.add_done_callback(
+        functools.partial(self._sock_write_done, fd, handle=handle))
+    return await fut
+
+def _sock_sendall(self, fut, sock, view, pos):
+    if fut.done():
+        # Future cancellation can be scheduled on previous loop iteration
+        return
+    start = pos[0]
+    try:
+        n = sock.send(view[start:])
+    except (BlockingIOError, InterruptedError):
+        # 遇到发送缓存区满，什么都不做，等下次执行，因为此 sock 还在监听中
+        return
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        fut.set_exception(exc)
+        return
+
+    start += n
+
+    if start == len(view):
+        fut.set_result(None)
+    else:
+        pos[0] = start
+```
+接下来看下`sock_recv`，相关源码如下：
+```python
+async def sock_recv(self, sock, n):
+    """Receive data from the socket.
+
+    The return value is a bytes object representing the data received.
+    The maximum amount of data to be received at once is specified by
+    nbytes.
+    """
+    _check_ssl_socket(sock)
+    if self._debug and sock.gettimeout() != 0:
+        raise ValueError("the socket must be non-blocking")
+    try:
+        # 先尝试接收，如果接收缓存区有数据，立刻返回；如果接收缓存区为空，执行下面等监听注册回调机制
+        return sock.recv(n)
+    except (BlockingIOError, InterruptedError):
+        # 接收缓存区为空
+        pass
+    fut = self.create_future()
+    fd = sock.fileno()
+    self._ensure_fd_no_transport(fd)
+    # 往 epoll/iocp/select 等注册此 sock 读事件，当接收缓存区有数据时候触发 self._sock_recv
+    handle = self._add_reader(fd, self._sock_recv, fut, sock, n)
+    fut.add_done_callback(
+        functools.partial(self._sock_read_done, fd, handle=handle))
+    return await fut
+
+def _sock_read_done(self, fd, fut, handle=None):
+    if handle is None or not handle.cancelled():
+        self.remove_reader(fd)
+
+def _sock_recv(self, fut, sock, n):
+    # _sock_recv() can add itself as an I/O callback if the operation can't
+    # be done immediately. Don't use it directly, call sock_recv().
+    if fut.done():
+        return
+    try:
+        data = sock.recv(n)
+    except (BlockingIOError, InterruptedError):
+        # 接收缓存区空，什么都不做，等下次调用，因为此sock 还是监听中，没有移除
+        return  # try again next time
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        fut.set_exception(exc)
+    else:
+        fut.set_result(data)
+```
+asyncio 库也实现了`sock_recv_info`和`sock_sendfile`，原理和上面介绍的 sock_xxx 类似。了解了相关异步 socket API 的实现
+原理，我们回过头看上面介绍的异步编程服务端和客户端的执行流程。首先介绍**服务端执行流程**：
 
 # Transport&Prorocols
 

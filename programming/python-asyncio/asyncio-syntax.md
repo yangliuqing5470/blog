@@ -482,4 +482,80 @@ StopIteration
 **目前介绍的协程相关都是基于生成器实现(`send`, `yield from`用来增强生成器，便于更好实现协程)**
 
 # async & await
-`async`代替`@asyncio.coroutine`，`await`代替`yield from`，从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分
+`async`代替`@asyncio.coroutine`，`await`代替`yield from`，从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分。
+`await`后面对象可以是一个**协程**或者实现`__await__`方法的**可等待对象**。例如 asyncio 库实现的 Future 就是一个可等待对象，
+其实现的`__await__`源码如下：
+```python
+def __await__(self):
+    if not self.done():
+        self._asyncio_future_blocking = True
+        yield self  # This tells Task to wait for completion.
+    if not self.done():
+        raise RuntimeError("await wasn't used with future")
+    return self.result()  # May raise too.
+```
+通过一个例子看下`async/await`的使用：
+```python
+import asyncio
+
+async def fun():
+    loop = asyncio.get_event_loop()
+    # 创建一个 Future 可等待对象
+    fut = loop.create_future()
+    print("fut: ", fut)
+    res = await fut
+    # res = await run()
+    print("res: ", res)
+    return res
+
+async def run():
+    # 一个直接 return 的协程
+    return "hello"
+
+def main():
+    coro = fun()
+    print(coro)
+    # 开始驱动协程运行
+    coro_res = coro.send(None)
+    print("coro_res: ", coro_res)
+    # 下面三行针对 await fut，如果是 await run 则注释掉
+    coro_res.set_result("world")
+    # 继续驱动协程运行
+    coro_res = coro.send(None)
+    print("main end")
+
+
+if __name__ == "__main__":
+    main()
+```
+执行结果如下：
+```bash
+# await fut
+$ python3 test.py
+<coroutine object fun at 0x7fb59c2de840>
+fut:  <Future pending>
+# 第一次驱动运行结果，返回结果是创建的 Future 对象（根据 Future 实现的 __await__ 源码知，第一次驱动执行到
+# yield self， 所以 coro.send(None) 的结果就是 self，也即是创建的  Future 对象）
+coro_res:  <Future pending>
+# 第二次驱动运行结果
+res:  world
+Traceback (most recent call last):
+  File "test.py", line 27, in <module>
+    main()
+  File "test.py", line 22, in main
+    coro_res = coro.send(None)
+StopIteration: world
+
+# await run()
+$ python3 test.py
+<coroutine object fun at 0x7fa16c2de8c0>
+fut:  <Future pending>
+# 第一次驱动执行结果，由于协程 run() 直接 return，所以这里就直接结束
+res:  hello
+Traceback (most recent call last):
+  File "test.py", line 27, in <module>
+    main()
+  File "test.py", line 18, in main
+    coro_res = coro.send(None)
+StopIteration: hello
+```
