@@ -510,31 +510,31 @@ main_coro cost 8.061261653900146s
 ```
 main_task 4个任务是并行运行，耗时2s，而 main_coro 4个协程是串行运行，耗时8s。<br>
 **main_coro 的执行流程如下：**
-1. aysncio.run(main_coro()) 首先将协程 main_coro 包装为一个`Task`给事件循环调度，
-此时事件循环就绪队列只有 main_coro_task.__step 一个 handle
-2. 事件循环从就绪队列取出 main_coro_task.__step 开始执行，直到第一次遇到
-`asyncio.sleep(1)`，`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 handle，
-并返回一个`Future`，此时当前任务 (main_coro_task) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
-把控制权从新交给事件循环，但由于此时就绪队列为空 (1s 时间还没到)，事件循环会等待
-3. 1s 时间到后，事件循环就绪队列会有`futures._set_result_unless_cancelled`的可执行 handle，
++ `aysncio.run(main_coro())` 首先将协程 `main_coro` 包装为一个`Task`给事件循环调度，
+此时事件循环就绪队列只有 `main_coro_task.__step` 一个 `handle`。
++ 事件循环从就绪队列取出`main_coro_task.__step`开始执行，直到第一次遇到`asyncio.sleep(1)`，
+`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 `handle`，
+并返回一个`Future`，此时当前任务 (`main_coro_task`) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
+把控制权从新交给事件循环，但由于此时就绪队列为空 (1s 时间还没到)，事件循环会等待。
++ 1s 时间到后，事件循环就绪队列会有`futures._set_result_unless_cancelled`的可执行 `handle`，
 方法`futures._set_result_unless_cancelled` 会被调用，将第 2 步返回的`Future` 设置
 结果，根据`Future.set_result`源码可知，此时注册的回调函数`Tasks.__wakeup`会被调用，
-继续下个for循环，依次类推
+继续下个 for 循环。
 
 **main_task 的执行流程如下：**
-1. aysncio.run(main_task()) 首先将协程 main_task 包装为一个`Task`给事件循环调度，
-此时事件循环就绪队列只有 main_task_task.__step 一个 handle
-2. 事件循环从就绪队列取出 main_task_task.__step 开始执行，`asyncio.create_task(counter)`
-会将协程 counter 包装为`Task`，此时有事件循环中有 5 个`Task` (一个 main_task，4个 counter)，事件循环就绪队列有 4 个
-Task(counter("task{}")).__step 的 handle。直到第一次遇到 await task，await task 会返回一个`Future`
-类，此时当前任务 (main_task_task) 会将返回的`Future`注册一个完成回调`__wakeup`，
-然后 把控制权从新交给事件循环
-3. 事件循环继续从就绪队列取出第一个 Task(counter("task{}")).__step 开始执行，直到第一次遇到
-`asyncio.sleep(1)`，`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 handle，
-并返回一个`Future`，此时当前任务 (Task(counter("task{}"))) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
-把控制权从新交给事件循环。事件循环继续处理后面的三个 Task(counter("task{}")).__step，此步可以认为
-4 个任务同时运行
-4. 1s 时间到后，事件循环就绪队列会有 4 个`futures._set_result_unless_cancelled`的可执行 handle，
++ `aysncio.run(main_task())` 首先将协程 `main_task` 包装为一个`Task`给事件循环调度，
+此时事件循环就绪队列只有 `main_task_task.__step` 一个 `handle`。
++ 事件循环从就绪队列取出 `main_task_task.__step` 开始执行，`asyncio.create_task(counter)`
+会将协程 `counter` 包装为`Task`，此时有事件循环中有 5 个`Task` (一个 `main_task`，4个 `counter`)，事件循环就绪队列有 4 个
+`Task(counter("task{}")).__step` 的 `handle`。直到第一次遇到 `await task`，`await task` 会返回一个`Future`
+类，此时当前任务 (`main_task_task`) 会将返回的`Future`注册一个完成回调`__wakeup`，
+然后 把控制权从新交给事件循环。
++ 事件循环继续从就绪队列取出第一个 `Task(counter("task{}")).__step` 开始执行，直到第一次遇到`asyncio.sleep(1)`，
+`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 `handle`，
+并返回一个`Future`，此时当前任务 (`Task(counter("task{}"))`) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
+把控制权从新交给事件循环。事件循环继续处理后面的三个 `Task(counter("task{}")).__step`，此步可以认为
+4 个任务同时运行。
++ 1s 时间到后，事件循环就绪队列会有 4 个`futures._set_result_unless_cancelled`的可执行`handle`，
 方法`futures._set_result_unless_cancelled` 会被调用，将第 3 步返回的`Future` 设置
 结果，根据`Future.set_result`源码可知，此时注册的回调函数`Tasks.__wakeup`会被调用，
-继续程序往下执行
+继续程序往下执行。

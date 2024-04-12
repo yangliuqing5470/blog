@@ -1,3 +1,6 @@
+# 引言
+针对网络编程，asyncio 库提供了底层`socket`接口，基于`socket`封装的`Transports&Protocols`
+以及基于`Transports&Protocols`封装的`Streams`三种方式。下面将分别介绍。
 # Socket
 基于 TCP 的 socket 编程一般流程如下：
 ![socket编程流程](./images/socket编程流程.png)
@@ -376,8 +379,37 @@ def _sock_recv(self, fut, sock, n):
     else:
         fut.set_result(data)
 ```
-asyncio 库也实现了`sock_recv_info`和`sock_sendfile`，原理和上面介绍的 sock_xxx 类似。了解了相关异步 socket API 的实现
-原理，我们回过头看上面介绍的异步编程服务端和客户端的执行流程。首先介绍**服务端执行流程**：
+asyncio 库也实现了`sock_recv_info`和`sock_sendfile`，原理和上面介绍的 sock_xxx 类似。
+下图总结了 sock_xxx 的执行流程：
+![sock_xxx 流程](./images/socket_xxx流程.png)
+了解了相关异步 socket API 的实现原理，我们回过头看上面介绍的异步编程服务端和客户端的执行流程
+首先介绍**服务端执行流程**：
++ 首先`asyncio.run(run_server())`会将协程`run_server()`包装为一个`Task`给事件
+循环调度，事件循环取出此时就绪队列中唯一的 `handle` （`Task`初始化时会添加）开始驱动协程`run_server()`
+执行。
++ 执行到`await loop.sock_accept(server)`时，若此时有已连接建立好的连接，则完成
+调用，开始往下执行；若此时还没建立好的连接，则协程阻塞在此处，并将控制权交给事件循环
+等操作`sock_accept`完成后，唤醒包含此协程的`Task`继续执行。
++ 继续执行到`loop.create_task(handle_client(client, addr))`会创建一个包含协程
+`handle_client(client, addr)`的新`Task`供事件循环调度，此时事件循环就绪队列
+会增加一个此`Task`的`handle`，继续执行到`await loop.sock_accept(server)`，
+若没有新的连接建立，则把控制权叫给事件循环，执行其他的任务。如果此时一直有新的
+连接建立，则永远不会把控制权交给事件循环，这是bug。
++ 假如事件循环有机会取出包含`handle_client`协程的`Task`的`handle`执行时，会执行
+到`await loop.sock_recv(client, 1024)`，如果此 socket 接收缓存区为空，则此协程
+阻塞在此处，将控制权交给事件循环，等接收缓存区有数据，则完成`sock_recv`操作，
+并唤醒包含此协程的`Task`继续执行；若此时接收缓存区有数据，则完成调用，直接返回，
+继续往下执行。一直执行到`await loop.sock_sendall(client, response.encode())`，
+若数据全部发生完成，则完成调用，继续往下执行；若数据没有全部发送完成，则阻塞在
+此处，把控制权交给事件循环，等数据全部发送完成，则唤醒包含此协程的`Task`继续执行。
+
+**客户端执行流程**：
++ 首先`asyncio.run(request())`会将协程`request()`包装为一个`Task`给事件
+循环调度，事件循环取出此时就绪队列中唯一的 `handle` （`Task`初始化时会添加）开始驱动协程`request()`
+执行。
++ 执行到`await`语句时，若后面的相关操作没有完成，会阻塞此处，并把控制权交给事件
+循环，等相关操作完成后，会唤醒包含此协程的`Task`继续执行（整个事件循环中只有一个任务）。
+
 
 # Transport&Prorocols
 
