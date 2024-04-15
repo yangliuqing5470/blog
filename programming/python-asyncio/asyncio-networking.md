@@ -1585,3 +1585,372 @@ async def _create_connection_transport(
 `Streams`的网络编程。
 
 # Streams
+基于`Transports&Protocols`，asyncio 实现了更高级别的`Streams`用于网络编程。`Streams`
+将基于回调和底层`Transports&Protocols`的异步网络编程模式转为同步编程模式，使得开发更加高效。
+下面是基于`Streams`实现的 TCP 服务端和客户端样例。<br>
+**服务端代码如下**：
+```python
+import asyncio
+
+async def handle_echo(reader, writer):
+    data = await reader.read(100)
+    message = data.decode()
+    addr = writer.get_extra_info('peername')
+
+    print(f"Received {message!r} from {addr!r}")
+
+    print(f"Send: {message!r}")
+    writer.write(data)
+    await writer.drain()
+
+    print("Close the connection")
+    writer.close()
+    await writer.wait_closed()
+
+async def main():
+    server = await asyncio.start_server(
+        handle_echo, '127.0.0.1', 8888)
+
+    addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
+    print(f'Serving on {addrs}')
+
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+```
+**客户端代码如下**：
+```python
+import asyncio
+
+async def tcp_echo_client(message):
+    reader, writer = await asyncio.open_connection(
+        '127.0.0.1', 8888)
+
+    print(f'Send: {message!r}')
+    writer.write(message.encode())
+    await writer.drain()
+
+    data = await reader.read(100)
+    print(f'Received: {data.decode()!r}')
+
+    print('Close the connection')
+    writer.close()
+    await writer.wait_closed()
+
+asyncio.run(tcp_echo_client('Hello World!'))
+```
+基于`Streams`实现的 TCP 编程，代码简洁清晰，编程思想符合同步编程实现。从样例可以看到，
+服务端主要调用`start_server`，其返回一个`Server`对象；客户端主要调用`open_connection`，
+其返回读写流用于数据交换。下面我们详细研究下`start_server`和`open_connection`内部实现原理。
+`start_server`的源码实现如下：
+```python
+async def start_server(client_connected_cb, host=None, port=None, *,
+                       limit=_DEFAULT_LIMIT, **kwds):
+    """Start a socket server, call back for each client connected.
+
+    The first parameter, `client_connected_cb`, takes two parameters:
+    client_reader, client_writer.  client_reader is a StreamReader
+    object, while client_writer is a StreamWriter object.  This
+    parameter can either be a plain callback function or a coroutine;
+    if it is a coroutine, it will be automatically converted into a
+    Task.
+
+    The rest of the arguments are all the usual arguments to
+    loop.create_server() except protocol_factory; most common are
+    positional host and port, with various optional keyword arguments
+    following.  The return value is the same as loop.create_server().
+
+    Additional optional keyword argument is limit (to set the buffer
+    limit passed to the StreamReader).
+
+    The return value is the same as loop.create_server(), i.e. a
+    Server object which can be used to stop the service.
+    """
+    loop = events.get_running_loop()
+
+    def factory():
+        reader = StreamReader(limit=limit, loop=loop)
+        protocol = StreamReaderProtocol(reader, client_connected_cb,
+                                        loop=loop)
+        return protocol
+
+    return await loop.create_server(factory, host, port, **kwds)
+```
+`start_server`内部实现和基于`Transports&Protocols`实现 TCP 服务端编程思想基本一致。
+调用`loop.create_server`实现一个服务，并返回`Server`对象，协议使用`StreamReaderProtocol`，
+新增`StreamReader`和`StreamWriter`两个用于读写流类。<br>
+
+`open_connection`源码如下：
+```python
+async def open_connection(host=None, port=None, *,
+                          limit=_DEFAULT_LIMIT, **kwds):
+    """A wrapper for create_connection() returning a (reader, writer) pair.
+
+    The reader returned is a StreamReader instance; the writer is a
+    StreamWriter instance.
+
+    The arguments are all the usual arguments to create_connection()
+    except protocol_factory; most common are positional host and port,
+    with various optional keyword arguments following.
+
+    Additional optional keyword arguments are loop (to set the event loop
+    instance to use) and limit (to set the buffer limit passed to the
+    StreamReader).
+
+    (If you want to customize the StreamReader and/or
+    StreamReaderProtocol classes, just copy the code -- there's
+    really nothing special here except some convenience.)
+    """
+    loop = events.get_running_loop()
+    reader = StreamReader(limit=limit, loop=loop)
+    protocol = StreamReaderProtocol(reader, loop=loop)
+    transport, _ = await loop.create_connection(
+        lambda: protocol, host, port, **kwds)
+    writer = StreamWriter(transport, protocol, reader, loop)
+    return reader, writer
+```
+`open_connection`内部实现和基于`Transports&Protocols`实现 TCP 客户端编程思想基本一致。
+调用`loop.create_connection`建立连接，协议使用`StreamReaderProtocol`，
+新增`StreamReader`和`StreamWriter`两个用于读写流类，并返回。<br>
+进一步，我们可能需要弄明白`StreamReaderProtocol`是如何实现的，以及`StreamWriter`和`StreamReader`
+内部工作原理。我们先从源码层面了解`StreamReaderProtocol`的实现原理。<br>
+先看`StreamReaderProtocol`初始化实现：
+```python
+class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
+    """Helper class to adapt between Protocol and StreamReader.
+
+    (This is a helper class instead of making StreamReader itself a
+    Protocol subclass, because the StreamReader has other potential
+    uses, and to prevent the user of the StreamReader to accidentally
+    call inappropriate methods of the protocol.)
+    """
+
+    _source_traceback = None
+
+    def __init__(self, stream_reader, client_connected_cb=None, loop=None):
+        super().__init__(loop=loop)
+        if stream_reader is not None:
+            self._stream_reader_wr = weakref.ref(stream_reader)
+            self._source_traceback = stream_reader._source_traceback
+        else:
+            self._stream_reader_wr = None
+        if client_connected_cb is not None:
+            # This is a stream created by the `create_server()` function.
+            # Keep a strong reference to the reader until a connection
+            # is established.
+            # 根据 start_server 源码，stream_reader 是在函数 factory() 内部实现，
+            # 函数返回后，此对象可能会被垃圾回收，所以这里保持一个强引用，直到
+            # 连接被建立
+            self._strong_reader = stream_reader
+        self._reject_connection = False
+        self._task = None
+        self._transport = None
+        # 服务端会传此参数
+        self._client_connected_cb = client_connected_cb
+        self._over_ssl = False
+        # StreamWriter.wait_closed 会使用，以等待协议关闭
+        self._closed = self._loop.create_future()
+
+    @property
+    def _stream_reader(self):
+        if self._stream_reader_wr is None:
+            return None
+        return self._stream_reader_wr()
+
+class FlowControlMixin(protocols.Protocol):
+    """Reusable flow control logic for StreamWriter.drain().
+
+    This implements the protocol methods pause_writing(),
+    resume_writing() and connection_lost().  If the subclass overrides
+    these it must call the super methods.
+
+    StreamWriter.drain() must wait for _drain_helper() coroutine.
+    """
+
+    def __init__(self, loop=None):
+        if loop is None:
+            self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+        self._paused = False
+        self._drain_waiters = collections.deque()
+        self._connection_lost = False
+```
+`StreamReaderProtocol`继承`FlowControlMixin`和`protocols.Protocol`，而`FlowControlMixin`
+也继承`protocols.Protocol`，所以`StreamReaderProtocol`会具体实现`protocols.Protocol`
+规定的方法。连接建立和连接丢失实现如下：
+
+```python
+class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
+    ...
+    def connection_made(self, transport):
+        if self._reject_connection:
+            context = {
+                'message': ('An open stream was garbage collected prior to '
+                            'establishing network connection; '
+                            'call "stream.close()" explicitly.')
+            }
+            if self._source_traceback:
+                context['source_traceback'] = self._source_traceback
+            self._loop.call_exception_handler(context)
+            transport.abort()
+            return
+        self._transport = transport
+        reader = self._stream_reader
+        if reader is not None:
+            reader.set_transport(transport)
+        self._over_ssl = transport.get_extra_info('sslcontext') is not None
+        if self._client_connected_cb is not None:
+            # 服务端才会传 client_connected_cb，走下面调用 client_connected_cb
+            writer = StreamWriter(transport, self, reader, self._loop)
+            res = self._client_connected_cb(reader, writer)
+            if coroutines.iscoroutine(res):
+                # 传递的 client_connected_cb 方法是协程处理逻辑
+                def callback(task):
+                    if task.cancelled():
+                        transport.close()
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        self._loop.call_exception_handler({
+                            'message': 'Unhandled exception in client_connected_cb',
+                            'exception': exc,
+                            'transport': transport,
+                        })
+                        transport.close()
+                # 将协程转为 Task 共事件循环调度
+                self._task = self._loop.create_task(res)
+                # 添加任务完成回调
+                self._task.add_done_callback(callback)
+
+            self._strong_reader = None
+
+    def connection_lost(self, exc):
+        reader = self._stream_reader
+        if reader is not None:
+            if exc is None:
+                # 将 eof 喂到 StreamReader 中
+                reader.feed_eof()
+            else:
+                reader.set_exception(exc)
+        if not self._closed.done():
+            if exc is None:
+                self._closed.set_result(None)
+            else:
+                self._closed.set_exception(exc)
+        super().connection_lost(exc)
+        self._stream_reader_wr = None
+        self._stream_writer = None
+        self._task = None
+        self._transport = None
+# 父类
+class FlowControlMixin(protocols.Protocol):
+    ...
+    def connection_lost(self, exc):
+        self._connection_lost = True
+        # Wake up the writer(s) if currently paused.
+        if not self._paused:
+            return
+
+        for waiter in self._drain_waiters:
+            if not waiter.done():
+                if exc is None:
+                    waiter.set_result(None)
+                else:
+                    waiter.set_exception(exc)
+```
+`connection_made`中服务端和客户端区别：
++ 如果是服务端，`client_connected_cb` 会被调用，参数是`reader`和`writer`，
+在`client_connected_cb`内部实现和客户端数据交互。
++ 如果是客户端，没有`client_connected_cb`参数，因为客户端是通过`open_connection`
+返回`reader`和`writer`和服务端实现数据交互。
+
+接收数据方法相关实现如下：
+```python
+class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
+    ...
+    def data_received(self, data):
+        reader = self._stream_reader
+        if reader is not None:
+            reader.feed_data(data)
+
+    def eof_received(self):
+        reader = self._stream_reader
+        if reader is not None:
+            reader.feed_eof()
+        if self._over_ssl:
+            # Prevent a warning in SSLProtocol.eof_received:
+            # "returning true from eof_received()
+            # has no effect when using ssl"
+            return False
+        return True
+```
+其主要功能是将接收的数据或者 eof 喂到 `StreamReader`中。下面看下和控制写流程相关的方法：
+```python
+class FlowControlMixin(protocols.Protocol):
+    def pause_writing(self):
+        assert not self._paused
+        self._paused = True
+        if self._loop.get_debug():
+            logger.debug("%r pauses writing", self)
+
+    def resume_writing(self):
+        assert self._paused
+        self._paused = False
+        if self._loop.get_debug():
+            logger.debug("%r resumes writing", self)
+        # 恢复写，通知 await drain() 往下执行
+        for waiter in self._drain_waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def _drain_helper(self):
+        if self._connection_lost:
+            raise ConnectionResetError('Connection lost')
+        if not self._paused:
+            return
+        # 如果写被 transport 暂停，需要等待
+        waiter = self._loop.create_future()
+        self._drain_waiters.append(waiter)
+        try:
+            await waiter
+        finally:
+            self._drain_waiters.remove(waiter)
+```
+因为底层`Transports`使用写 buffer，为了使得其大小不无限增大，需要在适当时候暂停或者恢复写操作，
+具体可看`Transports`的`write`实现原理。<br>
+
+接下来看`StreamReader`的内部工作原理。先看下`StreamReader`初始化实现：
+```python
+class StreamReader:
+
+    _source_traceback = None
+
+    def __init__(self, limit=_DEFAULT_LIMIT, loop=None):
+        # The line length limit is  a security feature;
+        # it also doubles as half the buffer limit.
+
+        if limit <= 0:
+            raise ValueError('Limit cannot be <= 0')
+
+        self._limit = limit
+        if loop is None:
+            self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+        # 缓存异步接收到的数据
+        self._buffer = bytearray()
+        self._eof = False    # Whether we're done.
+        # 等待有可读数据
+        self._waiter = None  # A future used by _wait_for_data()
+        self._exception = None
+        self._transport = None
+        self._paused = False
+        if self._loop.get_debug():
+            self._source_traceback = format_helpers.extract_stack(
+                sys._getframe(1))
+```
+初始化阶段会定义两个重要的变量：
++ `self._buffer`: 
++ `self._waiter`: 
