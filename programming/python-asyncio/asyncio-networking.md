@@ -447,7 +447,8 @@ asyncio 提供了 4 种**抽象**`Protocol`，分别是`Protocol`、`BufferedPro
 |`resume_writing`|||||
 
 具体的`Protocols`需要用户实现。适用具体场景的`Transports`由 asyncio 提供，会继承上面某些抽象类。
-我们先看用于 TCP socket 编程的`Transports`实现：
+我们先看用于 TCP socket 编程的`Transports`实现。
+`Transports`初始化源码实现如下：
 ```python
 # 父类
 class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
@@ -487,117 +488,15 @@ class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
         self._paused = False  # Set when pause_reading() called
 
         if self._server is not None:
+            # 将此 tarnsport 注册到 server 对象，server 对象记录每一个连接的 tarnsport
             self._server._attach(self)
         # 事件循环中 _transports 变量记录每一个 socket 绑定的 transport
         # 区别一个 socket 最多有一个 transport 传输数据
         loop._transports[self._sock_fd] = self
 
-    ...
-
-    def abort(self):
-        self._force_close(None)
-
     def set_protocol(self, protocol):
         self._protocol = protocol
         self._protocol_connected = True
-
-    def get_protocol(self):
-        return self._protocol
-
-    def is_closing(self):
-        return self._closing
-
-    def is_reading(self):
-        return not self.is_closing() and not self._paused
-
-    def pause_reading(self):
-        # 暂停读就是从事件监听中移除此 socket 可读监听事件
-        if not self.is_reading():
-            return
-        self._paused = True
-        self._loop._remove_reader(self._sock_fd)
-        if self._loop.get_debug():
-            logger.debug("%r pauses reading", self)
-
-    def resume_reading(self):
-        # 恢复读就是把此 socket 可读事件加到事件监听中
-        if self._closing or not self._paused:
-            return
-        self._paused = False
-        self._add_reader(self._sock_fd, self._read_ready)
-        if self._loop.get_debug():
-            logger.debug("%r resumes reading", self)
-
-    def close(self):
-        if self._closing:
-            return
-        self._closing = True
-        self._loop._remove_reader(self._sock_fd)
-        if not self._buffer:
-            # 缓存没有可写数据
-            self._conn_lost += 1
-            self._loop._remove_writer(self._sock_fd)
-            self._loop.call_soon(self._call_connection_lost, None)
-
-    def __del__(self, _warn=warnings.warn):
-        if self._sock is not None:
-            # 预防在 __init__ 阶段失败
-            _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-            self._sock.close()
-            if self._server is not None:
-                self._server._detach(self)
-
-    def _fatal_error(self, exc, message='Fatal error on transport'):
-        # Should be called from exception handler only.
-        if isinstance(exc, OSError):
-            if self._loop.get_debug():
-                logger.debug("%r: %s", self, message, exc_info=True)
-        else:
-            self._loop.call_exception_handler({
-                'message': message,
-                'exception': exc,
-                'transport': self,
-                'protocol': self._protocol,
-            })
-        self._force_close(exc)
-
-    def _force_close(self, exc):
-        # 强制关闭，会丢失缓存数据
-        if self._conn_lost:
-            return
-        if self._buffer:
-            self._buffer.clear()
-            self._loop._remove_writer(self._sock_fd)
-        if not self._closing:
-            self._closing = True
-            self._loop._remove_reader(self._sock_fd)
-        self._conn_lost += 1
-        self._loop.call_soon(self._call_connection_lost, exc)
-
-    def _call_connection_lost(self, exc):
-        # 关闭/强制关闭时候会被调用
-        try:
-            if self._protocol_connected:
-                # 调用 protocol 的 connection_lost 方法，通知 protocol 做相应处理
-                self._protocol.connection_lost(exc)
-        finally:
-            self._sock.close()
-            self._sock = None
-            self._protocol = None
-            self._loop = None
-            server = self._server
-            if server is not None:
-                server._detach(self)
-                self._server = None
-
-    def get_write_buffer_size(self):
-        # 获取写 buffer 队列的大小
-        return sum(map(len, self._buffer))
-
-    def _add_reader(self, fd, callback, *args):
-        if not self.is_reading():
-            return
-        self._loop._add_reader(fd, callback, *args)
 
 # 子类
 class _SelectorSocketTransport(_SelectorTransport):
@@ -626,8 +525,7 @@ class _SelectorSocketTransport(_SelectorTransport):
                              self._sock_fd, self._read_ready)
         if waiter is not None:
             # only wake up the waiter when connection_made() has been called
-            self._loop.call_soon(futures._set_result_unless_cancelled,
-                                 waiter, None)
+            self._loop.call_soon(futures._set_result_unless_cancelled, waiter, None)
 
     def set_protocol(self, protocol):
         if isinstance(protocol, protocols.BufferedProtocol):
@@ -636,46 +534,24 @@ class _SelectorSocketTransport(_SelectorTransport):
             self._read_ready_cb = self._read_ready__data_received
 
         super().set_protocol(protocol)
+```
+初始化阶段，除了完成必要的变量初始化，写缓存 buffer 初始化，还要做以下的重要工作：
++ 禁用 `Nagle` 算法；
++ 将`protocol.connection_made`方法添加到事件循环就绪队列，让其尽快被调用；
++ 将`self._add_reader`方法添加到事件循环的就绪队列，并确保其在`protocol.connection_made`之后被调用 （事件循环的就绪队列
+可以认为是个先进先出的队列），并将此连接 socket 的可读事件回调方法设置为`self._read_ready`；
++ 最后将调用方等待的 Future 对象`waiter`的`futures._set_result_unless_cancelled`方法添加到事件循环就绪队列，
+等待被执行以**唤醒**调用方继续执行；
+
+当 socket 接收缓冲区有数据时，回调方法`self._read_ready`会被执行。假设`self._read_ready_cb = self._read_ready__data_received`，
+读逻辑相关源码如下:
+```python
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
+    ...
 
     def _read_ready(self):
         self._read_ready_cb()
-
-    def _read_ready__get_buffer(self):
-        if self._conn_lost:
-            return
-
-        try:
-            buf = self._protocol.get_buffer(-1)
-            if not len(buf):
-                raise RuntimeError('get_buffer() returned an empty buffer')
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            self._fatal_error(
-                exc, 'Fatal error: protocol.get_buffer() call failed.')
-            return
-
-        try:
-            nbytes = self._sock.recv_into(buf)
-        except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            self._fatal_error(exc, 'Fatal read error on socket transport')
-            return
-
-        if not nbytes:
-            self._read_ready__on_eof()
-            return
-
-        try:
-            self._protocol.buffer_updated(nbytes)
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            self._fatal_error(
-                exc, 'Fatal error: protocol.buffer_updated() call failed.')
 
     def _read_ready__data_received(self):
         if self._conn_lost:
@@ -691,6 +567,7 @@ class _SelectorSocketTransport(_SelectorTransport):
             return
 
         if not data:
+            # 客户端关闭
             self._read_ready__on_eof()
             return
 
@@ -722,6 +599,103 @@ class _SelectorSocketTransport(_SelectorTransport):
             self._loop._remove_reader(self._sock_fd)
         else:
             self.close()
+```
+从 socket 接收缓存区读到数据后，会有如下三种情况发生：
++ 数据读成功：调用`protocol.data_received`方法，将读取的数据告诉给协议层；
++ 数据读遇到客户端关闭连接：调用`self._read_ready__on_eof`方法，进而调用`protocol.eof_received`方法，根据
+`protocol.eof_received`返回值，决定执行`self.close`还是只不监听读事件；
++ 数据读和处理过程抛出异常：调用`self._fatal_error`并返回；
+
+`self.close`和`self._fatal_error`源码如下：
+```python
+# 父类
+class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
+    ...
+
+    def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._loop._remove_reader(self._sock_fd)
+        if not self._buffer:
+            # 缓存没有可写数据
+            self._conn_lost += 1
+            self._loop._remove_writer(self._sock_fd)
+            self._loop.call_soon(self._call_connection_lost, None)
+
+    def _fatal_error(self, exc, message='Fatal error on transport'):
+        # Should be called from exception handler only.
+        if isinstance(exc, OSError):
+            if self._loop.get_debug():
+                logger.debug("%r: %s", self, message, exc_info=True)
+        else:
+            self._loop.call_exception_handler({
+                'message': message,
+                'exception': exc,
+                'transport': self,
+                'protocol': self._protocol,
+            })
+        self._force_close(exc)
+
+    def _force_close(self, exc):
+        # 强制关闭，会丢失缓存数据
+        if self._conn_lost:
+            return
+        if self._buffer:
+            self._buffer.clear()
+            self._loop._remove_writer(self._sock_fd)
+        if not self._closing:
+            self._closing = True
+            self._loop._remove_reader(self._sock_fd)
+        self._conn_lost += 1
+        self._loop.call_soon(self._call_connection_lost, exc)
+
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
+    ...
+
+    def close(self):
+        self._read_ready_cb = None
+        self._write_ready = None
+        super().close()
+```
+- 调用`self.close`首先设置关闭标志位`self._closing`，然后移除 socket 的读监听回调，使此`transport`不能继续读新数据；
+如果此时写缓存 buffer 有数据，则会等其发送完成，否则会移除 socket 的写回调，然后将`self._call_connection_lost`添加
+到事件循环中。
+- 调用`self._fatal_error`会首先调用`loop.call_exception_handler`将异常传递给事件循环，然后强制关闭此`transport`，
+写缓存 buffer 数据会被丢弃，最后会移除 socket 读写回调，并将`self._call_connection_lost`添加到事件循环中。
+
+`self._call_connection_lost`方法源码如下：
+```python
+# 父类
+class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
+    ...
+
+    def _call_connection_lost(self, exc):
+        # 关闭/强制关闭时候会被调用
+        try:
+            if self._protocol_connected:
+                # 调用 protocol 的 connection_lost 方法，通知 protocol 做相应处理
+                self._protocol.connection_lost(exc)
+        finally:
+            self._sock.close()
+            self._sock = None
+            self._protocol = None
+            self._loop = None
+            server = self._server
+            if server is not None:
+                # 将此连接 transport 从 server 对象中移除
+                server._detach(self)
+                self._server = None
+```
+调用`self._call_connection_lost`会首先调用协议的`protocol.connection_lost`方法，通知协议做相关处理，
+最后会将此 `transport` 底层的 socket 关闭以及将其从 server 对象中移除。<br>
+
+接下来我们看下`transport`的写逻辑是如何实现的，其源码如下：
+```python
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
+    ...
 
     def write(self, data):
         if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -735,6 +709,7 @@ class _SelectorSocketTransport(_SelectorTransport):
             return
 
         if self._conn_lost:
+            # 说明不可读也不可写
             if self._conn_lost >= constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES:
                 logger.warning('socket.send() raised exception.')
             self._conn_lost += 1
@@ -760,9 +735,19 @@ class _SelectorSocketTransport(_SelectorTransport):
 
         # Add it to the buffer.
         self._buffer.append(data)
-        # 如果写 buffer 数据超过高水位线，则暂定写
+        # 如果写 buffer 数据超过高水位线，则暂定写 调用 protocol.pause_writing
         self._maybe_pause_protocol()
+```
+在条件检查都通过后，`write`方法会将待发送的数据添加到写 buffer 中，然后注册写回调`self._write_ready`并调用`self._maybe_pause_protocol`以防 buffer 数据
+太多，超过高水位线。因为 buffer 底层数据结构是没有大小限制的，如果不限制则可能导致 buffer 太大，导致服务器崩溃。
+`self._maybe_pause_protocol`的源码在`transports.py` 中的 `_FlowControlMixin`类中。
+> 在`write`中有个优化逻辑，如果当前写 buffer 没有数据，则尝试立刻发送，如果数据发送完成直接返回，否则将未发送的数据
+添加到写 buffer 中，等待事件循环执行写回调。
 
+写回调`self._write_ready`在初始化中被设置为`self._write_send`或者`self._write_sendmsg`，其实现如下：
+```python
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
     def _get_sendmsg_buffer(self):
         return itertools.islice(self._buffer, SC_IOV_MAX)
 
@@ -784,14 +769,18 @@ class _SelectorSocketTransport(_SelectorTransport):
             if self._empty_waiter is not None:
                 self._empty_waiter.set_exception(exc)
         else:
+            # 如果写 buffer 数据少，则调用 protocol.resume_writing
             self._maybe_resume_protocol()  # May append to buffer.
             if not self._buffer:
+                # 数据全部写完，异常写回调
                 self._loop._remove_writer(self._sock_fd)
                 if self._empty_waiter is not None:
                     self._empty_waiter.set_result(None)
                 if self._closing:
+                    # 已经关闭(close 被调用)
                     self._call_connection_lost(None)
                 elif self._eof:
+                    # 如果有 eof，关闭写端
                     self._sock.shutdown(socket.SHUT_WR)
 
     def _adjust_leftover_buffer(self, nbytes: int) -> None:
@@ -809,6 +798,7 @@ class _SelectorSocketTransport(_SelectorTransport):
     def _write_send(self):
         assert self._buffer, 'Data should not be empty'
         if self._conn_lost:
+            # 不可读也不可写
             return
         try:
             buffer = self._buffer.popleft()
@@ -827,15 +817,26 @@ class _SelectorSocketTransport(_SelectorTransport):
             if self._empty_waiter is not None:
                 self._empty_waiter.set_exception(exc)
         else:
+            # 如果写 buffer 数据少，则调用 protocol.resume_writing
             self._maybe_resume_protocol()  # May append to buffer.
             if not self._buffer:
                 self._loop._remove_writer(self._sock_fd)
                 if self._empty_waiter is not None:
                     self._empty_waiter.set_result(None)
                 if self._closing:
+                    # 已经关闭(close 被调用)
                     self._call_connection_lost(None)
                 elif self._eof:
+                    # 如果有 eof，关闭写端
                     self._sock.shutdown(socket.SHUT_WR)
+```
+如果在发送数据的过程中遇到异常，走强制关闭的逻辑。写逻辑涉及到`eof`，
+`eof`机制就是用于告诉对位的读端在收到这个标记后就不需要再接收数据，且后续的数据发送完后也请尽快的关闭。
+`Transport`提供了如下写`eof`相关方法给调用方：
+```python
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
+    ...
 
     def write_eof(self):
         if self._closing or self._eof:
@@ -843,6 +844,15 @@ class _SelectorSocketTransport(_SelectorTransport):
         self._eof = True
         if not self._buffer:
             self._sock.shutdown(socket.SHUT_WR)
+
+    def can_write_eof(self):
+        return True
+```
+`transport`写操作除了有`write`方法，也提供了`writelines`方法，源码如下：
+```python
+# 子类
+class _SelectorSocketTransport(_SelectorTransport):
+    ...
 
     def writelines(self, list_of_data):
         if self._eof:
@@ -856,31 +866,66 @@ class _SelectorSocketTransport(_SelectorTransport):
         # If the entire buffer couldn't be written, register a write handler
         if self._buffer:
             self._loop._add_writer(self._sock_fd, self._write_ready)
+```
+最后需要了解下析构方法`__del__`，根据源码可知，主要是为了防止在`transport`初始化失败内存泄露：
+```python
+# 父类
+class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
+    ...
 
-    def can_write_eof(self):
-        return True
+    def __del__(self, _warn=warnings.warn):
+        if self._sock is not None:
+            # 预防在 __init__ 阶段失败
+            _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+            self._sock.close()
+            if self._server is not None:
+                self._server._detach(self)
+```
+以上就是`transport`的基本介绍，除此之外，`transport`还提供了其他给调用方的方法，如下：
+```python
+# 父类
+class _SelectorTransport(transports._FlowControlMixin, transports.Transport):
 
-    def _call_connection_lost(self, exc):
-        super()._call_connection_lost(exc)
-        if self._empty_waiter is not None:
-            self._empty_waiter.set_exception(
-                ConnectionError("Connection is closed by peer"))
+    ...
 
-    def _make_empty_waiter(self):
-        if self._empty_waiter is not None:
-            raise RuntimeError("Empty waiter is already set")
-        self._empty_waiter = self._loop.create_future()
-        if not self._buffer:
-            self._empty_waiter.set_result(None)
-        return self._empty_waiter
+    def abort(self):
+        self._force_close(None)
 
-    def _reset_empty_waiter(self):
-        self._empty_waiter = None
+    def get_protocol(self):
+        return self._protocol
 
-    def close(self):
-        self._read_ready_cb = None
-        self._write_ready = None
-        super().close()
+    def is_closing(self):
+        return self._closing
+
+    def is_reading(self):
+        return not self.is_closing() and not self._paused
+
+    def pause_reading(self):
+        # 暂停读就是从事件监听中移除此 socket 可读监听事件
+        if not self.is_reading():
+            return
+        self._paused = True
+        self._loop._remove_reader(self._sock_fd)
+        if self._loop.get_debug():
+            logger.debug("%r pauses reading", self)
+
+    def resume_reading(self):
+        # 恢复读就是把此 socket 可读事件加到事件监听中
+        if self._closing or not self._paused:
+            return
+        self._paused = False
+        self._add_reader(self._sock_fd, self._read_ready)
+        if self._loop.get_debug():
+            logger.debug("%r resumes reading", self)
+
+    def get_write_buffer_size(self):
+        # 获取写 buffer 队列的大小
+        return sum(map(len, self._buffer))
+
+    def _add_reader(self, fd, callback, *args):
+        if not self.is_reading():
+            return
+        self._loop._add_reader(fd, callback, *args)
 ```
 下图总结了`Transports`内部逻辑关系以及和`Protocols`交互逻辑：
 
@@ -1134,10 +1179,12 @@ class Server(events.AbstractServer):
         return f'<{self.__class__.__name__} sockets={self.sockets!r}>'
 
     def _attach(self, transport):
+        # 注册连接的 transport，在连接transport初始化时候被调用
         assert self._sockets is not None
         self._clients.add(transport)
 
     def _detach(self, transport):
+        # 删除连接的 transport，在connection_lost时候被调用
         self._clients.discard(transport)
         if len(self._clients) == 0 and self._sockets is None:
             self._wakeup()
@@ -1249,6 +1296,7 @@ class Server(events.AbstractServer):
         # from two places: self.close() and self._detach(), but only
         # when both conditions have become true. To signal that this
         # has happened, self._wakeup() sets self._waiters to None.
+        # 只有self._wakeup中会设置为 None
         if self._waiters is None:
             return
         waiter = self._loop.create_future()
