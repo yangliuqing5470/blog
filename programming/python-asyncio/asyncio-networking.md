@@ -1799,6 +1799,7 @@ class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
         self._transport = transport
         reader = self._stream_reader
         if reader is not None:
+            # 设置 reader 的底层 transport
             reader.set_transport(transport)
         self._over_ssl = transport.get_extra_info('sslcontext') is not None
         if self._client_connected_cb is not None:
@@ -1952,5 +1953,244 @@ class StreamReader:
                 sys._getframe(1))
 ```
 初始化阶段会定义两个重要的变量：
-+ `self._buffer`: 
-+ `self._waiter`: 
++ `self._buffer`: 缓存异步回调接收的数据。
++ `self._waiter`: 一个 Future 对象，用于读同步操作，也就是`self._buffer`没有数据的时候会等待。
+
+下面看下喂数据（也就是将异常接收的数据缓存到 `self._buffer`）相关实现：
+```python
+
+class StreamReader:
+    ...
+    def feed_eof(self):
+        self._eof = True
+        self._wakeup_waiter()
+
+    def at_eof(self):
+        """Return True if the buffer is empty and 'feed_eof' was called."""
+        return self._eof and not self._buffer
+
+    def feed_data(self, data):
+        assert not self._eof, 'feed_data after feed_eof'
+
+        if not data:
+            return
+
+        self._buffer.extend(data)
+        self._wakeup_waiter()
+
+        if (self._transport is not None and not self._paused and len(self._buffer) > 2 * self._limit):
+            try:
+                # buffer 数据太多，底层的 transport 暂停接收数据
+                self._transport.pause_reading()
+            except NotImplementedError:
+                # The transport can't be paused.
+                # We'll just have to buffer all data.
+                # Forget the transport so we don't keep trying.
+                # 不支持暂停读操作，则对 self._buffer 不做任何限制
+                self._transport = None
+            else:
+                self._paused = True
+```
+喂数据有两种场景：
++ `feed_eof`：表示读结束，设置读结束标志位`self._eof`，然后调用`self._wakeup_waiter`以唤醒在等待的读操作。
++ `feed_data`：表示正常收到数据，将数据存到`self._buffer`中，然后调用`self._wakeup_waiter`唤醒在等待的读操作，
+如果此时`self._buffer`中数据超过 limit 的两倍，则调用`self._transport.pause_reading`通知底层的`transport`暂停接收新数据，
+并设置暂停标志位`self._paused`。
+
+`_wakeup_waiter`源码实现如下：
+```python
+class StreamReader:
+    ...
+    def _wakeup_waiter(self):
+        """Wakeup read*() functions waiting for data or EOF."""
+        waiter = self._waiter
+        if waiter is not None:
+            self._waiter = None
+            if not waiter.cancelled():
+                waiter.set_result(None)
+```
+下面看下用于读同步的实现：
+```python
+class StreamReader:
+    ...
+    async def _wait_for_data(self, func_name):
+        """Wait until feed_data() or feed_eof() is called.
+    
+        If stream was paused, automatically resume it.
+        """
+        # StreamReader uses a future to link the protocol feed_data() method
+        # to a read coroutine. Running two read coroutines at the same time
+        # would have an unexpected behaviour. It would not possible to know
+        # which coroutine would get the next data.
+        if self._waiter is not None:
+            raise RuntimeError(
+                f'{func_name}() called while another coroutine is '
+                f'already waiting for incoming data')
+    
+        assert not self._eof, '_wait_for_data after EOF'
+    
+        # Waiting for data while paused will make deadlock, so prevent it.
+        # This is essential for readexactly(n) for case when n > self._limit.
+        if self._paused:
+            self._paused = False
+            self._transport.resume_reading()
+    
+        self._waiter = self._loop.create_future()
+        try:
+            await self._waiter
+        finally:
+            self._waiter = None
+```
+`_wait_for_data`内部如果遇到当前`StreamReader`被暂停，则会恢复读，以防止死锁情况发生。
+如果没有此逻辑，在下面场景可能导致死锁：
+> `self.feed_data`被调用执行了暂停操作，此时`readexactly`被调用，但是参数 `n > len(self._buffer)`，`readexactly`
+会调用`_wait_for_data`，而`_wait_for_data`会等待`feed_data`或者`feed_eof`被调用，但是由于开始`StreamReader`
+已经被暂停，所以`feed_data`和`feed_eof`不会被调用，导致死锁。
+
+接下来看下`StreamReader`读操作的实现，`StreamReader`实现了`read`、`readexactly`、`readuntil`和`readline`，
+我们主要看下`read`实现：
+```python
+class StreamReader:
+    ...
+    def _maybe_resume_transport(self):
+        if self._paused and len(self._buffer) <= self._limit:
+            self._paused = False
+            self._transport.resume_reading()
+
+    async def read(self, n=-1):
+        """Read up to `n` bytes from the stream.
+
+        If n is not provided, or set to -1, read until EOF and return all read
+        bytes. If the EOF was received and the internal buffer is empty, return
+        an empty bytes object.
+
+        If n is zero, return empty bytes object immediately.
+
+        If n is positive, this function try to read `n` bytes, and may return
+        less or equal bytes than requested, but at least one byte. If EOF was
+        received before any byte is read, this function returns empty byte
+        object.
+
+        Returned value is not limited with limit, configured at stream
+        creation.
+
+        If stream was paused, this function will automatically resume it if
+        needed.
+        """
+
+        if self._exception is not None:
+            raise self._exception
+
+        if n == 0:
+            return b''
+
+        if n < 0:
+            # This used to just loop creating a new waiter hoping to
+            # collect everything in self._buffer, but that would
+            # deadlock if the subprocess sends more than self.limit
+            # bytes.  So just call self.read(self._limit) until EOF.
+            blocks = []
+            while True:
+                block = await self.read(self._limit)
+                if not block:
+                    break
+                blocks.append(block)
+            return b''.join(blocks)
+
+        if not self._buffer and not self._eof:
+            await self._wait_for_data('read')
+
+        # This will work right even if buffer is less than n bytes
+        data = bytes(self._buffer[:n])
+        del self._buffer[:n]
+
+        self._maybe_resume_transport()
+        return data
+```
+`read(n)`根据参数 n 的不同，返回值有如下三种情况：
++ 如果`n = 0`，返回空字节数组；
++ 如果`n < 0`，会一直读，直到遇到 EOF，返回包含所有读到数据的字节数组；
++ 如果`n > 0`，会返回最多 n 个字节，最少 1 个字节的数组；
+
+`read`最后如果检测到`StreamReader`被暂停且缓存`self._buffer`数据少于`self._limit`，则恢复底层`transport`读。`StreamReader`支持`async for`语法：
+```python
+class StreamReader:
+    ...
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        val = await self.readline()
+        if val == b'':
+            raise StopAsyncIteration
+        return val
+```
+以上我们了解了完整的`StreamReader`的工作原理，接下来我们看下`StreamWriter`的工作原理。先看下`StreamWriter`初始化实现：
+```python
+class StreamWriter:
+    """Wraps a Transport.
+
+    This exposes write(), writelines(), [can_]write_eof(),
+    get_extra_info() and close().  It adds drain() which returns an
+    optional Future on which you can wait for flow control.  It also
+    adds a transport property which references the Transport
+    directly.
+    """
+
+    def __init__(self, transport, protocol, reader, loop):
+        self._transport = transport
+        self._protocol = protocol
+        # drain() expects that the reader has an exception() method
+        assert reader is None or isinstance(reader, StreamReader)
+        self._reader = reader
+        self._loop = loop
+        self._complete_fut = self._loop.create_future()
+        self._complete_fut.set_result(None)
+```
+`StreamWriter`初始化只是完成基本变量初始化。`StreamWriter`写相关操作基本是对底层`transport`的包装，直接调用`transport`
+的相关方法，新增的两个方法是`self.drain`和`self.wait_close`，源码如下：
+```python
+class StreamWriter:
+    ...
+    async def wait_closed(self):
+        await self._protocol._get_close_waiter(self)
+
+    async def drain(self):
+        """Flush the write buffer.
+
+        The intended use is to write
+
+          w.write(data)
+          await w.drain()
+        """
+        if self._reader is not None:
+            exc = self._reader.exception()
+            if exc is not None:
+                raise exc
+        if self._transport.is_closing():
+            # Wait for protocol.connection_lost() call
+            # Raise connection closing error if any,
+            # ConnectionResetError otherwise
+            # Yield to the event loop so connection_lost() may be
+            # called.  Without this, _drain_helper() would return
+            # immediately, and code that calls
+            #     write(...); await drain()
+            # in a loop would never call connection_lost(), so it
+            # would not see an error when the socket is closed.
+            await sleep(0)
+        await self._protocol._drain_helper()
+```
+`wait_closed`在`StreamWriter`的`close`方法之后调用，等待底层连接关闭，确保所有数据都被发送完成。使用样例：
+```python
+writer.close()
+await writer.wait_closed()
+```
+`drain`用于等到合适的时候在恢复流的写操作，使用样例如下：
+```python
+writer.write(data)
+await writer.drain()
+```
+如果`StreamWriter`写被暂停，则`await writer.drain()`会暂停，指导写操作恢复。在`drain`中，如果遇到底层的`transport`
+因为某些原因关闭，则通过`await sleep(0)`把控制器权交给事件循环，使得`connection_lost`在执行`protocol._drain_helper`
+之前被调用，进而使得`protocol._drain_helper`感知到底层`transport`关闭，这样`await writer.drain`会早感知错误，
+不会继续驱动下一条`writer.write(data)` 执行。
