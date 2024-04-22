@@ -1,6 +1,10 @@
 
 
-## Application
+# Application
+![应用框架](./images/application.png)
+上图显示了`Application`对象的大体结构，下面将分别介绍`application`、**路由调度器**、
+**资源**和**资源路由**对象。
+## application
 `Application`的初始化如下：
 ```python
 class Application(MutableMapping[Union[str, AppKey[Any]], Any]):
@@ -320,4 +324,13 @@ class CleanupContext(_CleanupContextBase):
             else:
                 raise CleanupError("Multiple errors on cleanup stage", errors)
 ```
-最后`Application`也提供了嵌套应用的机制。
+最后`Application`也提供了嵌套应用的机制。样例如下：
+```python
+admin = web.Application()
+admin.add_routes([web.get('/resource', handler, name='name')])
+
+app.add_subapp('/admin/', admin)
+
+url = admin.router['name'].url_for()
+# URL('/admin/resource')
+```
