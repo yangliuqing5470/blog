@@ -438,9 +438,16 @@ class UrlDispatcher(AbstractRouter, Mapping[str, AbstractResource]):
 ```
 初始化阶段主要完成用于存储注册的路由表项的数据结构（注册添加的每一项路由规则都对应一个资源，也即一个路由表项）。
 ### 路由表建立
-路由调度器`UrlDispatcher`提供来三种不同的路由项注册能力：http 请求方法路由项、静态资源路由项和基于类的视图路由项。<br>
+路由调度器`UrlDispatcher`提供来三种不同的路由项注册能力：http 请求方法路由项、静态资源路由项和基于类视图路由项。<br>
 
-用于 http 请求方法路由项注册的源码实现如下：
+用于 http 请求方法路由项注册的样例如下：
+```python
+async def hello(request):
+    return web.Response(text="Hello, world")
+
+app.router.add_get('/', hello) # 注册一个路由项，也即注册一个资源
+```
+相关源码实现如下：
 ```python
 def add_head(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
         """Shortcut for add_route with method HEAD."""
@@ -485,5 +492,247 @@ def add_delete(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRout
     """Shortcut for add_route with method DELETE."""
     return self.add_route(hdrs.METH_DELETE, path, handler, **kwargs)
 ```
+从源码可知，`add_xxx`方法内部会调用`self.add_route`方法（`self.add_get`调用逻辑其实就是`self.add_route`方法内部逻辑），
+`self.add_route`源码如下：
+```python
+def add_route(
+    self,
+    method: str,
+    path: str,
+    handler: Union[Handler, Type[AbstractView]],
+    *,
+    name: Optional[str] = None,
+    expect_handler: Optional[_ExpectHandler] = None,
+) -> AbstractRoute:
+    resource = self.add_resource(path, name=name)
+    return resource.add_route(method, handler, expect_handler=expect_handler)
+
+def add_resource(self, path: str, *, name: Optional[str] = None) -> Resource:
+    if path and not path.startswith("/"):
+        raise ValueError("path should be started with / or be empty")
+    # Reuse last added resource if path and name are the same
+    # 如果连续两次注册路由表项是同一个 name 和同一个 path，只是方法不同，
+    # 例如: app.router.add_get("/run", get), app.router.add_post("/run", post)，
+    # 则共用一个资源（路由表项）
+    if self._resources:
+        resource = self._resources[-1]
+        if resource.name == name and resource.raw_match(path):
+            return cast(Resource, resource)
+    if not ("{" in path or "}" in path or ROUTE_RE.search(path)):
+        resource = PlainResource(_requote_path(path), name=name)
+        self.register_resource(resource)
+        return resource
+    # 注册的 path 有 {}，例如 "/run/{name}"
+    resource = DynamicResource(path, name=name)
+    self.register_resource(resource)
+    return resource
+
+def register_resource(self, resource: AbstractResource) -> None:
+    ...
+    name = resource.name
+
+    if name is not None:
+        ...
+        if name in self._named_resources:
+            raise ValueError(
+                "Duplicate {!r}, "
+                "already handled by {!r}".format(name, self._named_resources[name])
+            )
+        # 记录具名资源（路由表项）
+        self._named_resources[name] = resource
+    # 记录资源（路由表项）
+    self._resources.append(resource)
+    if isinstance(resource, MatchedSubAppResource):
+        # We cannot index match sub-app resources because they have match rules
+        # 记录子 app 资源（路由表项）
+        self._matched_sub_app_resources.append(resource)
+    else:
+        # 记录路由索引和路由表项（资源）关系
+        self.index_resource(resource)
+
+def _get_resource_index_key(self, resource: AbstractResource) -> str:
+    """Return a key to index the resource in the resource index."""
+    # strip at the first { to allow for variables
+    # 提取固定路径，例如 "/run/{name}" 则得到 "/run"作为索引
+    return resource.canonical.partition("{")[0].rstrip("/") or "/"
+
+def index_resource(self, resource: AbstractResource) -> None:
+    """Add a resource to the resource index."""
+    resource_key = self._get_resource_index_key(resource)
+    # There may be multiple resources for a canonical path
+    # so we keep them in a list to ensure that registration
+    # order is respected.
+    self._resource_index.setdefault(resource_key, []).append(resource)
+```
+由源码可知，注册的每一个路由项，在内部都作为一个资源，例如`PlainResource`、
+`DynamicResource`、`MatchedSubAppResource`等资源。资源的内部是如何实现的，
+我们在下一小节进行介绍。`self.add_route`注册完资源后，接下来会调用`resource.add_route`方法将具体请求方法、
+`handler`等信息和资源绑定。
+
+下面看下用于类视图路由项注册。使用样例如下：
+```python
+class MyView(web.View):
+    async def get(self):
+        return await get_resp(self.request)
+
+    async def post(self):
+        return await post_resp(self.request)
+# Example will process GET and POST requests for /path/to
+# but raise 405 Method not allowed exception for unimplemented HTTP methods
+web.view('/path/to', MyView)
+```
+相关源码实现如下：
+```python
+def add_view(
+    self, path: str, handler: Type[AbstractView], **kwargs: Any
+) -> AbstractRoute:
+    """Shortcut for add_route with ANY methods for a class-based view."""
+    return self.add_route(hdrs.METH_ANY, path, handler, **kwargs)
+```
+`self.add_view`内部也是调用`self.add_route`，请求方法是所有的方法。`web.View`实现如下：
+```python
+class AbstractView(ABC):
+    """Abstract class based view."""
+
+    def __init__(self, request: Request) -> None:
+        # 被调用也就是被实例化时候，接收一个 request 参数
+        self._request = request
+
+    @property
+    def request(self) -> Request:
+        """Request instance."""
+        return self._request
+
+    @abstractmethod
+    def __await__(self) -> Generator[Any, None, StreamResponse]:
+        """Execute the view handler."""
+
+class View(AbstractView):
+    async def _iter(self) -> StreamResponse:
+        if self.request.method not in hdrs.METH_ALL:
+            self._raise_allowed_methods()
+        # 获取和请求方法同名的 handle 属性，例如 MyView.get
+        method: Optional[Callable[[], Awaitable[StreamResponse]]] = getattr(
+            self, self.request.method.lower(), None
+        )
+        if method is None:
+            self._raise_allowed_methods()
+        return await method()
+
+    def __await__(self) -> Generator[Any, None, StreamResponse]:
+        return self._iter().__await__()
+
+    def _raise_allowed_methods(self) -> NoReturn:
+        allowed_methods = {m for m in hdrs.METH_ALL if hasattr(self, m.lower())}
+        raise HTTPMethodNotAllowed(self.request.method, allowed_methods)
+```
+最后看一下用于静态资源路由项注册。使用样例如下：
+```python
+router.add_static("/static", path_to_static_folder)
+```
+源码实现如下：
+```python
+def add_static(
+    self,
+    prefix: str,
+    path: PathLike,
+    *,
+    name: Optional[str] = None,
+    expect_handler: Optional[_ExpectHandler] = None,
+    chunk_size: int = 256 * 1024,
+    show_index: bool = False,
+    follow_symlinks: bool = False,
+    append_version: bool = False,
+) -> AbstractResource:
+    """Add static files view.
+
+    prefix - url prefix
+    path - folder with files
+
+    """
+    assert prefix.startswith("/")
+    if prefix.endswith("/"):
+        prefix = prefix[:-1]
+    resource = StaticResource(
+        prefix,
+        path,
+        name=name,
+        expect_handler=expect_handler,
+        chunk_size=chunk_size,
+        show_index=show_index,
+        follow_symlinks=follow_symlinks,
+        append_version=append_version,
+    )
+    self.register_resource(resource)
+    return resource
+```
+从源码可知，`add_static`主要使用`StaticResource`资源，将在下一小节介绍，
+最后将资源添加到路由表中。
+
+路由调度器`UrlDispatcher`也提供了批量注册路由项的接口，源码如下：
+```python
+def add_routes(self, routes: Iterable[AbstractRouteDef]) -> List[AbstractRoute]:
+    """Append routes to route table.
+
+    Parameter should be a sequence of RouteDef objects.
+
+    Returns a list of registered AbstractRoute instances.
+    """
+    registered_routes = []
+    for route_def in routes:
+        registered_routes.extend(route_def.register(self))
+    return registered_routes
+```
+使用样例如下：
+```python
+app.add_routes([web.get('/path1', get_1),
+                web.post('/path1', post_1),
+                web.get('/path2', get_2),
+                web.post('/path2', post_2)]
+```
 
 ### 路由表检索
+路由表检索就是根据请求的`path`从路由表中找到最佳的匹配资源（路由项），
+进而找到注册的处理请求`handler`。相关源码如下：
+```python
+async def resolve(self, request: Request) -> UrlMappingMatchInfo:
+    resource_index = self._resource_index
+    allowed_methods: Set[str] = set()
+
+    # Walk the url parts looking for candidates. We walk the url backwards
+    # to ensure the most explicit match is found first. If there are multiple
+    # candidates for a given url part because there are multiple resources
+    # registered for the same canonical path, we resolve them in a linear
+    # fashion to ensure registration order is respected.
+    url_part = request.rel_url.raw_path
+    while url_part:
+        for candidate in resource_index.get(url_part, ()):
+            match_dict, allowed = await candidate.resolve(request)
+            if match_dict is not None:
+                return match_dict
+            else:
+                allowed_methods |= allowed
+        if url_part == "/":
+            break
+        url_part = url_part.rpartition("/")[0] or "/"
+
+    #
+    # We didn't find any candidates, so we'll try the matched sub-app
+    # resources which we have to walk in a linear fashion because they
+    # have regex/wildcard match rules and we cannot index them.
+    #
+    # For most cases we do not expect there to be many of these since
+    # currently they are only added by `add_domain`
+    #
+    for resource in self._matched_sub_app_resources:
+        match_dict, allowed = await resource.resolve(request)
+        if match_dict is not None:
+            return match_dict
+        else:
+            allowed_methods |= allowed
+
+    if allowed_methods:
+        return MatchInfoError(HTTPMethodNotAllowed(request.method, allowed_methods))
+
+    return MatchInfoError(self.HTTP_NOT_FOUND)
+```
