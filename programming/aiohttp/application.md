@@ -1,5 +1,3 @@
-
-
 # Application
 ![应用框架](./images/application.png)
 上图显示了`Application`对象的大体结构，下面将分别介绍`application`、**路由调度器**、
@@ -46,6 +44,7 @@ class Application(MutableMapping[Union[str, AppKey[Any]], Any]):
         # 客户端请求的最大大小
         self._client_max_size = client_max_size
 ```
+### 变量存储与获取
 `Application`可以方便地存储和读取类似全局变量的`Application`配置，使用样例如下：
 ```python
 my_private_key = web.AppKey("my_private_key", str)
@@ -99,6 +98,7 @@ def get(self, key: str, default: Any = ...) -> Any: ...
 def get(self, key: Union[str, AppKey[_T]], default: Any = None) -> Any:
     return self._state.get(key, default)
 ```
+### 中间件机制
 `Application`支持中间件机制，中间件有如下作用或特点：
 + 自定义`handler`的行为。
 + 中间件是一个协程，可以用以修改请求或者响应。
@@ -194,6 +194,7 @@ def pre_freeze(self) -> None:
 + 当有客户端发送的请求时，会调用`self._handle`方法处理。如果有中间件，则按初始化阶段构造的顺序，包装生成一个新的
 `handler`用以处理请求。
 
+### 信号机制
 除了中间件机制外，`Application`也提供了如下的信号机制：
 + `on_response_prepare`：在`response`准备阶段被调用，具体来说就是在准备完`headers`和发送`headers`之前调用。
 + `on_startup`：在应用的启动阶段也就是`setup`阶段被调用。
@@ -324,7 +325,25 @@ class CleanupContext(_CleanupContextBase):
             else:
                 raise CleanupError("Multiple errors on cleanup stage", errors)
 ```
-最后`Application`也提供了嵌套应用的机制。样例如下：
+根据`CleanupContext`源码可知，被注册的方法必须是只有一个`yield`表达式的异步生成器。**异步生成器**是指：
+使用`async def`定义一个函数，并在函数内部使用`yield`语句来产生值，其允许在生成值的过程中进行异步操作。样例如下：
+```python
+async def pg_engine(app: web.Application):
+    # 异步操作
+    app[pg_engine] = await create_async_engine(
+        "postgresql+asyncpg://postgre:@localhost:5432/postgre"
+    )
+    # 生成值
+    yield
+    await app[pg_engine].dispose()
+
+app.cleanup_ctx.append(pg_engine)
+```
+源码中`__aiter__()`会返回一个异步生成器对象，`__anext__()`方法会开始异常生成器的执行，一直到`yield`处暂停，
+如果没有`yield`表达式，则抛出`StopAsyncIteration`异常。<br>
+
+### 应用嵌套
+`Application`也提供了嵌套应用的机制。样例如下：
 ```python
 admin = web.Application()
 admin.add_routes([web.get('/resource', handler, name='name')])
@@ -334,3 +353,137 @@ app.add_subapp('/admin/', admin)
 url = admin.router['name'].url_for()
 # URL('/admin/resource')
 ```
+和嵌套应用相关的源码如下：
+```python
+def _reg_subapp_signals(self, subapp: "Application") -> None:
+    def reg_handler(signame: str) -> None:
+        subsig = getattr(subapp, signame)
+
+        async def handler(app: "Application") -> None:
+            await subsig.send(subapp)
+
+        appsig = getattr(self, signame)
+        appsig.append(handler)
+
+    reg_handler("on_startup")
+    reg_handler("on_shutdown")
+    reg_handler("on_cleanup")
+
+def add_subapp(self, prefix: str, subapp: "Application") -> AbstractResource:
+    if not isinstance(prefix, str):
+        raise TypeError("Prefix must be str")
+    prefix = prefix.rstrip("/")
+    if not prefix:
+        raise ValueError("Prefix cannot be empty")
+    factory = partial(PrefixedSubAppResource, prefix, subapp)
+    return self._add_subapp(factory, subapp)
+
+def _add_subapp(
+    self, resource_factory: Callable[[], AbstractResource], subapp: "Application"
+) -> AbstractResource:
+    if self.frozen:
+        raise RuntimeError("Cannot add sub application to frozen application")
+    if subapp.frozen:
+        raise RuntimeError("Cannot add frozen application"
+    resource = resource_factory()
+    self.router.register_resource(resource)
+    self._reg_subapp_signals(subapp)
+    self._subapps.append(subapp)
+    subapp.pre_freeze()
+    return resource
+
+def add_domain(self, domain: str, subapp: "Application") -> AbstractResource:
+    if not isinstance(domain, str):
+        raise TypeError("Domain must be str")
+    elif "*" in domain:
+        rule: Domain = MaskDomain(domain)
+    else:
+        rule = Domain(domain)
+    factory = partial(MatchedSubAppResource, rule, subapp)
+    return self._add_subapp(factory, subapp)
+```
+TODO 等下面的资源梳理完来，在解释嵌套应用的实现原理
+
+### 路由调度器对象
+`Application`提供路由调度器实例属性，相关源码如下：
+```python
+self._router = UrlDispatcher()
+
+def add_routes(self, routes: Iterable[AbstractRouteDef]) -> List[AbstractRoute]:
+    return self.router.add_routes(routes)
+
+@property
+def router(self) -> UrlDispatcher:
+    return self._router
+```
+路由调度器完成路由表的建立与查询。
+
+## 路由调度器
+路由调度器`UrlDispatcher`初始化源码如下：
+```python
+class UrlDispatcher(AbstractRouter, Mapping[str, AbstractResource]):
+    NAME_SPLIT_RE = re.compile(r"[.:-]")
+    HTTP_NOT_FOUND = HTTPNotFound()
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 用于存储所有的路由表项
+        self._resources: List[AbstractResource] = []
+        # 只存储具名的路由表项
+        self._named_resources: Dict[str, AbstractResource] = {}
+        # 建立路由索引和路由表项关系映射，用于后续的路由选择
+        self._resource_index: dict[str, list[AbstractResource]] = {}
+        # 存储子app相关的路由表项
+        self._matched_sub_app_resources: List[MatchedSubAppResource] = []
+```
+初始化阶段主要完成用于存储注册的路由表项的数据结构（注册添加的每一项路由规则都对应一个资源，也即一个路由表项）。
+### 路由表建立
+路由调度器`UrlDispatcher`提供来三种不同的路由项注册能力：http 请求方法路由项、静态资源路由项和基于类的视图路由项。<br>
+
+用于 http 请求方法路由项注册的源码实现如下：
+```python
+def add_head(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+        """Shortcut for add_route with method HEAD."""
+        return self.add_route(hdrs.METH_HEAD, path, handler, **kwargs)
+
+def add_options(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+    """Shortcut for add_route with method OPTIONS."""
+    return self.add_route(hdrs.METH_OPTIONS, path, handler, **kwargs)
+
+def add_get(
+    self,
+    path: str,
+    handler: Handler,
+    *,
+    name: Optional[str] = None,
+    allow_head: bool = True,
+    **kwargs: Any,
+) -> AbstractRoute:
+    """Shortcut for add_route with method GET.
+
+    If allow_head is true, another
+    route is added allowing head requests to the same endpoint.
+    """
+    resource = self.add_resource(path, name=name)
+    if allow_head:
+        resource.add_route(hdrs.METH_HEAD, handler, **kwargs)
+    return resource.add_route(hdrs.METH_GET, handler, **kwargs)
+
+def add_post(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+    """Shortcut for add_route with method POST."""
+    return self.add_route(hdrs.METH_POST, path, handler, **kwargs)
+
+def add_put(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+    """Shortcut for add_route with method PUT."""
+    return self.add_route(hdrs.METH_PUT, path, handler, **kwargs)
+
+def add_patch(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+    """Shortcut for add_route with method PATCH."""
+    return self.add_route(hdrs.METH_PATCH, path, handler, **kwargs)
+
+def add_delete(self, path: str, handler: Handler, **kwargs: Any) -> AbstractRoute:
+    """Shortcut for add_route with method DELETE."""
+    return self.add_route(hdrs.METH_DELETE, path, handler, **kwargs)
+```
+
+### 路由表检索
