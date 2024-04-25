@@ -707,6 +707,8 @@ async def resolve(self, request: Request) -> UrlMappingMatchInfo:
     url_part = request.rel_url.raw_path
     while url_part:
         for candidate in resource_index.get(url_part, ()):
+            # match_dict 是一个 UrlMappingMatchInfo 对象，下面资源章节有详细介绍
+            # allowed 是一个 Set，表示当前资源允许的请求方法
             match_dict, allowed = await candidate.resolve(request)
             if match_dict is not None:
                 return match_dict
@@ -714,6 +716,8 @@ async def resolve(self, request: Request) -> UrlMappingMatchInfo:
                 allowed_methods |= allowed
         if url_part == "/":
             break
+        # 从 url_part 右边分割字符
+        # 样例: str = "www.runoob.com"，str.rpartition(".") ==> ('www.runoob', '.', 'com')
         url_part = url_part.rpartition("/")[0] or "/"
 
     #
@@ -724,6 +728,7 @@ async def resolve(self, request: Request) -> UrlMappingMatchInfo:
     # For most cases we do not expect there to be many of these since
     # currently they are only added by `add_domain`
     #
+    # subapp 资源有两种：PrefixedSubAppResource 和 MatchedSubAppResource
     for resource in self._matched_sub_app_resources:
         match_dict, allowed = await resource.resolve(request)
         if match_dict is not None:
@@ -736,3 +741,650 @@ async def resolve(self, request: Request) -> UrlMappingMatchInfo:
 
     return MatchInfoError(self.HTTP_NOT_FOUND)
 ```
+TODO 路由检索流程机制
+
+## 资源
+**资源是路由表中的一项**，`aiohttp`提供了多种不同的资源类型。
+### 用于 http 请求方法的资源
+`PlainResource`表示`path`是固定路径的资源，例如`path = /run`。相关源码实现如下：
+```python
+class PlainResource(Resource):
+    def __init__(self, path: str, *, name: Optional[str] = None) -> None:
+        super().__init__(name=name)
+        assert not path or path.startswith("/")
+        self._path = path
+
+    @property
+    def canonical(self) -> str:
+        return self._path
+
+    def freeze(self) -> None:
+        if not self._path:
+            self._path = "/"
+
+    def add_prefix(self, prefix: str) -> None:
+        assert prefix.startswith("/")
+        assert not prefix.endswith("/")
+        assert len(prefix) > 1
+        self._path = prefix + self._path
+
+    def _match(self, path: str) -> Optional[Dict[str, str]]:
+        # string comparison is about 10 times faster than regexp matching
+        if self._path == path:
+            return {}
+        else:
+            return None
+
+    def raw_match(self, path: str) -> bool:
+        return self._path == path
+
+    def get_info(self) -> _InfoDict:
+        return {"path": self._path}
+
+    def url_for(self) -> URL:  # type: ignore[override]
+        return URL.build(path=self._path, encoded=True)
+
+    def __repr__(self) -> str:
+        name = "'" + self.name + "' " if self.name is not None else ""
+        return f"<PlainResource {name} {self._path}>"
+```
+`PlainResource`接收的`path`参数要么为空（内部会转为默认的`/`），要么必须以`/`开头。`PlainResource`继承`Resource`类，
+源码实现如下：
+```python
+class Resource(AbstractResource):
+    def __init__(self, *, name: Optional[str] = None) -> None:
+        super().__init__(name=name)
+        self._routes: List[ResourceRoute] = []
+
+    def add_route(
+        self,
+        method: str,
+        handler: Union[Type[AbstractView], Handler],
+        *,
+        expect_handler: Optional[_ExpectHandler] = None,
+    ) -> "ResourceRoute":
+        for route_obj in self._routes:
+            if route_obj.method == method or route_obj.method == hdrs.METH_ANY:
+                raise RuntimeError(
+                    "Added route will never be executed, "
+                    "method {route.method} is already "
+                    "registered".format(route=route_obj)
+                )
+
+        route_obj = ResourceRoute(method, handler, self, expect_handler=expect_handler)
+        self.register_route(route_obj)
+        return route_obj
+
+    def register_route(self, route: "ResourceRoute") -> None:
+        assert isinstance(
+            route, ResourceRoute
+        ), f"Instance of Route class is required, got {route!r}"
+        self._routes.append(route)
+
+    async def resolve(self, request: Request) -> _Resolve:
+        allowed_methods: Set[str] = set()
+
+        match_dict = self._match(request.rel_url.raw_path)
+        if match_dict is None:
+            return None, allowed_methods
+
+        for route_obj in self._routes:
+            route_method = route_obj.method
+            allowed_methods.add(route_method)
+
+            if route_method == request.method or route_method == hdrs.METH_ANY:
+                return (UrlMappingMatchInfo(match_dict, route_obj), allowed_methods)
+        else:
+            return None, allowed_methods
+
+    @abc.abstractmethod
+    def _match(self, path: str) -> Optional[Dict[str, str]]:
+        pass  # pragma: no cover
+
+    def __len__(self) -> int:
+        return len(self._routes)
+
+    def __iter__(self) -> Iterator["ResourceRoute"]:
+        return iter(self._routes)
+```
+`PlainResource`提供的属性或方法如下（没有特殊备注的都表示方法）：
++ `name`（属性）：返回调用者指定的名字，也即 name 参数值；
++ `canonical`（属性）：返回调用者指定的 path 参数值；
++ `add_prefix`：给`path`添加一个前缀`prefix`，`prefix`必须以`/`开头，但不能以`/`结尾；
++ `_match`：如果路径相等，返回一个`{}`，如果不匹配返回`None`；
++ `raw_match`：表示和原始注册的`path`是否相等，返回`True`表示相等，否则返回`False`；
++ `get_info`：返回一个固定的字典对象 `{"path": self._path}`；
++ `url_for`：利用`yarl.URL.build`构建资源中的 url (`path`)，返回`URL`对象。
+
+父类`Resource`中会维护一个列表`self._routes: List[ResourceRoute] = []`，存放当前资源有哪些路由项（`ResourceRoute`数据类型，也即资源路由），
+资源路由`ResourceRoute`数据结构在下一小节详细介绍。`Resource`提供了路由注册和路由检索能力，源码实现如下：
+```python
+def add_route(
+    self,
+    method: str,
+    handler: Union[Type[AbstractView], Handler],
+    *,
+    expect_handler: Optional[_ExpectHandler] = None,
+) -> "ResourceRoute":
+    for route_obj in self._routes:
+        # 当前资源已经注册过路由，只允许注册不同的请求方法
+        if route_obj.method == method or route_obj.method == hdrs.METH_ANY:
+            raise RuntimeError(
+                "Added route will never be executed, "
+                "method {route.method} is already "
+                "registered".format(route=route_obj)
+            )
+
+    route_obj = ResourceRoute(method, handler, self, expect_handler=expect_handler)
+    self.register_route(route_obj)
+    return route_obj
+
+def register_route(self, route: "ResourceRoute") -> None:
+    assert isinstance(
+        route, ResourceRoute
+    ), f"Instance of Route class is required, got {route!r}"
+    self._routes.append(route)
+
+async def resolve(self, request: Request) -> _Resolve:
+    allowed_methods: Set[str] = set()
+
+    match_dict = self._match(request.rel_url.raw_path)
+    if match_dict is None:
+        # 如果资源路径和请求路径不匹配
+        return None, allowed_methods
+    # 遍历当前资源内部所有的路由项，直到找到和请求方法匹配的路由项
+    for route_obj in self._routes:
+        route_method = route_obj.method
+        allowed_methods.add(route_method)
+
+        if route_method == request.method or route_method == hdrs.METH_ANY:
+            return (UrlMappingMatchInfo(match_dict, route_obj), allowed_methods)
+    else:
+        return None, allowed_methods
+```
+路由检索方法`resolve`内部使用了`for ... else ...`语法：
+> 如果`for`里的逻辑正常执行完，则`else`逻辑会执行；如果`for`里的逻辑提前退出，例如遇到`break`或者`return`，
+则`else`逻辑不会执行。
+
+如果检索成功，即当前资源中找到匹配的路由项，则返回`(UrlMappingMatchInfo, Set)`元组对象，其中`Set`表示当前资源允许请求方法的集合。
+如果检索失败，返回`(None, Set)`对象。`UrlMappingMatchInfo`的实现源码如下：
+```python
+class UrlMappingMatchInfo(BaseDict, AbstractMatchInfo):
+    def __init__(self, match_dict: Dict[str, str], route: AbstractRoute):
+        super().__init__(match_dict)
+        self._route = route
+        self._apps: List[Application] = []
+        self._current_app: Optional[Application] = None
+        self._frozen = False
+
+    @property
+    def handler(self) -> Handler:
+        return self._route.handler
+
+    @property
+    def route(self) -> AbstractRoute:
+        return self._route
+
+    @property
+    def expect_handler(self) -> _ExpectHandler:
+        return self._route.handle_expect_header
+
+    @property
+    def http_exception(self) -> Optional[HTTPException]:
+        return None
+
+    def get_info(self) -> _InfoDict:  # type: ignore[override]
+        return self._route.get_info()
+
+    @property
+    def apps(self) -> Tuple["Application", ...]:
+        return tuple(self._apps)
+
+    def add_app(self, app: "Application") -> None:
+        if self._frozen:
+            raise RuntimeError("Cannot change apps stack after .freeze() call")
+        if self._current_app is None:
+            self._current_app = app
+        self._apps.insert(0, app)
+
+    @property
+    def current_app(self) -> "Application":
+        app = self._current_app
+        assert app is not None
+        return app
+
+    @contextmanager
+    def set_current_app(self, app: "Application") -> Generator[None, None, None]:
+        if DEBUG:  # pragma: no cover
+            if app not in self._apps:
+                raise RuntimeError(
+                    "Expected one of the following apps {!r}, got {!r}".format(
+                        self._apps, app
+                    )
+                )
+        prev = self._current_app
+        self._current_app = app
+        try:
+            yield
+        finally:
+            self._current_app = prev
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    def __repr__(self) -> str:
+        return f"<MatchInfo {super().__repr__()}: {self._route}>"
+```
+从源码可知，`UrlMappingMatchInfo`本身是个字典对象，可以像使用字典一样使用它（看作是使用`match_dict`），除此之外，
+`UrlMappingMatchInfo`还提供了一些额外的属性和方法。属性`handler`、`route`、`expect_handler`和方法`get_info`
+是直接返回资源路由对象`route`的同名属性或方法。
+
+TODO 其他资源类型介绍完在补充这里的 app 相关的方法介绍
+
+`DynamicResource`表示`path`带有可变路径的资源，例如`path = /run/{name}`。可变部分被指定在`{identifier}`，
+相关源码实现如下：
+```python
+# 匹配 {} 内容，包括 {} 本身
+ROUTE_RE: Final[Pattern[str]] = re.compile(r"(\{[_a-zA-Z][^{}]*(?:\{[^{}]*\}[^{}]*)*\})")
+
+class DynamicResource(Resource):
+    # 匹配形如 {var} 的字符串
+    DYN = re.compile(r"\{(?P<var>[_a-zA-Z][_a-zA-Z0-9]*)\}")
+    # 匹配形如 {var:re} 的字符串
+    DYN_WITH_RE = re.compile(r"\{(?P<var>[_a-zA-Z][_a-zA-Z0-9]*):(?P<re>.+)\}")
+    GOOD = r"[^{}/]+"
+
+    def __init__(self, path: str, *, name: Optional[str] = None) -> None:
+        super().__init__(name=name)
+        pattern = ""
+        formatter = ""
+        # 如果 path = "/run/{name}" 则 split 输出：["/run/", "{name}", ""]
+        # 如果 path = "/run/{name}/{hello}/aaa" 则 split 输出：["/run/", "{name}", "/", "{hello}", "/aaa"]
+        for part in ROUTE_RE.split(path):
+            match = self.DYN.fullmatch(part)
+            if match:
+                # 如果是形如 {var} 的字符串
+                pattern += "(?P<{}>{})".format(match.group("var"), self.GOOD)
+                formatter += "{" + match.group("var") + "}"
+                continue
+
+            match = self.DYN_WITH_RE.fullmatch(part)
+            if match:
+                # 如果是形如 {var: re} 的字符串
+                pattern += "(?P<{var}>{re})".format(**match.groupdict())
+                formatter += "{" + match.group("var") + "}"
+                continue
+
+            if "{" in part or "}" in part:
+                raise ValueError(f"Invalid path '{path}'['{part}']")
+
+            # 不包含可变部分 {}
+            part = _requote_path(part)
+            formatter += part
+            # print(re.escape('https://www.python.org')) ==> https://www\.python\.org
+            pattern += re.escape(part)
+
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"Bad pattern '{pattern}': {exc}") from None
+        # PATH_SEP: Final[str] = re.escape("/")
+        assert compiled.pattern.startswith(PATH_SEP)
+        assert formatter.startswith("/")
+        self._pattern = compiled
+        self._formatter = formatter
+
+    @property
+    def canonical(self) -> str:
+        # 返回原始的 path，如果 path = "/run/{name}/aaa" ==> "/run/{name}/aaa"
+        # 如果 path = "/run/{name:.*}/aaa" ==> "/run/{name}/aaa"
+        return self._formatter
+
+    def add_prefix(self, prefix: str) -> None:
+        assert prefix.startswith("/")
+        assert not prefix.endswith("/")
+        assert len(prefix) > 1
+        self._pattern = re.compile(re.escape(prefix) + self._pattern.pattern)
+        self._formatter = prefix + self._formatter
+
+    def _match(self, path: str) -> Optional[Dict[str, str]]:
+        match = self._pattern.fullmatch(path)
+        if match is None:
+            return None
+        else:
+            return {
+                key: _unquote_path(value) for key, value in match.groupdict().items()
+            }
+
+    def raw_match(self, path: str) -> bool:
+        return self._formatter == path
+
+    def get_info(self) -> _InfoDict:
+        return {"formatter": self._formatter, "pattern": self._pattern}
+
+    def url_for(self, **parts: str) -> URL:
+        # 替换 formatter 中的占位符
+        url = self._formatter.format_map({k: _quote_path(v) for k, v in parts.items()})
+        return URL.build(path=url, encoded=True)
+
+    def __repr__(self) -> str:
+        name = "'" + self.name + "' " if self.name is not None else ""
+        return "<DynamicResource {name} {formatter}>".format(
+            name=name, formatter=self._formatter
+        )
+```
+`DynamicResource`提供的属性或方法如下（没有特殊备注的都表示方法）：
++ `name`（属性）：返回调用者指定的名字，也即 name 参数值；
++ `canonical`（属性）：返回调用者指定的 path 参数值，结果参考下面三种情况；
+    > path = "/run" ==> "/run" <br>
+    > path = "/run/{name}/aaa" ==> "/run/{name}/aaa" <br>
+    > path = "/run/{name:.*}/aaa" ==> "/run{name}/aaa" <br>
++ `add_prefix`：给`formatter`添加一个前缀`prefix`，`prefix`必须以`/`开头，但不能以`/`结尾；同时给匹配模式`pattern`
+也会添加前缀`re.escape(prefix)`；
++ `_match`：如果路径不匹配返回`None`，如果路径匹配返回一个字典，字典中的 key 表示注册可变部分占位符名，
+value 表示和占位符匹配的实际值，样例说明如下：
+    > path = "/run/{name}/aaa"，则 self._match("/run/123/aaa") 返回 {"name": "123"}
++ `raw_match`：表示和原始注册的`self._formatter`（参考`canonical`属性）是否相等，返回`True`表示相等，否则返回`False`；
++ `get_info`：返回一个固定的字典对象 `{"formatter": self._formatter, "pattern": self._pattern}`；
++ `url_for`：首先替换注册路径中的可变部分为实际的值，然后利用`yarl.URL.build`构建资源中的 url (`path`)，返回`URL`对象。
+
+
+### 子应用资源
+子应用资源有两种：用于域名注册的`MatchedSubAppResource`和用`path`注册的`PrefixedSubAppResource`。
+我们先看`PrefixedSubAppResource`资源的内部实现，相关源码如下：
+```python
+class PrefixedSubAppResource(PrefixResource):
+    def __init__(self, prefix: str, app: "Application") -> None:
+        super().__init__(prefix)
+        # subapp
+        self._app = app
+        self._add_prefix_to_resources(prefix)
+
+    def add_prefix(self, prefix: str) -> None:
+        super().add_prefix(prefix)
+        self._add_prefix_to_resources(prefix)
+
+    def _add_prefix_to_resources(self, prefix: str) -> None:
+        # subapp 的路由调度器实例
+        router = self._app.router
+        # 给 subapp 中路由调度器注册的每一路由项(资源)对应的 path 添加前缀 prefix
+        for resource in router.resources():
+            # Since the canonical path of a resource is about
+            # to change, we need to unindex it and then reindex
+            router.unindex_resource(resource)
+            resource.add_prefix(prefix)
+            router.index_resource(resource)
+
+    def url_for(self, *args: str, **kwargs: str) -> URL:
+        raise RuntimeError(".url_for() is not supported " "by sub-application root")
+
+    def get_info(self) -> _InfoDict:
+        return {"app": self._app, "prefix": self._prefix}
+
+    async def resolve(self, request: Request) -> _Resolve:
+        # 委托调用 subapp 中路由调度器路由检索方法
+        # match_info 是一个 UrlMappingMatchInfo 对象
+        match_info = await self._app.router.resolve(request)
+        match_info.add_app(self._app)
+        if isinstance(match_info.http_exception, HTTPMethodNotAllowed):
+            methods = match_info.http_exception.allowed_methods
+        else:
+            methods = set()
+        return match_info, methods
+
+    def __len__(self) -> int:
+        return len(self._app.router.routes())
+
+    def __iter__(self) -> Iterator[AbstractRoute]:
+        # 每一项都是资源路由对象
+        return iter(self._app.router.routes())
+
+    def __repr__(self) -> str:
+        return "<PrefixedSubAppResource {prefix} -> {app!r}>".format(
+            prefix=self._prefix, app=self._app
+        )
+```
+`PrefixedSubAppResource`继承于`PrefixResource`，其源码实现如下：
+```python
+class PrefixResource(AbstractResource):
+    def __init__(self, prefix: str, *, name: Optional[str] = None) -> None:
+        assert not prefix or prefix.startswith("/"), prefix
+        assert prefix in ("", "/") or not prefix.endswith("/"), prefix
+        super().__init__(name=name)
+        self._prefix = _requote_path(prefix)
+        # 用于静态资源路由检索，必须以 / 结尾
+        self._prefix2 = self._prefix + "/"
+
+    @property
+    def canonical(self) -> str:
+        return self._prefix
+
+    def add_prefix(self, prefix: str) -> None:
+        assert prefix.startswith("/")
+        assert not prefix.endswith("/")
+        assert len(prefix) > 1
+        self._prefix = prefix + self._prefix
+        self._prefix2 = self._prefix + "/"
+
+    def raw_match(self, prefix: str) -> bool:
+        return False
+```
+在`PrefixedSubAppResource`初始化阶段会将调用者传递的`prefix`作为前缀添加到 subapp 中路由调度器注册的每一路由项(资源)对应的 `path`，
+样例说明如下：
+```python
+# admin 是 subapp
+admin = web.Application()
+#注册资源（路由项）
+admin.add_routes([web.get('/resource', handler, name='name')])
+
+app.add_subapp('/admin/', admin)
+
+url = admin.router['name'].url_for()
+# URL('/admin/resource')
+```
+`PrefixedSubAppResource`提供的属性或方法如下（没有特殊备注的都表示方法）：
++ `name`（属性）：返回调用者指定的名字，也即 name 参数值；
++ `canonical`（属性）：返回调用者指定的 prefix 参数值；
++ `add_prefix`：给`_prefix`添加一个前缀`prefix`，`prefix`必须以`/`开头，但不能以`/`结尾；
+最后会更新 subapp 中路由调度器实例中注册的所有资源前缀；
++ `get_info`：返回固定的字典对象`{"app": self._app, "prefix": self._prefix}`；
+
+`PrefixedSubAppResource`也提供了路由检索方法`resolve`，其内部会委托调用 subapp 中路由调度器的路由检索方法，
+具体可以参考上面路由表检索小结介绍。
+
+接下来我们看下用于域名注册的`MatchedSubAppResource`资源内部实现。`MatchedSubAppResource`资源初始化参数`rule`是`Domain`
+或者`MaskDomain`类型，其相关源码实现如下：
+```python
+class Domain(AbstractRuleMatching):
+    # 匹配一个不以连字符 "-" 开始或结尾的长度为 1 到 63 的字符串，且字符串只包含小写字母、数字和连字符
+    re_part = re.compile(r"(?!-)[a-z\d-]{1,63}(?<!-)")
+
+    def __init__(self, domain: str) -> None:
+        super().__init__()
+        self._domain = self.validation(domain)
+
+    @property
+    def canonical(self) -> str:
+        return self._domain
+
+    def validation(self, domain: str) -> str:
+        if not isinstance(domain, str):
+            raise TypeError("Domain must be str")
+        domain = domain.rstrip(".").lower()
+        if not domain:
+            raise ValueError("Domain cannot be empty")
+        elif "://" in domain:
+            raise ValueError("Scheme not supported")
+        url = URL("http://" + domain)
+        assert url.raw_host is not None
+        if not all(self.re_part.fullmatch(x) for x in url.raw_host.split(".")):
+            raise ValueError("Domain not valid")
+        if url.port == 80:
+            return url.raw_host
+        return f"{url.raw_host}:{url.port}"
+
+    async def match(self, request: Request) -> bool:
+        host = request.headers.get(hdrs.HOST)
+        if not host:
+            return False
+        return self.match_domain(host)
+
+    def match_domain(self, host: str) -> bool:
+        return host.lower() == self._domain
+
+    def get_info(self) -> _InfoDict:
+        return {"domain": self._domain}
+
+# 域名中有 *
+class MaskDomain(Domain):
+    # 匹配一个不以连字符 "-" 开始或结尾的长度为 1 到 63 的字符串，且字符串只包含小写字母、数字、星号 "*" 和连字符 "-"
+    re_part = re.compile(r"(?!-)[a-z\d\*-]{1,63}(?<!-)")
+
+    def __init__(self, domain: str) -> None:
+        super().__init__(domain)
+        mask = self._domain.replace(".", r"\.").replace("*", ".*")
+        self._mask = re.compile(mask)
+
+    @property
+    def canonical(self) -> str:
+        return self._mask.pattern
+
+    def match_domain(self, host: str) -> bool:
+        return self._mask.fullmatch(host) is not None
+```
+`Domain`和`MaskDomain`提供了用于后续路由检索的`match`方法，内部执行逻辑如下：
++ 如果请求`headers`中没指定`Host`头，则直接不匹配；
++ 如果请求`headers`中`Host`头值和注册的域名`self._domain`相等或者满足正则规则，则匹配成功，否则失败；
+
+现在可以看下`MatchedSubAppResource`资源相关源码实现：
+```python
+class MatchedSubAppResource(PrefixedSubAppResource):
+    def __init__(self, rule: AbstractRuleMatching, app: "Application") -> None:
+        AbstractResource.__init__(self)
+        self._prefix = ""
+        # subapp
+        self._app = app
+        self._rule = rule
+
+    @property
+    def canonical(self) -> str:
+        return self._rule.canonical
+
+    def get_info(self) -> _InfoDict:
+        return {"app": self._app, "rule": self._rule}
+
+    async def resolve(self, request: Request) -> _Resolve:
+        # 检查和请求的 Host 是否匹配成功
+        if not await self._rule.match(request):
+            return None, set()
+        match_info = await self._app.router.resolve(request)
+        match_info.add_app(self._app)
+        if isinstance(match_info.http_exception, HTTPMethodNotAllowed):
+            methods = match_info.http_exception.allowed_methods
+        else:
+            methods = set()
+        return match_info, methods
+
+    def __repr__(self) -> str:
+        return "<MatchedSubAppResource -> {app!r}>" "".format(app=self._app)
+```
+`MatchedSubAppResource`继承于`PrefixedSubAppResource`，`PrefixedSubAppResource`相关实现参考上面介绍。
+`MatchedSubAppResource`提供的属性或方法如下（没有特殊备注的都表示方法）：
++ `name`（属性）：返回调用者指定的名字，也即 name 参数值；
++ `canonical`（属性）：返回调用者指定的 `{url.raw_host}:{url.port}`字符串，如果不指定端口或者默认 80 端口，
+则返回 `url.raw_host`字符串，如果是带有 `*` 的域名，返回域名的匹配模式；
++ `add_prefix`：给`_prefix`添加一个前缀`prefix`，`prefix`必须以`/`开头，但不能以`/`结尾；
+最后会更新 subapp 中路由调度器实例中注册的所有资源前缀；
++ `get_info`：返回固定的字典对象`{"app": self._app, "rule": self._rule}`；
+
+`MatchedSubAppResource`也提供了路由检索方法`resolve`，其内部先检查注册的域名和请求`request`的`Host`是否匹配成功，
+然后会委托调用 subapp 中路由调度器的路由检索方法，具体可以参考上面路由表检索小结介绍。
+
+### 静态资源
+TODO
+
+## 资源路由
+资源路由对象`ResourceRoute`是资源中记录的属于当前资源路由表的一项，内部会记录请求方法及`handler`等，
+数据结构源码实现如下：
+```python
+class ResourceRoute(AbstractRoute):
+    """A route with resource"""
+
+    def __init__(
+        self,
+        method: str,
+        handler: Union[Handler, Type[AbstractView]],
+        resource: AbstractResource,
+        *,
+        expect_handler: Optional[_ExpectHandler] = None,
+    ) -> None:
+        super().__init__(
+            method, handler, expect_handler=expect_handler, resource=resource
+        )
+
+    def __repr__(self) -> str:
+        return "<ResourceRoute [{method}] {resource} -> {handler!r}".format(
+            method=self.method, resource=self._resource, handler=self.handler
+        )
+
+    @property
+    def name(self) -> Optional[str]:
+        if self._resource is None:
+            return None
+        return self._resource.name
+
+    def url_for(self, *args: str, **kwargs: str) -> URL:
+        """Construct url for route with additional params."""
+        assert self._resource is not None
+        return self._resource.url_for(*args, **kwargs)
+
+    def get_info(self) -> _InfoDict:
+        assert self._resource is not None
+        return self._resource.get_info()
+```
+其继承的父类`AbstractRoute`实现的源码如下（省略了抽象方法及参数校验）：
+```python
+class AbstractRoute(abc.ABC):
+    def __init__(
+        self,
+        method: str,
+        handler: Union[Handler, Type[AbstractView]],
+        *,
+        expect_handler: Optional[_ExpectHandler] = None,
+        resource: Optional[AbstractResource] = None,
+    ) -> None:
+        if expect_handler is None:
+            expect_handler = _default_expect_handler
+
+        ...
+        self._method = method
+        self._handler = handler
+        self._expect_handler = expect_handler
+        self._resource = resource
+
+    @property
+    def method(self) -> str:
+        return self._method
+
+    @property
+    def handler(self) -> Handler:
+        return self._handler
+
+    ...
+    
+    @property
+    def resource(self) -> Optional[AbstractResource]:
+        return self._resource
+    
+    ...
+
+    async def handle_expect_header(self, request: Request) -> Optional[StreamResponse]:
+        return await self._expect_handler(request)
+```
+资源路由提供了如下属性或方法（没有备注的表示方法）：
++ `method`（属性）：调用者注册的路由项请求方法；
++ `handler`（属性）：调用者注册的路由项`handler`；
++ `resource`（属性）：当前资源路由所属的资源；
++ `name`（属性）：返回所属资源的名字，如果所属资源不存在返回`None`；
++ `get_info`：直接返回所属资源的`get_info`结果；
++ `url_for`：直接返回所属资源的`url_for`结果；
