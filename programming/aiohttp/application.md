@@ -153,11 +153,14 @@ def _fix_request_current_app(app: "Application") -> Middleware:
 def _prepare_middleware(self) -> Iterator[Middleware]:
     yield from reversed(self._middlewares)
     # 增加一个中间件 (https://github.com/aio-libs/aiohttp/pull/2550)
-    # TODO: 等后面请求模块梳理完了，在补充解释这个bug
+    # 如果 app 有 subapp，且路由匹配到 subapp，因为默认的 match_info.current_app 是 subapp
+    # 这时候 app 中的中间件看到的 request.app 是 subapp 而不是 app 
+    # 所以增加一个而外的中间件，设置 match_info.current_app 为 app
     yield _fix_request_current_app(self)
 
 async def _handle(self, request: Request) -> StreamResponse:
     match_info = await self._router.resolve(request)
+    # 匹配的路由项关联 app
     match_info.add_app(self)
     match_info.freeze()
     resp = None
@@ -169,6 +172,7 @@ async def _handle(self, request: Request) -> StreamResponse:
     if resp is None:
         handler = match_info.handler
         if self._run_middlewares:
+            # 从 subapp -> app 顺序执行
             for app in match_info.apps[::-1]:
                 assert app.pre_frozen, "middleware handlers are not ready"
                 for m in app._middlewares_handlers:
@@ -191,7 +195,7 @@ def pre_freeze(self) -> None:
 + 初始化时候调用`pre_freeze`方法，其中会完成`self._middlewares_handlers`和`self._run_middlewares`变量的更新。
 用以更新`self._middlewares_handlers`变量的`self._prepare_middleware`方法是一个生成器，按照参数`self._middlewares`
 的逆序生成中间件调用链。
-+ 当有客户端发送的请求时，会调用`self._handle`方法处理。如果有中间件，则按初始化阶段构造的顺序，包装生成一个新的
++ 当有客户端发送的请求时，会调用`self._handle`方法处理。如果有中间件，则按初始化阶段构造的顺序 + subapp 到 app 顺序，包装生成一个新的
 `handler`用以处理请求。
 
 ### 信号机制
@@ -356,6 +360,7 @@ url = admin.router['name'].url_for()
 和嵌套应用相关的源码如下：
 ```python
 def _reg_subapp_signals(self, subapp: "Application") -> None:
+    # 将 subapp 的信号添加到 父app 信号中
     def reg_handler(signame: str) -> None:
         subsig = getattr(subapp, signame)
 
@@ -402,7 +407,11 @@ def add_domain(self, domain: str, subapp: "Application") -> AbstractResource:
     factory = partial(MatchedSubAppResource, rule, subapp)
     return self._add_subapp(factory, subapp)
 ```
-TODO 等下面的资源梳理完来，在解释嵌套应用的实现原理
+提供了两种方式注册 subapp 路由项（参考下面路由调度器路由注册小节），一种是通过域名的方式通过调用`add_domain`方法，使用`MatchedSubAppResource`资源；
+另一种是通过路径`prefix`方式调用`add_subapp`方法，使用`PrefixedSubAppResource`资源；两种资源在资源小节有详细说明。
+
+注册 subapp 时，同时会通过调用`self._reg_subapp_signals`方法将`on_startup`、`on_shutdown`和`on_cleanup`信号添加到父 app
+对应的信号中，使得父 app 信号被执行的时，subapp 信号也被执行。
 
 ### 路由调度器对象
 `Application`提供路由调度器实例属性，相关源码如下：
@@ -741,7 +750,56 @@ async def resolve(self, request: Request) -> UrlMappingMatchInfo:
 
     return MatchInfoError(self.HTTP_NOT_FOUND)
 ```
-TODO 路由检索流程机制
+路由检索流程机制可以参考源码注释有详细说明，这里重点关注下返回值。如果检索成功，返回一个`UrlMappingMatchInfo`对象，
+此对象在下面资源小节有详细介绍。如果检索失败，返回一个`MatchInfoError`对象，源码实现如下：
+```python
+class MatchInfoError(UrlMappingMatchInfo):
+    def __init__(self, http_exception: HTTPException) -> None:
+        self._exception = http_exception
+        super().__init__({}, SystemRoute(self._exception))
+
+    @property
+    def http_exception(self) -> HTTPException:
+        return self._exception
+
+    def __repr__(self) -> str:
+        return "<MatchInfoError {}: {}>".format(
+            self._exception.status, self._exception.reason
+        )
+```
+此对象`MatchInfoError`初始化参数是个`http_exception`，并提供`http_exception`属性。重点是初始化父类的资源路由参数是`SystemRoute`
+对象，源码实现如下：
+```python
+class SystemRoute(AbstractRoute):
+    def __init__(self, http_exception: HTTPException) -> None:
+        super().__init__(hdrs.METH_ANY, self._handle)
+        self._http_exception = http_exception
+
+    def url_for(self, *args: str, **kwargs: str) -> URL:
+        raise RuntimeError(".url_for() is not allowed for SystemRoute")
+
+    @property
+    def name(self) -> Optional[str]:
+        return None
+
+    def get_info(self) -> _InfoDict:
+        return {"http_exception": self._http_exception}
+
+    async def _handle(self, request: Request) -> StreamResponse:
+        raise self._http_exception
+
+    @property
+    def status(self) -> int:
+        return self._http_exception.status
+
+    @property
+    def reason(self) -> str:
+        return self._http_exception.reason
+
+    def __repr__(self) -> str:
+        return "<SystemRoute {self.status}: {self.reason}>".format(self=self)
+```
+`SystemRoute`初始化父类的`handler`参数是`self._handle`方法，此方法会抛出一个异常。
 
 ## 资源
 **资源是路由表中的一项**，`aiohttp`提供了多种不同的资源类型。
@@ -804,6 +862,7 @@ class Resource(AbstractResource):
         expect_handler: Optional[_ExpectHandler] = None,
     ) -> "ResourceRoute":
         for route_obj in self._routes:
+            # 当前资源已经注册过路由，只允许注册不同的请求方法
             if route_obj.method == method or route_obj.method == hdrs.METH_ANY:
                 raise RuntimeError(
                     "Added route will never be executed, "
@@ -826,8 +885,9 @@ class Resource(AbstractResource):
 
         match_dict = self._match(request.rel_url.raw_path)
         if match_dict is None:
+            # 如果资源路径和请求路径不匹配
             return None, allowed_methods
-
+        # 遍历当前资源内部所有的路由项，直到找到和请求方法匹配的路由项
         for route_obj in self._routes:
             route_method = route_obj.method
             allowed_methods.add(route_method)
@@ -857,52 +917,8 @@ class Resource(AbstractResource):
 + `url_for`：利用`yarl.URL.build`构建资源中的 url (`path`)，返回`URL`对象。
 
 父类`Resource`中会维护一个列表`self._routes: List[ResourceRoute] = []`，存放当前资源有哪些路由项（`ResourceRoute`数据类型，也即资源路由），
-资源路由`ResourceRoute`数据结构在下一小节详细介绍。`Resource`提供了路由注册和路由检索能力，源码实现如下：
-```python
-def add_route(
-    self,
-    method: str,
-    handler: Union[Type[AbstractView], Handler],
-    *,
-    expect_handler: Optional[_ExpectHandler] = None,
-) -> "ResourceRoute":
-    for route_obj in self._routes:
-        # 当前资源已经注册过路由，只允许注册不同的请求方法
-        if route_obj.method == method or route_obj.method == hdrs.METH_ANY:
-            raise RuntimeError(
-                "Added route will never be executed, "
-                "method {route.method} is already "
-                "registered".format(route=route_obj)
-            )
-
-    route_obj = ResourceRoute(method, handler, self, expect_handler=expect_handler)
-    self.register_route(route_obj)
-    return route_obj
-
-def register_route(self, route: "ResourceRoute") -> None:
-    assert isinstance(
-        route, ResourceRoute
-    ), f"Instance of Route class is required, got {route!r}"
-    self._routes.append(route)
-
-async def resolve(self, request: Request) -> _Resolve:
-    allowed_methods: Set[str] = set()
-
-    match_dict = self._match(request.rel_url.raw_path)
-    if match_dict is None:
-        # 如果资源路径和请求路径不匹配
-        return None, allowed_methods
-    # 遍历当前资源内部所有的路由项，直到找到和请求方法匹配的路由项
-    for route_obj in self._routes:
-        route_method = route_obj.method
-        allowed_methods.add(route_method)
-
-        if route_method == request.method or route_method == hdrs.METH_ANY:
-            return (UrlMappingMatchInfo(match_dict, route_obj), allowed_methods)
-    else:
-        return None, allowed_methods
-```
-路由检索方法`resolve`内部使用了`for ... else ...`语法：
+资源路由`ResourceRoute`数据结构在下一小节详细介绍。`Resource`提供了路由注册`self.add_route`和路由检索`self.resolve`能力，
+路由检索方法`self.resolve`内部使用了`for ... else ...`语法：
 > 如果`for`里的逻辑正常执行完，则`else`逻辑会执行；如果`for`里的逻辑提前退出，例如遇到`break`或者`return`，
 则`else`逻辑不会执行。
 
@@ -941,6 +957,7 @@ class UrlMappingMatchInfo(BaseDict, AbstractMatchInfo):
         return tuple(self._apps)
 
     def add_app(self, app: "Application") -> None:
+        # 每一个 app (包括 subapp) 检索成功，都会调用此方法
         if self._frozen:
             raise RuntimeError("Cannot change apps stack after .freeze() call")
         if self._current_app is None:
@@ -979,7 +996,16 @@ class UrlMappingMatchInfo(BaseDict, AbstractMatchInfo):
 `UrlMappingMatchInfo`还提供了一些额外的属性和方法。属性`handler`、`route`、`expect_handler`和方法`get_info`
 是直接返回资源路由对象`route`的同名属性或方法。
 
-TODO 其他资源类型介绍完在补充这里的 app 相关的方法介绍
+匹配的路由对象`UrlMappingMatchInfo`也应该关联 app 对象，所以每一个 app（包括 subapp）检索成功后，也即找到匹配的路由项，
+都会调用`self.add_app`方法，将此匹配的路由项对象和对应的 app 进行关联。属性`self.current_app`默认是`self.apps[-1]`。
+
+`self.set_current_app`方法是一个上下文管理器修饰的对象，`with self.set_current_app(app): pass`语句执行流程如下：
++ 调用`self.set_current_app(app)`方法；
++ 执行`self.set_current_app(app)`中`yield`之前的代码；
++ 执行`with`中的语句体；
++ `with`中的语句体执行完，执行`yield`之后的代码；
+
+`self.set_current_app`方法是为了解决[bug](https://github.com/aio-libs/aiohttp/pull/2550)。
 
 `DynamicResource`表示`path`带有可变路径的资源，例如`path = /run/{name}`。可变部分被指定在`{identifier}`，
 相关源码实现如下：
