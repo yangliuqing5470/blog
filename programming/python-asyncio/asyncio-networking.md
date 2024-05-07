@@ -2190,7 +2190,7 @@ await writer.wait_closed()
 writer.write(data)
 await writer.drain()
 ```
-如果`StreamWriter`写被暂停，则`await writer.drain()`会暂停，指导写操作恢复。在`drain`中，如果遇到底层的`transport`
+如果`StreamWriter`写被暂停，则`await writer.drain()`会暂停，直到写操作恢复。在`drain`中，如果遇到底层的`transport`
 因为某些原因关闭，则通过`await sleep(0)`把控制器权交给事件循环，使得`connection_lost`在执行`protocol._drain_helper`
 之前被调用，进而使得`protocol._drain_helper`感知到底层`transport`关闭，这样`await writer.drain`会早感知错误，
 不会继续驱动下一条`writer.write(data)` 执行。
