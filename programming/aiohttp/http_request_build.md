@@ -55,6 +55,7 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
         # 变量的存储与获取
         self._state = state
         self._task = task
+        # 请求体大小上限
         self._client_max_size = client_max_size
         self._loop = loop
         self._disconnection_waiters: Set[asyncio.Future[None]] = set()
@@ -545,3 +546,46 @@ a
 }
 ```
 ## 请求信息
+> URL 的结构如下所示：
+>  ```bash
+>   http://user:pass@example.com:8042/over/there?name=ferret#nose
+>   \__/   \__/ \__/ \_________/ \__/\_________/ \_________/ \__/
+>    |      |    |        |       |      |           |        |
+>  scheme  user password host    port   path       query   fragment
+>  ```
+
+`Request`对象包含了 http 请求相关的所有信息，下面对其进行总结和介绍。
++ `task`：表示处理请求的异步任务对象，例如`self._loop.create_task(self.start())`。
+*May be useful for graceful shutdown of long-running requests (streaming, long polling or web-socket)*
+  ```python
+  @property
+  def task(self) -> "asyncio.Task[None]":
+      return self._task
+  ```
++ `protocol`：`Request`对象底层使用的协议；
+  ```python
+  @property
+  def protocol(self) -> "RequestHandler":
+      return self._protocol
+  ```
++ `transport`：`Request`对象底层使用的`transport`对象；
+  ```python
+  @property
+  def transport(self) -> Optional[asyncio.Transport]:
+      if self._protocol is None:
+          return None
+      return self._protocol.transport
+  ```
++ `client_max_size`：表示请求体大小的最大值；
+  ```python
+  @property
+  def client_max_size(self) -> int:
+      return self._client_max_size
+  ```
++ `rel_url`：返回 url 的相对资源路径，也就是只包含 path、query 和 fragment 部分，
+例如上面样例中`/over/there?name=ferret#nose`；
+  ```python
+  @reify
+  def rel_url(self) -> URL:
+      return self._rel_url
+  ```
