@@ -75,6 +75,7 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
 class Request(BaseRequest):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # 路由匹配结果，一个 UrlMappingMatchInfo 对象
         self._match_info: Optional[UrlMappingMatchInfo] = None
 ```
 
@@ -582,10 +583,377 @@ a
   def client_max_size(self) -> int:
       return self._client_max_size
   ```
-+ `rel_url`：返回 url 的相对资源路径，也就是只包含 path、query 和 fragment 部分，
-例如上面样例中`/over/there?name=ferret#nose`；
++ `rel_url`：返回 url 的相对资源路径，也就是只包含 path、query 和 fragment 部分，一个 `yarl.URL`对象，
+例如上面样例中`URL('/over/there?name=ferret#nose')`；
   ```python
   @reify
   def rel_url(self) -> URL:
       return self._rel_url
   ```
++ `secure`：返回一个 bool 值，表示是否是 https 协议；
+  ```python
+  @reify
+  def secure(self) -> bool:
+      """A bool indicating if the request is handled with SSL."""
+      return self.scheme == "https"
+  ```
++ `forwarded`：解析 Forwarded 头，返回一个元组，每一个`Forwarded 'field-value'`都是一个字典；
+  > Forwarded headers 用于在 HTTP 请求或响应中传递关于请求链的信息。它提供了一种机制来跟踪客户端到服务器之间的请求路由路径，
+  > 样例说明如下：
+  > ```bash
+  > Forwarded: by=192.0.2.60; for=192.0.2.0; host=example.com; proto=https
+  > ```
+  > 这个例子中的 Forwarded 标头包含了四个参数：
+  > + by：表示请求的发起者，即客户端的 IP 地址或主机名。
+  > + for：表示原始请求的目标，通常是中间代理的 IP 地址。
+  > + host：表示请求的目标主机。
+  > + proto：表示请求使用的协议。
+
+  > 如果有多个代理服务器，用逗号分开，样例如下：
+  > ```bash
+  > Forwarded: for=192.0.2.60;by=proxy1.example.com;proto=https, for=203.0.113.11;by=proxy2.example.com;proto=http
+  > ```
++ `scheme`：返回请求 url 中的 scheme 部分，例如 http/https；
+  ```python
+  @reify
+  def scheme(self) -> str:
+      """A string representing the scheme of the request.
+  
+      Hostname is resolved in this order:
+  
+      - overridden value by .clone(scheme=new_scheme) call.
+      - type of connection to peer: HTTPS if socket is SSL, HTTP otherwise.
+  
+      'http' or 'https'.
+      """
+      if self._transport_sslcontext:
+          return "https"
+      else:
+          return "http"
+  ```
++ `method`：返回请求方法，例如 GET/POST 等；
+  ```python
+  @reify
+  def method(self) -> str:
+      """Read only property for getting HTTP method.
+
+      The value is upper-cased str like 'GET', 'POST', 'PUT' etc.
+      """
+      return self._method
+  ```
++ `version`：返回 HTTP 的版本，一个`aiohttp.protocol.HttpVersion`实例；
+  ```python
+  @reify
+  def version(self) -> HttpVersion:
+      """Read only property for getting HTTP version of request.
+
+      Returns aiohttp.protocol.HttpVersion instance.
+      """
+      return self._version
+  ```
++ `host`：返回请求头 Host 的值，一个字符串对象；如果没有请求头，返回`socket.getfqdn()`的值；
+  ```python
+  @reify
+  def host(self) -> str:
+      """Hostname of the request.
+
+      Hostname is resolved in this order:
+
+      - overridden value by .clone(host=new_host) call.
+      - HOST HTTP header
+      - socket.getfqdn() value
+      """
+      host = self._message.headers.get(hdrs.HOST)
+      if host is not None:
+          return host
+      return socket.getfqdn()
+  ```
++ `remote`：返回客户端的 ip，如果获取不到返回 None；
+  ```python
+  @reify
+  def remote(self) -> Optional[str]:
+      """Remote IP of client initiated HTTP request.
+
+      The IP is resolved in this order:
+
+      - overridden value by .clone(remote=new_remote) call.
+      - peername of opened socket
+      """
+      if self._transport_peername is None:
+          return None
+      # self._transport_peername 是 (ip, port)
+      if isinstance(self._transport_peername, (list, tuple)):
+          return str(self._transport_peername[0])
+      return str(self._transport_peername)
+  ```
++ `url`：返回完整的 url 的`yarl.URL`对象，也包含 scheme、host 和 port 部分，例如：`URL('http://example.com:8042/over/there?name=ferret#nose')`；
+  ```python
+  @reify
+  def url(self) -> URL:
+      url = URL.build(scheme=self.scheme, host=self.host)
+      return url.join(self._rel_url)
+  ```
++ `path`：返回 url 中的 path 部分，一个字符串，例如：`/over/there`；
+  ```python
+  @reify
+  def path(self) -> str:
+      """The URL including *PATH INFO* without the host or scheme.
+
+      E.g., ``/app/blog``
+      """
+      return self._rel_url.path
+  ```
++ `path_qs`：返回一个字符串，表示 url 的相对资源路径，也就是只包含 path、query 和 fragment 部分，例如：`/over/there?name=ferret#nose`；
+  ```python
+  @reify
+  def path_qs(self) -> str:
+      """The URL including PATH_INFO and the query string.
+
+      E.g, /app/blog?id=10
+      """
+      return str(self._rel_url)
+  ```
++ `raw_path`：返回一个字符串，表示**请求行**中的 path 部分；
+  ```python
+  @reify
+  def raw_path(self) -> str:
+      """The URL including raw *PATH INFO* without the host or scheme.
+
+      Warning, the path is unquoted and may contains non valid URL characters
+
+      E.g., ``/my%2Fpath%7Cwith%21some%25strange%24characters``
+      """
+      return self._message.path
+  ```
++ `query`：返回一个 MultiDictProxy 对象，表示 url 中的 query 部分，例如：`<MultiDictProxy('name': 'ferret')>`；
+  ```python
+  @reify
+  def query(self) -> MultiDictProxy[str]:
+      """A multidict with all the variables in the query string."""
+      return MultiDictProxy(self._rel_url.query)
+  ```
++ `query_string`：返回一个字符串，表示 url 中的 query 部分，例如：`name=ferret`；
+  ```python
+  @reify
+  def query_string(self) -> str:
+      """The query string in the URL.
+
+      E.g., id=10
+      """
+      return self._rel_url.query_string
+  ```
++ `headers`：一个 case-insensitive 的 multidict 对象，包含所有的请求头信息；
+  ```python
+  @reify
+  def headers(self) -> "CIMultiDictProxy[str]":
+      """A case-insensitive multidict proxy with all headers."""
+      return self._headers
+  ```
++ `raw_headers`：一个元组，每一个元素是`(bname, bvalue)`，表示一个请求头名字和取值，`bname`和`bvalue`是字节序列；
+  ```python
+  @reify
+  def raw_headers(self) -> RawHeaders:
+      """A sequence of pairs for all headers."""
+      return self._message.raw_headers
+  ```
++ `if_modified_since`：返回请求头`If-Modified-Since`的值或者 None；
+  > 通常用于条件 GET 请求。它允许客户端告知服务器，它只需要响应一个在指定时间之后被修改过的资源。
+  如果资源自指定时间之后未被修改，服务器将返回一个 304 Not Modified 响应，而不是完整的资源内容，样例如下：
+  ```bash
+  If-Modified-Since: Sat, 08 May 2021 12:00:00 GMT
+  ```
+  ```python
+  @reify
+  def if_modified_since(self) -> Optional[datetime.datetime]:
+      """The value of If-Modified-Since HTTP header, or None.
+
+      This header is represented as a `datetime` object.
+      """
+      return parse_http_date(self.headers.get(hdrs.IF_MODIFIED_SINCE))
+  ```
++ `if_unmodified_since`：返回请求头`If-Unmodified-Since`的值，或者None；
+  ```python
+  @reify
+  def if_unmodified_since(self) -> Optional[datetime.datetime]:
+      """The value of If-Unmodified-Since HTTP header, or None.
+
+      This header is represented as a `datetime` object.
+      """
+      return parse_http_date(self.headers.get(hdrs.IF_UNMODIFIED_SINCE))
+  ```
++ `if_range`：返回请求头`If-Range`的值，或者None；
+  ```python
+  @reify
+  def if_range(self) -> Optional[datetime.datetime]:
+      """The value of If-Range HTTP header, or None.
+
+      This header is represented as a `datetime` object.
+      """
+      return parse_http_date(self.headers.get(hdrs.IF_RANGE))
+  ```
++ `if_match`：返回一个元组，表示请求头`If-Match`的值，每一个元素都是 ETag，或者返回None；
++ `if_none_match`：返回一个元组，表示请求头`If-None-Match`的值，每一个元素都是 ETag，或者返回None；
+  > ETag（实体标签）是用于标识资源版本的一种机制。它是由服务器为每个资源分配的一个唯一的标识符，
+  通常是资源内容的哈希值或其他类似的指纹。ETag 被用来帮助客户端和服务器在资源是否发生变化方面进行有效的缓存管理和条件请求。
+  >
+  > ETag 的工作方式如下：
+  > + 当服务器响应一个资源请求时，它会附加一个 ETag 头，其中包含了资源的标识符。
+  > + 客户端在后续请求中，如果想要检查资源是否发生了变化，可以将上次获取的 ETag 值发送给服务器，通过条件请求来验证资源的状态。
+  
+  > ETag 可以是任何能唯一标识资源版本的字符串，但通常采用以下两种方式生成：
+  > + 哈希值：服务器可以计算资源内容的哈希值（如 MD5、SHA1 等），将其作为 ETag。
+  > + 时间戳或版本号：资源的最后修改时间戳或版本号可以作为 ETag。如果资源发生变化，时间戳或版本号也会改变，因此它们可以作为资源版本的标识符。
+
+  > 客户端可以使用 ETag 来进行条件请求，包括：
+  > + If-None-Match：客户端可以发送上次获取的 ETag 值，询问服务器是否有新的资源版本。
+  > + If-Match：客户端可以发送希望修改的资源的 ETag 值，服务器会检查该 ETag 是否匹配当前资源版本，如果匹配，则执行请求，否则返回 412 Precondition Failed
++ `keep_alive`：一个 bool 值，表示是否是长连接：
+  ```python
+  @reify
+  def keep_alive(self) -> bool:
+      """Is keepalive enabled by client?"""
+      return not self._message.should_close
+  ```
++ `cookies`：返回一个字典对象，包含所有的 cookies 信息；
+  ```python
+  @reify
+  def cookies(self) -> Mapping[str, str]:
+      """Return request cookies.
+
+      A read-only dictionary-like object.
+      """
+      raw = self.headers.get(hdrs.COOKIE, "")
+      parsed = SimpleCookie(raw)
+      return MappingProxyType({key: val.value for key, val in parsed.items()})
+  ```
++ `http_range`：放回请求头`Range`的内容，结果是一个切片对象`slice(start, end, 1)`；
+  > Range 是一个 HTTP 请求头，用于指定客户端想要获取的资源的范围。它通常与 GET 请求一起使用，
+  允许客户端请求资源的部分内容，而不是整个资源，样例说明如下：
+  ```bash
+  Range: bytes=0-499
+  ```
+  > Range 头的值通常是一个范围描述，指定了资源的起始和结束位置。在这个例子中，
+  bytes=0-499 表示从字节偏移量 0 开始，到字节偏移量 499 结束的范围。
+  > 
+  > 服务器在收到带有 Range 头的请求后，可以根据指定的范围，返回相应的资源部分，
+  并使用状态码 206 Partial Content 响应。如果服务器无法满足范围请求，或者不支持范围请求，
+  它会返回完整的资源内容，使用状态码 200 OK 响应
++ `content`：返回请求体的流式写对象`StreamWriter`；
+  ```python
+  @reify
+  def content(self) -> StreamReader:
+      """Return raw payload stream."""
+      return self._payload
+  ```
++ `can_read_body`：返回 bool 值，表示请求体是否可读；
+  ```python
+  @property
+  def can_read_body(self) -> bool:
+      """Return True if request's HTTP BODY can be read, False otherwise."""
+      return not self._payload.at_eof()
+  ```
++ `body_exists`：一个 bool 值，表示请求体是否存在；
+  ```python
+  @reify
+  def body_exists(self) -> bool:
+      """Return True if request has HTTP BODY, False otherwise."""
+      return type(self._payload) is not EmptyStreamReader
+  ```
++ `content_length`：返回请求头`Content-Length`的值；
+  ```python
+  @property
+  def content_length(self) -> Optional[int]:
+      """The value of Content-Length HTTP header."""
+      content_length = self._headers.get(  # type: ignore[attr-defined]
+          hdrs.CONTENT_LENGTH
+      )
+
+      if content_length is not None:
+          return int(content_length)
+      else:
+          return None
+  ```
++ `charset`：获取请求头`Content-Type`的`charset`部分；
++ `content_type`：获取请求头`Content-Type`内容；
+  > Content-Type 样例如下：
+  ```bash
+  Content-Type: text/html; charset=UTF-8
+  ```
++ `match_info`：返回匹配的路由结果对象`UrlMappingMatchInfo`；
+  ```python
+  @reify
+  def match_info(self) -> "UrlMappingMatchInfo":
+      """Result of route resolving."""
+      match_info = self._match_info
+      assert match_info is not None
+      return match_info
+  ```
++ `app`：返回和匹配路由关联的`Application`对象；
+  ```python
+  @property
+  def app(self) -> "Application":
+      """Application instance."""
+      match_info = self._match_info
+      assert match_info is not None
+      return match_info.current_app
+  ```
++ `config_dict`：返回一个`ChainMapProxy`对象，包含当前 app 以及所有父 app；
+  ```python
+  @property
+  def config_dict(self) -> ChainMapProxy:
+      match_info = self._match_info
+      assert match_info is not None
+      lst = match_info.apps
+      app = self.app
+      # 获取当前 app 的索引
+      idx = lst.index(app)
+      sublist = list(reversed(lst[: idx + 1]))
+      return ChainMapProxy(sublist)
+  ```
+## 优雅关闭及信息交互
+`Request`对象提供了自身复制能力`clone`用于返回一个新的实例并替换一些属性。
+
+`_prepare_hook`方法用于在默认响应头准备完到发送之间执行，主要用来触发`on_response_prepare`信号，源码如下：
+```python
+async def _prepare_hook(self, response: StreamResponse) -> None:
+    match_info = self._match_info
+    if match_info is None:
+        return
+    for app in match_info._apps:
+        # 触发 on_response_prepare 信号
+        await app.on_response_prepare.send(self, response)
+```
+`Request`的优雅关闭主要涉及三个方法：`wait_for_disconnection`、`_finish`和`_cancel`，源码如下：
+```python
+def _cancel(self, exc: BaseException) -> None:
+    set_exception(self._payload, exc)
+    for fut in self._disconnection_waiters:
+        set_result(fut, None)
+
+def _finish(self) -> None:
+    for fut in self._disconnection_waiters:
+        fut.cancel()
+
+    if self._post is None or self.content_type != "multipart/form-data":
+        return
+
+    # NOTE: Release file descriptors for the
+    # NOTE: `tempfile.Temporaryfile`-created `_io.BufferedRandom`
+    # NOTE: instances of files sent within multipart request body
+    # NOTE: via HTTP POST request.
+    for file_name, file_field_object in self._post.items():
+        if not isinstance(file_field_object, FileField):
+            continue
+        # 关闭请求传输文件对象
+        file_field_object.file.close()
+
+async def wait_for_disconnection(self) -> None:
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future[None] = loop.create_future()
+    self._disconnection_waiters.add(fut)
+    try:
+        await fut
+    finally:
+        self._disconnection_waiters.remove(fut)
+```
+TODO 使用场景后面在补充，这是新加特性
