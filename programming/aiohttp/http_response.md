@@ -245,3 +245,376 @@ May be useful for graceful shutdown of long-running requests (streaming, long po
           ctype = self._content_type
       self._headers[CONTENT_TYPE] = ctype
   ```
++ `charset`：返回或更新 Content-Type 的 charset 部分（charset 的值），也就是后面的`charset=xxx`部分；
+  ```python
+  @charset.setter
+  def charset(self, value: Optional[str]) -> None:
+      # 用来更新 self._content_dict 变量，存储后面的 key=value 内容
+      ctype = self.content_type  # read header values if needed
+      if ctype == "application/octet-stream":
+          raise RuntimeError(
+              "Setting charset for application/octet-stream "
+              "doesn't make sense, setup content_type first"
+          )
+      assert self._content_dict is not None
+      if value is None:
+          # 删除
+          self._content_dict.pop("charset", None)
+      else:
+          # 更新 charset 的值
+          self._content_dict["charset"] = str(value).lower()
+      # 更新 Content-Type 全部值字符串
+      self._generate_content_type_header()
+  ```
++ `last_modified`：返回或更新 Last-Modified 响应头值；
+  ```python
+  @property
+  def last_modified(self) -> Optional[datetime.datetime]:
+      """The value of Last-Modified HTTP header, or None.
+
+      This header is represented as a `datetime` object.
+      """
+      return parse_http_date(self._headers.get(hdrs.LAST_MODIFIED))
+
+  @last_modified.setter
+  def last_modified(
+      self, value: Optional[Union[int, float, datetime.datetime, str]]
+  ) -> None:
+      if value is None:
+          # 删除
+          self._headers.pop(hdrs.LAST_MODIFIED, None)
+      elif isinstance(value, (int, float)):
+          self._headers[hdrs.LAST_MODIFIED] = time.strftime(
+              "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(math.ceil(value))
+          )
+      elif isinstance(value, datetime.datetime):
+          self._headers[hdrs.LAST_MODIFIED] = time.strftime(
+              "%a, %d %b %Y %H:%M:%S GMT", value.utctimetuple()
+          )
+      elif isinstance(value, str):
+          self._headers[hdrs.LAST_MODIFIED] = value
+  ```
++ `etag`：返回或更新响应头 Etag 的值；
+  ```python
+  @property
+  def etag(self) -> Optional[ETag]:
+      quoted_value = self._headers.get(hdrs.ETAG)
+      if not quoted_value:
+          return None
+      # ETAG_ANY = "*"
+      elif quoted_value == ETAG_ANY:
+          return ETag(value=ETAG_ANY)
+      match = QUOTED_ETAG_RE.fullmatch(quoted_value)
+      if not match:
+          return None
+      is_weak, value = match.group(1, 2)
+      return ETag(
+          is_weak=bool(is_weak),
+          value=value,
+      )
+
+  @etag.setter
+  def etag(self, value: Optional[Union[ETag, str]]) -> None:
+      if value is None:
+          # 删除
+          self._headers.pop(hdrs.ETAG, None)
+      # ETAG_ANY = "*"
+      elif (isinstance(value, str) and value == ETAG_ANY) or (
+          isinstance(value, ETag) and value.value == ETAG_ANY
+      ):
+          self._headers[hdrs.ETAG] = ETAG_ANY
+      elif isinstance(value, str):
+          validate_etag_value(value)
+          self._headers[hdrs.ETAG] = f'"{value}"'
+      elif isinstance(value, ETag) and isinstance(value.value, str):  # type: ignore[redundant-expr]
+          validate_etag_value(value.value)
+          hdr_value = f'W/"{value.value}"' if value.is_weak else f'"{value.value}"'
+          self._headers[hdrs.ETAG] = hdr_value
+      else:
+          raise ValueError(
+              f"Unsupported etag type: {type(value)}. "
+              f"etag must be str, ETag or None"
+          )
+  ```
+## 数据准备与发送
+响应数据准备阶段包括响应头设置、执行钩子函数（触发响应准备信号）和发送响应头。
+相关源码如下：
+```python
+async def prepare(self, request: "BaseRequest") -> Optional[AbstractStreamWriter]:
+    # 判断是否写结束
+    if self._eof_sent:
+        return None
+    # prepare 已经被执行过
+    if self._payload_writer is not None:
+        return self._payload_writer
+    # 响应体是否为空
+    self._must_be_empty_body = must_be_empty_body(request.method, self.status)
+    return await self._start(request)
+
+async def _start(self, request: "BaseRequest") -> AbstractStreamWriter:
+    # 设置构建的请求对象
+    self._req = request
+    # 设置流式写对象，用于发送响应报文
+    writer = self._payload_writer = request._payload_writer
+
+    await self._prepare_headers()
+    await request._prepare_hook(self)
+    await self._write_headers()
+
+    return writer
+```
+第一步准备响应头的源码实现如下：
+```python
+async def _prepare_headers(self) -> None:
+    request = self._req
+    assert request is not None
+    writer = self._payload_writer
+    assert writer is not None
+    keep_alive = self._keep_alive
+    if keep_alive is None:
+        # 如果响应头没有指定 keep_alive，则使用请求中指定的 keep_alive
+        keep_alive = request.keep_alive
+    self._keep_alive = keep_alive
+    # 协议版本
+    version = request.version
+
+    headers = self._headers
+    # 设置 cookies 信息
+    populate_with_cookies(headers, self.cookies)
+    # 开始数据压缩
+    if self._compression:
+        await self._start_compression(request)
+    # 分块传输
+    if self._chunked:
+        if version != HttpVersion11:
+            raise RuntimeError(
+                "Using chunked encoding is forbidden "
+                "for HTTP/{0.major}.{0.minor}".format(request.version)
+            )
+        # 有响应体，给流式写对象设置分块传输，更新响应头 Transfer-Encoding=chunked
+        if not self._must_be_empty_body:
+            writer.enable_chunking()
+            headers[hdrs.TRANSFER_ENCODING] = "chunked"
+        # 如果响应头有 Content-Length，删除
+        if hdrs.CONTENT_LENGTH in headers:
+            del headers[hdrs.CONTENT_LENGTH]
+    # 检查响应头 Content-Length
+    elif self._length_check:
+        # 设置流式写对象最多发送的响应体的大小
+        writer.length = self.content_length
+        if writer.length is None:
+            # 响应头没有 Content-Length
+            if version >= HttpVersion11:
+                # 有响应体，给流式写对象设置分块传输，
+                # 更新响应头 Transfer-Encoding=chunked
+                if not self._must_be_empty_body:
+                    writer.enable_chunking()
+                    headers[hdrs.TRANSFER_ENCODING] = "chunked"
+            elif not self._must_be_empty_body:
+                keep_alive = False
+
+    # HTTP 1.1: https://tools.ietf.org/html/rfc7230#section-3.3.2
+    # HTTP 1.0: https://tools.ietf.org/html/rfc1945#section-10.4
+    # 空的响应体
+    if self._must_be_empty_body:
+        # 删除响应头中的 Content-Length
+        if hdrs.CONTENT_LENGTH in headers and should_remove_content_length(
+            request.method, self.status
+        ):
+            del headers[hdrs.CONTENT_LENGTH]
+        # https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-10
+        # https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-13
+        # 删除响应头中的 Transfer-Encoding
+        if hdrs.TRANSFER_ENCODING in headers:
+            del headers[hdrs.TRANSFER_ENCODING]
+    else:
+        # 设置 Content-Type 响应头
+        headers.setdefault(hdrs.CONTENT_TYPE, "application/octet-stream")
+    # 设置 Date 响应头
+    headers.setdefault(hdrs.DATE, rfc822_formatted_time())
+    # 设置 Server 响应头
+    # SERVER_SOFTWARE: str = "Python/{0[0]}.{0[1]} aiohttp/{1}".format(sys.version_info, __version__)
+    headers.setdefault(hdrs.SERVER, SERVER_SOFTWARE)
+    # 设置 Connection 响应头
+    # connection header
+    if hdrs.CONNECTION not in headers:
+        if keep_alive:
+            if version == HttpVersion10:
+                headers[hdrs.CONNECTION] = "keep-alive"
+        else:
+            if version == HttpVersion11:
+                headers[hdrs.CONNECTION] = "close"
+```
+在准备响应头`_prepare_headers`源码中，数据压缩的源码实现如下：
+```python
+async def _do_start_compression(self, coding: ContentCoding) -> None:
+    # 编码方式不是 identity
+    if coding != ContentCoding.identity:
+        assert self._payload_writer is not None
+        # 设置响应头 Content-Encoding
+        self._headers[hdrs.CONTENT_ENCODING] = coding.value
+        # 用指定的编码，开启流式写对象的数据编码
+        self._payload_writer.enable_compression(coding.value)
+        # Compressed payload may have different content length,
+        # remove the header
+        # 删除原始响应头 Content-Length
+        self._headers.popall(hdrs.CONTENT_LENGTH, None)
+
+async def _start_compression(self, request: "BaseRequest") -> None:
+    # 指定了压缩编码方式
+    if self._compression_force:
+        await self._do_start_compression(self._compression_force)
+    else:
+        # Encoding comparisons should be case-insensitive
+        # https://www.rfc-editor.org/rfc/rfc9110#section-8.4.1
+        # 使用请求头 Accept-Encoding 指定的编码方式
+        accept_encoding = request.headers.get(hdrs.ACCEPT_ENCODING, "").lower()
+        # ContentCoding 包含 deflate/gzip/identity 三种编码方式
+        for coding in ContentCoding:
+            if coding.value in accept_encoding:
+                await self._do_start_compression(coding)
+                return
+```
+根据源码可知，压缩编码方式可以指定，如果没指定会取请求头 Accept-Encoding 指定的值。
+
+第二步执行钩子函数（触发响应准备信号）源码如下：
+```python
+async def _prepare_hook(self, response: StreamResponse) -> None:
+    match_info = self._match_info
+    if match_info is None:
+        return
+    for app in match_info._apps:
+        # 这里的 self 是 Request 对象
+        await app.on_response_prepare.send(self, response)
+```
+相关实现在请求体对象中`Request._prepare_hook`，主要是发送响应准备信号`on_response_prepare`。
+
+第三步发送响应头相关源码如下：
+```python
+async def _write_headers(self) -> None:
+    request = self._req
+    assert request is not None
+    writer = self._payload_writer
+    assert writer is not None
+    # status line
+    version = request.version
+    # 构造响应行，例如 HTTP/1.1 200 OK
+    status_line = "HTTP/{}.{} {} {}".format(
+        version[0], version[1], self._status, self._reason
+    )
+    # 委托底层的流式写对象 StreamWriter 进行发送
+    await writer.write_headers(status_line, self._headers)
+```
+响应数据发送的源码如下：
+```python
+async def write(self, data: bytes) -> None:
+    assert isinstance(
+        data, (bytes, bytearray, memoryview)
+    ), "data argument must be byte-ish (%r)" % type(data)
+
+    if self._eof_sent:
+        raise RuntimeError("Cannot call write() after write_eof()")
+    if self._payload_writer is None:
+        raise RuntimeError("Cannot call write() before prepare()")
+
+    await self._payload_writer.write(data)
+
+async def write_eof(self, data: bytes = b"") -> None:
+    assert isinstance(
+        data, (bytes, bytearray, memoryview)
+    ), "data argument must be byte-ish (%r)" % type(data)
+
+    if self._eof_sent:
+        return
+
+    assert self._payload_writer is not None, "Response has not been started"
+
+    await self._payload_writer.write_eof(data)
+    # 设置发送完成标志
+    self._eof_sent = True
+    self._req = None
+    # 更新响应报文的大小
+    self._body_length = self._payload_writer.output_size
+    self._payload_writer = None
+```
+`write`：用于发送响应体数据；`write_eof`：用于通知响应体数据发送完成。
+
+# Response
+`Response`继承`StreamResponse`，下面对`Response`独有地方进行说明。
+## 初始化
+`Response`类初始化源码如下：
+```python
+class Response(StreamResponse):
+    def __init__(
+        self,
+        *,
+        body: Any = None,
+        status: int = 200,
+        reason: Optional[str] = None,
+        text: Optional[str] = None,
+        headers: Optional[LooseHeaders] = None,
+        content_type: Optional[str] = None,
+        charset: Optional[str] = None,
+        zlib_executor_size: Optional[int] = None,
+        zlib_executor: Optional[Executor] = None,
+    ) -> None:
+        if body is not None and text is not None:
+            raise ValueError("body and text are not allowed together")
+        # 参数指定响应头
+        if headers is None:
+            real_headers: CIMultiDict[str] = CIMultiDict()
+        elif not isinstance(headers, CIMultiDict):
+            real_headers = CIMultiDict(headers)
+        else:
+            real_headers = headers  # = cast('CIMultiDict[str]', headers)
+
+        if content_type is not None and "charset" in content_type:
+            raise ValueError("charset must not be in content_type " "argument")
+
+        if text is not None:
+            if hdrs.CONTENT_TYPE in real_headers:
+                if content_type or charset:
+                    raise ValueError(
+                        "passing both Content-Type header and "
+                        "content_type or charset params "
+                        "is forbidden"
+                    )
+            else:
+                # fast path for filling headers
+                if not isinstance(text, str):
+                    raise TypeError("text argument must be str (%r)" % type(text))
+                if content_type is None:
+                    content_type = "text/plain"
+                if charset is None:
+                    charset = "utf-8"
+                real_headers[hdrs.CONTENT_TYPE] = content_type + "; charset=" + charset
+                body = text.encode(charset)
+                text = None
+        else:
+            if hdrs.CONTENT_TYPE in real_headers:
+                if content_type is not None or charset is not None:
+                    raise ValueError(
+                        "passing both Content-Type header and "
+                        "content_type or charset params "
+                        "is forbidden"
+                    )
+            else:
+                if content_type is not None:
+                    if charset is not None:
+                        content_type += "; charset=" + charset
+                    real_headers[hdrs.CONTENT_TYPE] = content_type
+
+        super().__init__(status=status, reason=reason, headers=real_headers)
+
+        if text is not None:
+            self.text = text
+        else:
+            self.body = body
+
+        self._compressed_body: Optional[bytes] = None
+        self._zlib_executor_size = zlib_executor_size
+        self._zlib_executor = zlib_executor
+```
+## 属性
+
+## 数据准备与发送
