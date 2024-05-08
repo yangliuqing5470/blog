@@ -496,10 +496,10 @@ class HeadersParser:
 我们继续往上回到`parse_message`方法。返回是个`RawRequestMessage`数据类型，各个字段的含义如下：
 - `method`: 请求行方法，例如 `GET`
 - `path`: 请求行中的 `path` 部分，例如 `/index.html`
-- `version_o`: 请求行中协议版本号，例如 `HttpVersion(1, 1)`
+- `version`: 请求行中协议版本号，例如 `HttpVersion(1, 1)`
 - `headers`: 一个只读的字典，包含所有的请求头及值，其中 key 是大小写不敏感，也就是同一个 key 不能同时存在大写和小写；
 - `raw_headers`: 一个元组，每一项都是`(bname, bvalue)`形式表示一个请求头名字和取值，`bname`和`bvalue`是字节序列；
-- `close`: 一个 `bool` 值，控制长连接。http/1.1 默认是 `False`，http/1.0 默认是 `True`；如果请求头有指定，以指定为准；
+- `should_close`: 一个 `bool` 值，控制长连接。http/1.1 默认是 `False`，http/1.0 默认是 `True`；如果请求头有指定，以指定为准；
 - `compression`: `str` 类型，压缩类型，如果请求头中不指定或者指定值不在 `("gzip", "deflate", "br")`，取值 `None`，否则按指定值；
 - `upgrade`: 一个 `bool` 类型，表示是否升级协议；
 - `chunked`: 一个 `bool` 类型，表示是否是分块传输；
