@@ -874,7 +874,7 @@ a
           return None
   ```
 + `charset`：获取请求头`Content-Type`的`charset`部分；
-+ `content_type`：获取请求头`Content-Type`内容；
++ `content_type`：获取请求头`Content-Type`内容，例如：`text/html`，不包含后面的`key=value`内容；
   > Content-Type 样例如下：
   ```bash
   Content-Type: text/html; charset=UTF-8
