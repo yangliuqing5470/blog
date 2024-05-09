@@ -22,7 +22,7 @@ Content-Length: 1245
 + **空行**：用于分隔响应头和响应体。
 + **响应体（Response Body）**：包含了实际的资源数据，这里是一个简单的 HTML 文档
 
-aiohttp 为 http 响应提供了三个类：`StreamResponse`、`Response`和`FileResponse`。
+aiohttp 为 http 响应提供了三个类：`StreamResponse`、`Response`和`FileResponse`，以及一个便捷的`json_response`方法。
 # StreamResponse
 ## 初始化
 `StreamResponse`类的初始化源码如下：
@@ -247,6 +247,11 @@ May be useful for graceful shutdown of long-running requests (streaming, long po
   ```
 + `charset`：返回或更新 Content-Type 的 charset 部分（charset 的值），也就是后面的`charset=xxx`部分；
   ```python
+  @property
+  def charset(self) -> Optional[str]:
+      # Just a placeholder for adding setter
+      return super().charset
+
   @charset.setter
   def charset(self, value: Optional[str]) -> None:
       # 用来更新 self._content_dict 变量，存储后面的 key=value 内容
@@ -560,18 +565,19 @@ class Response(StreamResponse):
     ) -> None:
         if body is not None and text is not None:
             raise ValueError("body and text are not allowed together")
-        # 参数指定响应头
+        # 参数指定的响应头
         if headers is None:
             real_headers: CIMultiDict[str] = CIMultiDict()
         elif not isinstance(headers, CIMultiDict):
             real_headers = CIMultiDict(headers)
         else:
             real_headers = headers  # = cast('CIMultiDict[str]', headers)
-
+        # 参数 content_type 不能包含 charset
         if content_type is not None and "charset" in content_type:
             raise ValueError("charset must not be in content_type " "argument")
-
+        # text 表示响应体内容，字符串形式
         if text is not None:
+            # 如果响应头有 Content-Type，则参数 content_type 或者 charset 都不能传
             if hdrs.CONTENT_TYPE in real_headers:
                 if content_type or charset:
                     raise ValueError(
@@ -579,6 +585,7 @@ class Response(StreamResponse):
                         "content_type or charset params "
                         "is forbidden"
                     )
+            # 响应头没有 Content-Type
             else:
                 # fast path for filling headers
                 if not isinstance(text, str):
@@ -587,10 +594,13 @@ class Response(StreamResponse):
                     content_type = "text/plain"
                 if charset is None:
                     charset = "utf-8"
+                # 设置 Content-Type 响应头
                 real_headers[hdrs.CONTENT_TYPE] = content_type + "; charset=" + charset
+                # 编码响应体
                 body = text.encode(charset)
                 text = None
         else:
+            # 如果响应头有 Content-Type，则参数 content_type 或者 charset 都不能传
             if hdrs.CONTENT_TYPE in real_headers:
                 if content_type is not None or charset is not None:
                     raise ValueError(
@@ -598,23 +608,243 @@ class Response(StreamResponse):
                         "content_type or charset params "
                         "is forbidden"
                     )
+            # 响应头没有 Content-Type
             else:
                 if content_type is not None:
                     if charset is not None:
                         content_type += "; charset=" + charset
+                    # 设置 Content-Type 响应头
                     real_headers[hdrs.CONTENT_TYPE] = content_type
 
         super().__init__(status=status, reason=reason, headers=real_headers)
 
         if text is not None:
+            # 更新 text 属性
             self.text = text
         else:
+            # 更新响应体属性 字节对象
             self.body = body
-
+        # 表示压缩后的响应体内容
         self._compressed_body: Optional[bytes] = None
+        # 下面两个参数用于 zlib 压缩
         self._zlib_executor_size = zlib_executor_size
         self._zlib_executor = zlib_executor
 ```
-## 属性
+增加额外的初始化内容主要是初始化响应体`self.body`和设置响应头`Content-Type`。响应体通过参数初始化有两种方式：
++ `text`：一个字符串对象;
++ `body`：一个字节对象；
 
+## 属性
+下面主要是新增属性
++ `body`：返回或者更新响应体数据，字节对象；
+  ```python
+  @property
+  def body(self) -> Optional[Union[bytes, Payload]]:
+      return self._body
+
+  @body.setter
+  def body(self, body: bytes) -> None:
+      if body is None:
+          self._body: Optional[bytes] = None
+          self._body_payload: bool = False
+      elif isinstance(body, (bytes, bytearray)):
+          self._body = body
+          self._body_payload = False
+      else:
+          try:
+              self._body = body = payload.PAYLOAD_REGISTRY.get(body)
+          except payload.LookupError:
+              raise ValueError("Unsupported body type %r" % type(body))
+          # 响应体是 payload 对象
+          # Assigning str to body will make the body type of aiohttp.payload.StringPayload, 
+          # which tries to encode the given data based on Content-Type HTTP header, 
+          # while defaulting to UTF-8
+          self._body_payload = True
+
+          headers = self._headers
+
+          # set content-type
+          if hdrs.CONTENT_TYPE not in headers:
+              headers[hdrs.CONTENT_TYPE] = body.content_type
+
+          # copy payload headers
+          if body.headers:
+              for key, value in body.headers.items():
+                  if key not in headers:
+                      headers[key] = value
+
+      self._compressed_body = None
+  ```
+  TODO payload 对象
+
++ `text`：返回或更新响应体数据，字符串对象；
+  ```python
+  @property
+  def text(self) -> Optional[str]:
+      if self._body is None:
+          return None
+      return self._body.decode(self.charset or "utf-8")
+
+  @text.setter
+  def text(self, text: str) -> None:
+      assert isinstance(text, str), "text argument must be str (%r)" % type(text)
+
+      if self.content_type == "application/octet-stream":
+          # 更新 content_type 属性
+          self.content_type = "text/plain"
+      if self.charset is None:
+          # 更新 charset 属性
+          self.charset = "utf-8"
+      # 设置响应体
+      self._body = text.encode(self.charset)
+      self._body_payload = False
+      self._compressed_body = None
+  ```
++ `content_length`：返回响应体的大小；
+  ```python
+  @property
+  def content_length(self) -> Optional[int]:
+      if self._chunked:
+          return None
+
+      if hdrs.CONTENT_LENGTH in self._headers:
+          return super().content_length
+
+      if self._compressed_body is not None:
+          # Return length of the compressed body
+          return len(self._compressed_body)
+      elif self._body_payload:
+          # A payload without content length, or a compressed payload
+          return None
+      elif self._body is not None:
+          return len(self._body)
+      else:
+          return 0
+
+  @content_length.setter
+  def content_length(self, value: Optional[int]) -> None:
+      raise RuntimeError("Content length is set automatically")
+  ```
 ## 数据准备与发送
+`Response`的数据发送部分会复写父类的`write_eof`方法，对应的相关源码如下：
+```python
+async def write_eof(self, data: bytes = b"") -> None:
+    # 是否写结束
+    if self._eof_sent:
+        return
+    # 响应体没有压缩
+    if self._compressed_body is None:
+        body: Optional[Union[bytes, Payload]] = self._body
+    # 响应体压缩
+    else:
+        body = self._compressed_body
+    assert not data, f"data arg is not supported, got {data!r}"
+    assert self._req is not None
+    assert self._payload_writer is not None
+    # 有响应体会先发送响应体数据，然后通知写结束
+    if body is not None:
+        # 不能发送响应体 直接调用父类 write_eof，通知写结束
+        if self._must_be_empty_body:
+            await super().write_eof()
+        # 响应体是 payload 对象
+        elif self._body_payload:
+            payload = cast(Payload, body)
+            await payload.write(self._payload_writer)
+            await super().write_eof()
+        else:
+            await super().write_eof(cast(bytes, body))
+    # 没有响应体，直接调用父类 write_eof，通知写结束
+    else:
+        await super().write_eof()
+```
+如果有响应体，会先发送响应体数据，然后通知写结束。
+
+`Response`数据准备（响应头准备）会复写父类的`_start`方法，数据压缩会复写父类的`_do_start_compression`方法，相关源码如下：
+```python
+async def _start(self, request: "BaseRequest") -> AbstractStreamWriter:
+    if should_remove_content_length(request.method, self.status):
+        if hdrs.CONTENT_LENGTH in self._headers:
+            del self._headers[hdrs.CONTENT_LENGTH]
+    # 不是分块传输，且响应头也不包含 Content-Length
+    elif not self._chunked and hdrs.CONTENT_LENGTH not in self._headers:
+        # 响应体数据是 payload 对象
+        if self._body_payload:
+            size = cast(Payload, self._body).size
+            # 更新响应头 Content-Length
+            if size is not None:
+                self._headers[hdrs.CONTENT_LENGTH] = str(size)
+        else:
+            # 更新响应头 Content-Length
+            body_len = len(self._body) if self._body else "0"
+            # https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6-7
+            if body_len != "0" or (
+                self.status != 304 and request.method.upper() != hdrs.METH_HEAD
+            ):
+                self._headers[hdrs.CONTENT_LENGTH] = str(body_len)
+
+    return await super()._start(request)
+
+async def _do_start_compression(self, coding: ContentCoding) -> None:
+    if self._body_payload or self._chunked:
+        # 父类中会移除 Content-Length 响应头，对于非分块传输，
+        # 需要 Content-Length 响应头，需要走下面的流程
+        return await super()._do_start_compression(coding)
+
+    if coding != ContentCoding.identity:
+        # Instead of using _payload_writer.enable_compression,
+        # compress the whole body
+        compressor = ZLibCompressor(
+            encoding=str(coding.value),
+            max_sync_chunk_size=self._zlib_executor_size,
+            executor=self._zlib_executor,
+        )
+        assert self._body is not None
+        if self._zlib_executor_size is None and len(self._body) > 1024 * 1024:
+            warnings.warn(
+                "Synchronous compression of large response bodies "
+                f"({len(self._body)} bytes) might block the async event loop. "
+                "Consider providing a custom value to zlib_executor_size/"
+                "zlib_executor response properties or disabling compression on it."
+            )
+        self._compressed_body = (
+            await compressor.compress(self._body) + compressor.flush()
+        )
+        assert self._compressed_body is not None
+
+        self._headers[hdrs.CONTENT_ENCODING] = coding.value
+        self._headers[hdrs.CONTENT_LENGTH] = str(len(self._compressed_body))
+```
++ `_start`主要增加更新响应头 Content-Length；
++ `_do_start_compression`：对整个请求体进行压缩而不是对发送的 chunk 数据压缩；
+
+# json_response
+`json_response`方法基于`Response`实现，用于响应 json 类型的数据，源码实现如下：
+```python
+def json_response(
+    data: Any = sentinel,
+    *,
+    text: Optional[str] = None,
+    body: Optional[bytes] = None,
+    status: int = 200,
+    reason: Optional[str] = None,
+    headers: Optional[LooseHeaders] = None,
+    content_type: str = "application/json",
+    dumps: JSONEncoder = json.dumps,
+) -> Response:
+    if data is not sentinel:
+        if text or body:
+            raise ValueError("only one of data, text, or body should be specified")
+        else:
+            text = dumps(data)
+    return Response(
+        text=text,
+        body=body,
+        status=status,
+        reason=reason,
+        headers=headers,
+        content_type=content_type,
+    )
+```
+
+# FileResponse
+TODO
