@@ -6,7 +6,7 @@
 - [调度原理](./programming/python-asyncio/asyncio-scheduling.md)
 - [网络编程](./programming/python-asyncio/asyncio-networking.md)
 
-### aiothhp
+### aiohttp
 - [框架原理](./programming/aiohttp/framework.md)
 - [Application实现原理](./programming/aiohttp/application.md)
 - [http请求解析](./programming/aiohttp/http_request_parser.md)
