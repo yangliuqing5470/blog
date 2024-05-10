@@ -1145,3 +1145,36 @@ async def shutdown(self, timeout: Optional[float] = 15.0) -> None:
 ```
 
 # 优雅停服
+如果注册了`signal.SIGINT`和`signal.SIGTERM`信号，当信号发生时，默认抛出`GracefulExit`异常，源码如下：
+```python
+class GracefulExit(SystemExit):
+    code = 1
+
+def _raise_graceful_exit() -> None:
+    raise GracefulExit()
+```
+根据`web.run_app`源码可知，最终`AppRunner.cleanup`优雅退出方法会被调用。`cleanup`执行以下步骤：
++ 停止每一个监听 socket 的 site，保证不会有新的连接建立；
+  ```python
+  self._server = await loop.create_server(
+      server,
+      self._host,
+      self._port,
+      ssl=self._ssl_context,
+      backlog=self._backlog,
+      reuse_address=self._reuse_address,
+      reuse_port=self._reuse_port,
+  )
+  # close 方法被调用
+  self._server.close()
+  ```
+  > 此步会首先移除监听 socket，然后将监听 socket 关闭，确保不会有新的连接建立。
++ 关闭所有空闲的长连接，并设置标志通知当前活跃的连接处理完当前请求后关闭；
+  > 根据`RequestHandler.start`源码可知，关闭连接的时候，会调用`transport.close`，
+  进而`connection_lost`方法被调用。
++ 触发`Application.on_shutdown`信号，让用户进行相关处理；
++ 调用`web.run_app`中注册的`shutdown_callback`方法，等待当前事件循环中的任务执行完；
++ 关闭剩余的连接，取消所有的 hanlders，最后关闭底层的`transport`；
++ 触发`Application.on_cleanup`信号，让用户清理相关资源；
++ 删除注册的信号；
+
