@@ -13,6 +13,7 @@
 - [http请求对象](./programming/aiohttp/http_request_build.md)
 - [http响应](./programming/aiohttp/http_response.md)
 - [websocket](./programming/aiohttp/websocket.md)
+- [性能优化及压测](./programming/aiohttp/performance_benchmarks.md)
 
 ### concurrent
 - [线程池](./programming/python-futures/thread-pool.md)
