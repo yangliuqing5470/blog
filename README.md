@@ -1,10 +1,10 @@
 # 编程篇
-## 网络
+## Network
 - [socket网络编程知多少](./programming/network/socket.md)
 - [https协议原理及使用](./programming/network/https.md)
 - [nginx介绍](./programming/network/nginx.md)
 
-## python
+## Python
 ### asyncio
 - [协程&生成器基础语法](./programming/python-asyncio/asyncio-syntax.md)
 - [futures&tasks&coroutines原理](./programming/python-asyncio/asyncio-futures-tasks-coroutines.md)
@@ -26,10 +26,10 @@
 - [future对象](./programming/python-futures/futures.md)
 - [相关拓展](./programming/python-futures/reference.md)
 
-## docker
+## Docker
 - [docker使用教程](./programming/docker/tutorial.md)
 
-## windows
+## Windows
 - [windows服务原理](./programming/windows-service/service.md)
 
 # 工具篇
