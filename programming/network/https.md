@@ -53,13 +53,44 @@
 + **TLS握手**
 + **HTTP数据传输（SSL加密）**
 
+`HTTPS`使用对称加密和非对称加密两种方式，非对称加密用于握手阶段，对称加密用于数据传输阶段。
+
 ## TLS握手
-+ 客户端发送`Client Hello`报文开始`SSL`通信。`Client Hello`报文包含客户端支持的`SSL`版本，加密套件（`Cipher Suites`）列表，
+`TLS`握手阶段流程如下：
++ **客户端**发送`Client Hello`报文开始`SSL`通信。`Client Hello`报文包含客户端支持的`SSL`版本，加密套件（`Cipher Suites`）列表，
 客户端生成的一个 32 字节的随机数`R1`等。
-+ 服务端响应`Server Hello`响应报文。`Server Hello`响应报文包含`SSL`版本，加密套件（`Cipher Suites`）以及服务端生成的一个 32
++ **服务端**响应`Server Hello`响应报文。`Server Hello`响应报文包含`SSL`版本，加密套件（`Cipher Suites`）以及服务端生成的一个 32
 位的随机数`R2`。其中加密套件是从接收的客户端加密套件中筛选出来的。
-+ 服务端继续发送`Certificate`、`Server Key Exchange`和`Server Hello Done`三个报文。
-  + `Certificate`表示服务端证书
-  + `Server Key Exchange`表示用于
++ **服务端**继续发送`Certificate`、`Server Key Exchange`和`Server Hello Done`三个报文。
+  + `Certificate`表示服务端证书。
+  + `Server Key Exchange`表示一个对称密钥，用于`DH`算法，`RSA`算法不需要，没这个报文。
+  + `Server Hello Done`表示服务端完成握手协议，通知客户端继续下一步。
++ **客户端**开始证书校验。
++ **客户端**发送`Client Key Exchange`报文。证书校验通过后，客户端获的服务端的公钥，
+然后客户端生成一个随机数`R3`，并用获取的公钥加密此随机数生成`PreMaster Key`发送给服务端，
+后面服务端接收到`PreMaster Key`后，用自己的私钥解密获取随机数`R3`，这样客户端和服务端都有随机数`R1`、
+`R2`和`R3`，然后两端用相同的算法生成一个**对称密钥**，握手结束后，会通过该**对称密钥**传输应用数据。
++ **客户端**继续发送`Change Cipher Spec`报文，表示客户端接下来使用前面生成的**对称密钥**来传输数据。
++ **客户端**继续发送`Finished`报文，该报文包含连接至今全部报文的整体校验值，
+握手协商是否成功要以服务端是否可以正确解密该报文为准。
++ **服务端**也发送`Change Cipher Spec`报文，表示服务端接下来使用前面生成的**对称密钥**来传输数据。
++ **服务端**也发送`Finished`报文。
 
 # HTTPS 使用样例
+## 自签名证书
+### 创建根 CA 证书
++ 生成私钥
+  ```bash
+  openssl ecparam -out contoso.key -name prime256v1 -genkey
+  ```
+  这里使用`ecparam`加密算法，参数指定`prime256v1`，生成的密钥是`contoso.key`。
++ 生成自签名证书请求（CSR）
+  ```bash
+  openssl req -new -sha256 -key contoso.key -out contoso.csr
+  ```
++ 生成证书
+  ```bash
+  openssl x509 -req -sha256 -days 365 -in contoso.csr -signkey contoso.key -out contoso.crt
+  ```
+
+### 创建服务器证书
