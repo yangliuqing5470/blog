@@ -88,9 +88,140 @@
   ```bash
   openssl req -new -sha256 -key contoso.key -out contoso.csr
   ```
+  出现如下提示，需要填一些证书相关信息：
+  ```bash
+  You are about to be asked to enter information that will be incorporated
+  into your certificate request.
+  What you are about to enter is what is called a Distinguished Name or a DN.
+  There are quite a few fields but you can leave some blank
+  For some fields there will be a default value,
+  If you enter '.', the field will be left blank.
+  -----
+  Country Name (2 letter code) [AU]:CN
+  State or Province Name (full name) [Some-State]:BeiJing
+  Locality Name (eg, city) []:BeiJing
+  Organization Name (eg, company) [Internet Widgits Pty Ltd]:Yang
+  Organizational Unit Name (eg, section) []:basic
+  Common Name (e.g. server FQDN or YOUR name) []:10.211.55.8
+  Email Address []:my@gmail.com
+  
+  Please enter the following 'extra' attributes
+  to be sent with your certificate request
+  A challenge password []:123456
+  An optional company name []:test
+  ```
+  + `Country Name`：缩写为`C`，证书持有者所在国家，要求填写国家代码，用2个字母表示。
+  + `State or Province Name`：缩写为`ST`，证书持有者所在州或省份，填写全称，可省略不填。
+  + `Locality Name`：缩写为`L`，证书持有者所在城市，可省略不填。
+  + `Ori`
+  + `Organization Name`：缩写为`O`，证书持有者所属组织或公司，可省略不填，建议填。
+  + `Organizational Unit Name`：缩写为`OU`，证书持有者所属部门，可省略不填。
+  + `Common Name`：缩写为`CN`，证书持有者的通用名，必填，如果是服务器证书一般填域名地址或者 ip 地址。
+  + `Email Address`：证书持有者邮箱，可省略不填。
+
+  **`CN`的作用**：客户端使用`HTTPS`连接到服务器时，客户端会检查以确保获取的服务器证书与实际客户端请求主机名称匹配，
+  也就是客户端会检查服务器证书上的域名是否和服务器的实际域名相匹配。
 + 生成证书
   ```bash
   openssl x509 -req -sha256 -days 365 -in contoso.csr -signkey contoso.key -out contoso.crt
   ```
 
+经过上述步骤，最终会得到如下三个文件：
++ contoso.key
++ contoso.csr
++ contoso.crt
+
 ### 创建服务器证书
++ 生成服务器证书私钥
+  ```bash
+  openssl ecparam -out fabrikam.key -name prime256v1 -genkey
+  ```
+  这里使用`ecparam`加密算法，参数指定`prime256v1`，生成的密钥是`fabrikam.key`。
++ 生成自签名证书请求（CSR）
+  ```bash
+  openssl req -new -sha256 -key fabrikam.key -out fabrikam.csr
+  ```
++ 生成服务器证书
+  ```bash
+  openssl x509 -req -in fabrikam.csr -CA  contoso.crt -CAkey contoso.key -CAcreateserial -out fabrikam.crt -days 365 -sha256
+  ```
+经过上述步骤，最终会多如下三个文件：
++ fabrikam.key
++ fabrikam.csr
++ fabrikam.crt
+
+可以使用如下的命令查看证书：
+```bash
+openssl x509 -in fabrikam.crt -text -noout
+```
+输出结果如下：
+```bash
+Certificate:
+    Data:
+        Version: 1 (0x0)
+        Serial Number:
+            2f:b2:8f:28:ae:ef:95:b3:e6:c9:23:5c:6e:4e:91:a8:33:f8:93:6f
+        Signature Algorithm: ecdsa-with-SHA256
+        Issuer: C = CN, ST = BeiJing, L = BeiJing, O = Yang, OU = basic, CN = 10.211.55.8, emailAddress = my@gmail.com
+        Validity
+            Not Before: May 17 03:23:15 2024 GMT
+            Not After : May 17 03:23:15 2025 GMT
+        Subject: C = CN, ST = BeiJing, L = Beijing, O = Yang, OU = basic, CN = 10.211.55.8, emailAddress = user@gamil.com
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:95:27:1c:c6:4b:ac:0b:7a:5a:2a:cf:29:24:ae:
+                    86:00:67:fb:88:ed:1e:7b:05:31:de:79:46:79:56:
+                    0c:c6:32:9e:0c:35:ca:8b:64:b9:f3:70:ba:70:e3:
+                    3b:af:de:35:b4:a1:11:5b:a0:6c:60:9d:44:e7:de:
+                    fa:50:6f:d2:c7
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+    Signature Algorithm: ecdsa-with-SHA256
+    Signature Value:
+        30:45:02:21:00:bd:9d:95:a4:7e:b4:22:2e:90:b3:3a:f4:8f:
+        50:3c:89:99:1e:07:a4:9c:e5:66:f3:fe:07:d3:01:a8:6e:ac:
+        cd:02:20:21:68:61:ea:74:67:ab:4c:92:dd:0d:d1:08:ab:a4:
+        2a:40:1d:5d:22:6e:8f:56:b8:1b:b6:61:2a:d0:84:ff:ee
+```
+其中`Issuer`字段表示颁发者信息，`Subject`字段表示当前证书信息。
+
+## HTTPS 服务端
+基于`aiohttp`实现的`https`服务样例代码如下：
+```python
+import ssl
+from aiohttp import web
+
+async def handle(request):
+    return web.Response(text="Hello, HTTPS world!")
+
+def create_ssl_context():
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain('./fabrikam.crt', './fabrikam.key')
+    return ssl_context
+
+app = web.Application()
+app.router.add_get('/', handle)
+
+if __name__ == "__main__":
+    ssl_context = create_ssl_context()
+    web.run_app(app, ssl_context=ssl_context, port=8443)
+```
+其中`fabrikam.crt`是服务器上的证书文件，`fabrikam.key`是私钥。
+
+## HTTPS 客户端
+发送`https`请求的客户端样例代码如下：
+```python
+import requests
+
+def main():
+    url = "https://10.211.55.8:8443"
+    cert_path = "./contoso.crt"
+    response = requests.get(url, verify=cert_path)
+    print(response.content)
+
+if __name__ == "__main__":
+    main()
+```
+其中`cert_path`表示`CA bundle`文件路径，因为没有中间证书，这里是根证书。根据证书链验证规则，这里需要指定根证书和中间证书（如果存在）。
