@@ -1,7 +1,7 @@
 # 概述
 基于`TCP`的`Socket`编程流程如下：
 ![socket编程流程](./images/socket编程流程.png)
-基于`TCP`的`socket`状态流转如下：
+基于`TCP`的`socket`状态流转如下：<br>
 ![socket状态流转](./images/socket状态流转.png)
 
 # Socket API 功能
