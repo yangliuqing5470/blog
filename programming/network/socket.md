@@ -334,6 +334,53 @@ ip route list table main
 
 本机通信中`Unix Domain Socket`性能要好于`127.0.0.1`方式。
 
+基于`Unix Domain Socket`实现的服务端样例如下：
+```python
+import os
+import socket
+
+def main():
+    server_address = "./uds.sock"
+    try:
+        os.unlink(server_address)
+    except Exception:
+        if os.path.exists(server_address):
+            raise
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(server_address)
+    sock.listen(1)
+    print("Server on ", server_address)
+    # client_address is ""
+    connection, client_address = sock.accept()
+    print("New Connection")
+    while True:
+        data = connection.recv(1024)
+        if not data:
+            break
+        print("Received: ", data.decode())
+    connection.close()
+    os.unlink(server_address)
+
+if __name__ == "__main__":
+    main()
+```
+客户端样例代码如下：
+```bash
+import socket
+
+def main():
+    server_address = "./uds.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    print('Connecting to', server_address)
+    sock.connect(server_address)
+    message = 'Hello, server!'
+    sock.sendall(message.encode())
+    sock.close()
+
+if __name__ == "__main__":
+    main()
+```
+
 ## 特殊地址 0.0.0.0
 如果一个服务是绑定到`0.0.0.0`，那么外部机器访问该机器上所有 IP 都可以访问该服务。
 如果服务绑定到的是特定的 IP，则只有访问该 IP 才能访问到服务。
