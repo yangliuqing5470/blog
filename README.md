@@ -2,7 +2,7 @@
 ## Network
 - [socket网络编程知多少](./programming/network/socket.md)
 - [https协议原理及使用](./programming/network/https.md)
-- [nginx介绍](./programming/network/nginx.md)
+- [nginx使用教程](./programming/network/nginx.md)
 
 ## Python
 ### asyncio
