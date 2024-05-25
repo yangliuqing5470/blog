@@ -265,3 +265,161 @@ CPU 调度的**带宽控制**：**控制一个用户组（`cgroup`）在给定�
 终有一刻，时间池中已经没有时间可供申请。此时`throttle`运行队列。
 
 # docker 资源限制
+`docker`实现资源限制底层依赖 Linux 的`cgroup`能力。运行一个`docker`后，会在宿主机系统`root cgroup`下创建子`cgroup`。
+例如运行一个容器：
+```bash
+$ sudo docker run -d -it ubuntu:22.04 /bin/bash
+99480e3c30ce7414eaa720c13d911a9ba30f2e5e2f9d47faab7981431e0573be
+```
+则给当前`docker`创建的子`cgroup`如下：
+```bash
+$ ls /sys/fs/cgroup/system.slice/docker-99480e3c30ce7414eaa720c13d911a9ba30f2e5e2f9d47faab7981431e0573be.scope/
+cgroup.controllers      cgroup.pressure         cpu.idle               cpuset.cpus.partition  cpu.weight                hugetlb.1GB.numa_stat     hugetlb.2MB.max           io.prio.class        memory.high       memory.peak          memory.swap.high      misc.events   rdma.current
+cgroup.events           cgroup.procs            cpu.max                cpuset.mems            cpu.weight.nice           hugetlb.1GB.rsvd.current  hugetlb.2MB.numa_stat     io.stat              memory.low        memory.pressure      memory.swap.max       misc.max      rdma.max
+cgroup.freeze           cgroup.stat             cpu.max.burst          cpuset.mems.effective  hugetlb.1GB.current       hugetlb.1GB.rsvd.max      hugetlb.2MB.rsvd.current  io.weight            memory.max        memory.reclaim       memory.swap.peak      pids.current
+cgroup.kill             cgroup.subtree_control  cpu.pressure           cpu.stat               hugetlb.1GB.events        hugetlb.2MB.current       hugetlb.2MB.rsvd.max      memory.current       memory.min        memory.stat          memory.zswap.current  pids.events
+cgroup.max.depth        cgroup.threads          cpuset.cpus            cpu.uclamp.max         hugetlb.1GB.events.local  hugetlb.2MB.events        io.max                    memory.events        memory.numa_stat  memory.swap.current  memory.zswap.max      pids.max
+cgroup.max.descendants  cgroup.type             cpuset.cpus.effective  cpu.uclamp.min         hugetlb.1GB.max           hugetlb.2MB.events.local  io.pressure               memory.events.local  memory.oom.group  memory.swap.events   misc.current          pids.peak
+```
+默认情况下，运行一个`docker`是没有资源限制的，可以使用宿主机内核调度允许的全部资源。
+`docker`提供了一些运行时标志用于限制系统资源。
+## CPU 限制
+`Linux`正常运行的进程默认使用`CFS`调度器，下面介绍的都是针对`CFS`调度器运行时参数标志。
++ `--cpus=<value>`：指定容器可以使用多少可用的 CPU。例如，如果宿主机有 2 个 CPU，
+设置`--cpus="1.5"`，则容器最多使用 1.5 个 CPU。这个参数等价于设置`--cpu-period="100000"`和`--cpu-quota="150000"`。
+  ```bash
+  $ sudo docker run -d -it --cpus=1.5  ubuntu:22.04 /bin/bash
+  752e96b664d7e4867ec38fa0877fabaf1c133a8d630bec55d830257301455422
+
+  $ cat docker-752e96b664d7e4867ec38fa0877fabaf1c133a8d630bec55d830257301455422.scope/cpu.max
+  150000 100000
+  ```
+  可以看到指定`--cpu="1.5"`，实际会在`docker`的`cgroup`下`cpu.max`文件写`150000 100000`。
++ `--cpu-period=<value>`和`--cpu-quota=<value>`：设置`CFS`调度器的`period`和`quota`值，参考上小节`CPU`调度原理。
+`--cpu-period`默认值是`100000`（`100ms`），一般不改变这个默认值。
++ `--cpuset-cpus`：将容器绑定到指定的 CPU 核上。如果宿主机有多个 CPU，CPU 以 0 开始，
+有效的值可以类似是`0-3`（绑定使用前 4 个 CPU）或者类似`1,3`（绑定使用第二个到第四个 CPU）。
+  ```bash
+  $ sudo docker run -d -it --cpuset-cpus="1,3" ubuntu:22.04 /bin/bash
+  1071b1c580b399773bb732c185dcba9fe63ea4df6649d3e4e24a1d2f388b2708
+
+  $ cat docker-1071b1c580b399773bb732c185dcba9fe63ea4df6649d3e4e24a1d2f388b2708.scope/cpuset.cpus
+  1,3
+
+  $ cat docker-1071b1c580b399773bb732c185dcba9fe63ea4df6649d3e4e24a1d2f388b2708.scope/cpuset.cpus.effective 
+  1,3
+  ```
+  指定`--cpuset-cpus="1，3"`，实际会在`docker`的`cgroup`下`cpuset.cpus`文件写入`1,3`。
+  文件`cpuset.cpus.effective`表示实际生效的 CPU 核心。
++ `--cpu-shares`：指定容器使用宿主机 CPU 的相对值，默认值 1024。例如，有三个运行的容器，
+`--cpu-shares`分别是 1024、512 和 512，则三个容器使用的 CPU 分别是 50%、25% 和 25%。
+**只有当 CPU 负载高的时候，此值才会有效**。
+  ```bash
+  $ sudo docker run -d -it --cpu-shares=512 ubuntu:22.04 /bin/bash
+  f6f49b90b7381868885b01104f3635b35db18be49c7c40138ddf4bd9e1c2090a
+
+  $ cat docker-f6f49b90b7381868885b01104f3635b35db18be49c7c40138ddf4bd9e1c2090a.scope/cpu.weight
+  20
+  $ cat docker-f6f49b90b7381868885b01104f3635b35db18be49c7c40138ddf4bd9e1c2090a.scope/cpu.weight.nice 
+  7
+  ```
++ `--cpuset-mems`：指定`cgroup`中允许使用的内存节点（`NUMA`节点）。只想允许`cgroup`中的进程使用内存节点 0 和 1，
+可以将`--cpuset-mems`参数设置为`0-1`。
+
+## 内存限制
+Linux 宿主机检查到`OOM`发生的时候，会杀掉进程释放内存，任何进程都可能被杀掉（[OOM 管理机制](https://www.kernel.org/doc/gorman/html/understand/understand016.html)）。
+> `Docker daemon`进程的`OOM`优先级被调整，使得其被杀掉的概率比较低。
++ `-m or --memory=`：设置容器可以使用的最大内存大小，最小值是`6m`。
+  ```bash
+  $ sudo docker run -it -d --memory=100m ubuntu:22.04
+  9ad8775d9187a7b064bab2ef02bc5e005ff0d63733a3eca348c3366cb20eb653
+
+  $ cat docker-9ad8775d9187a7b064bab2ef02bc5e005ff0d63733a3eca348c3366cb20eb653.scope/memory.max 
+  104857600
+  ```
+  `cgroup`下内存`memory`相关的部分接口文件说明如下：
+  + `memory.current`：表示当前`cgroup`及子`cgroup`使用的内存总量。
+  + `memory.peak`：记录当前`cgroup`及子`cgroup`从创建以来使用最大内存值。
+  + `memory.min`：**硬限制**，指定为`cgroup`保留的最小内存量，即系统永远不应回收的内存。
+  如果系统有内存压力需要回收内存，且没有可用的未受保护的可回收内存，则内核会调用`OOM`终止程序。
+  + `memory.max`：**硬限制**，指定允许`cgroup`使用的最大内存限制。如果`cgroup`内的进程尝试使用的内存量超过所配置的限制值，
+  且不能通过回收减少，内核将终止该进程并显示内存不足`OOM`错误。
+  + `memory.low`：**软限制**，指定`cgroup`使用内存下限，如果当`cgroup`内存使用总量低于有效`low`值，
+  尽力不回收内存，除非在未受保护`cgroup`中没有可回收的内存（也就是说，即使`cgroup`内存使用总量低于`memory.low`，
+  也有可能被回收）。
+  + `memory.high`：**软限制**，指定`cgroup`使用内存上限，如果`cgroup`使用内存超过`memory.high`值，不会触发`OOM`，
+  内核会回收内存，使得`cgroup`使用内存低于`memory.high`值。
+  + `memory.reclaim`：触发`cgroup`的内存回收，不影响网络相关的内存（`socket`内存）。
+  此接口触发的内存回收（主动回收）并不意味着`cgroup`存在内存压力，内核可能回收内存低于或者高于指定的值。
+  例如：
+    ```bash
+    echo "1G" > memory.reclaim
+    ```
+    触发内核回收`1G`的内存
+  + `memory.events`：此文件值的更改一般会触发一个文件修改事件（`poll()监听`）。不同值枚举如下：
+    + `low`：表示即使`cgroup`使用的内存低于低边界`memory.low`值，但由于内存压力较高而被回收的次数。
+    这通常表明低边界`memory.low`设置太大
+    + `high`：表示`cgroup`使用的内存超过`memory.high`值导致`cgroup`中的进程被受到限制而触发直接内存回收的次数
+    + `max`：表示`cgroup`使用的内存超过`memory.max`的次数，如果直接的内存回收没有使`cgroup`使用的内存小于`memory.max`值，
+    则会导致`OOM`
+    + `oom`：`cgroup`内存使用达到限制且分配即将失败的次数
+    + `oom_kill`：`cgroup`中因为`OOM`而被杀掉进程的数目
+    + `oom_group_kill`：一个`group`发生`OOM`的次数
+
+  + `memory.oom.group`：表示是否`cgroup`及子`cgroup`作为`OOM`操作的一个整体，
+  也就是`cgroup`及子`cgroup`中的所有任务（进程）被一起`kill`或者都不被`kill`。
+  可以用于避免部分任务被`kill`，保证工作的完整性。有`OOM`保护的任务（`oom_score_adj`设置`-1000`），
+  不会被`kill`
+
+  `memory.min`、`memory.low`、`memory.high`和`memory.max`值和系统内存回收有关，说明如下：
+  ```bash
+                      尽量不回收，                                               必须回收
+                      如果没有可回收                        尽量回收，            低于 memory.max，
+                      的未保护内存，                        确保内存使用          否则触发
+  不会回收             也会回收           无操作            低于 memory.high      OOM
+  -------> memory.min ------> memory.low ------> memory.high ------> memory.max ------>
+  ```
++ `--memory-reservation`：设置`cgroup`中的`memory.low`值，软限制。
+  ```bash
+  $ sudo docker run -it -d --memory-reservation=100m ubuntu:22.04
+  788bb76b3161ecd6d16a2b3ec6aa05ea14a5be1921a5845b3ea7bf1c43e1e61e
+
+  $ cat docker-788bb76b3161ecd6d16a2b3ec6aa05ea14a5be1921a5845b3ea7bf1c43e1e61e.scope/memory.low 
+  104857600
+  ```
++ `--kernel-memory`：设置容器可以使用最大的`kernel-memory`，最小值是`6m`。
+上面`-m or --memory=`限制的内存是总的内存，也即包括`kernel-memory`内存在内。
++ `--memory-swap`：设置容器被允许使用的`swap`内存大小（可以理解为拿多少磁盘当内存）。
+此限制需要配合`--memory`一起使用。
+  + 如果`--memory-swap`设置正值，则`--memory`和`--memory-swap`都需要设置，其中`--memory-swap`表示可以使用的物理内存和`swap`内存总数。
+  例如，`--memory="300m"`，`--memory-swap="1g"`表示容器可以使用 300m 物理内存，700m `swap`内存。
+    ```bash
+    $ sudo docker run -it -d --memory=100m --memory-swap=200m ubuntu:22.04
+    926966944f62caec423d1a4a744c66d3f4bb065cb12b1b5bcbfbf1cfdcf51547
+
+    $ cat docker-926966944f62caec423d1a4a744c66d3f4bb065cb12b1b5bcbfbf1cfdcf51547.scope/memory.max 
+    104857600
+    $ cat docker-926966944f62caec423d1a4a744c66d3f4bb065cb12b1b5bcbfbf1cfdcf51547.scope/memory.swap.max 
+    104857600
+    ```
+  + 如果`--memory-swap=0`，被忽略，保持默认设置。
+  + 如果`--memory-swap`设置的值和`--memory`一样，则容器不会使用`swap`内存。
+  + 如果不设置`--memory-swap`，但设置了`--memory`，则容器可以使用的`swap`内存和`--memory`值一样多，
+  前提是宿主机有交换内存配置。例如，设置`--memory="300m"`，不设置`--memory-swap`值，
+  容器可以使用总 600m 内存，包括 300m 物理内存，300m 的`swap`内存。
+    ```bash
+    # 宿主机启用了 swap 内存
+    $ sudo docker run -it -d --memory=100m ubuntu:22.04
+    8cae7e50e30ad24fefef603b5c3795f2a68a71cb172051101e2abfccb2f8a6e8
+    $ cat docker-8cae7e50e30ad24fefef603b5c3795f2a68a71cb172051101e2abfccb2f8a6e8.scope/memory.max 
+    104857600
+    $ cat docker-8cae7e50e30ad24fefef603b5c3795f2a68a71cb172051101e2abfccb2f8a6e8.scope/memory.swap.max 
+    104857600
+    ```
+  + 如果`--memory-swap=-1`，则容器可以使用宿主机允许的最大`swap`内存。
+  + **在容器中使用`free`工具，结果是宿主机可用的`swap`，不是容器的**。
++ `--memory-swappiness`：取值`[0, 100]`之前，一个百分比。取值 0 表示关闭使用`swap`，
+取值`100`表示可以使用`swap`的时候尽量使用`swap`。
++ `--oom-kill-disable`：默认情况下，如果容器中遇到了`OOM`，内核会杀掉容器中的进程。通过设置该参数，
+可以关闭容器中的`OOM killer`，也就是不杀掉容器中的进程，此时容器内部申请内存的进程将`hang`，
+直到他们可以申请到内存（容器内其他进程释放了内存）。
