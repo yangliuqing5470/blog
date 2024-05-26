@@ -1,3 +1,64 @@
+# 引言
+对`docker`运行的容器施加资源限制，例如限制使用的`cpu=2`，那么实际在容器中看到的`cpu`核数是什么？
+实验使用`docker`宿主机系统是`ubuntu 22.04`，宿主机`cpu`相关的信息如下：
+```python
+# 逻辑核
+$ cat /proc/cpuinfo| grep "processor"| wc -l
+6
+# 物理核
+$ cat /proc/cpuinfo| grep "cpu cores"| uniq
+cpu cores	: 6
+```
+运行的容器限制`cpu=2`，有两种限制，一直是`cpu`绑定 2 个核，一种是限制使用 `cpu=2`：
+```bash
+# 限制 cpu 使用 2 核
+$ sudo docker run -it --cpus="2"  ubuntu:22.04
+# cgroup 结果
+$ cat /sys/fs/cgroup/system.slice/docker-7275c9e404b74a46be171af132b0208397c0f7e4dfd35ce1eb245d9db22f9722.scope/cpu.max
+200000 100000
+# 容器可使用的 cpu 编号范围
+$ cat /sys/fs/cgroup/system.slice/docker-7275c9e404b74a46be171af132b0208397c0f7e4dfd35ce1eb245d9db22f9722.scope/cpuset.cpus.effective 
+0-5
+```
+在容器查看读到的`cpu`个数如下：
+```bash
+root@7275c9e404b7:/# python3
+Python 3.10.12 (main, Nov 20 2023, 15:14:05) [GCC 11.4.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import os
+>>> os.cpu_count()
+6
+>>>
+```
+接下来我们在看下限制容器绑定 2 个`cpu`的情况：
+```bash
+# 绑定 cpu 使用编号 2 和 3 两个核
+$ sudo docker run -it --cpuset-cpus="2-3"  ubuntu:22.04
+# 容器可以使用的 cpu 编号
+$ cat /sys/fs/cgroup/system.slice/docker-6449e4546c5ce417bf40b8d9f7338bcbfeb343f805fe79fab2b20adec2376d9f.scope/cpuset.cpus.effective 
+2-3
+```
+此时在容器中查看读到的`cpu`个数如下：
+```bash
+root@6449e4546c5c:/# python3
+Python 3.10.12 (main, Nov 20 2023, 15:14:05) [GCC 11.4.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import os
+>>> os.cpu_count()
+6
+>>>
+```
+容器中查看两种限制情况下`cpu`信息：
+```bash
+root@6449e4546c5c:/# cat /proc/cpuinfo| grep "processor"| wc -l
+6
+root@6449e4546c5c:/# cat /proc/cpuinfo| grep "cpu cores"| uniq
+cpu cores	: 6
+```
+结论：**容器中看到的`cpu`信息和宿主机一样，对容器施加`cpu`限制只是限制容器运行时可使用`cpu`资源大小**。
+
+下面从底层原理详细了解下`docker`资源限制。
+
 # Linux cgroup
 [官方文档](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 ## cgroup 介绍
