@@ -549,4 +549,29 @@ listening on docker0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
 ```
 
 ### 外部访问docker内部
-通过**端口映射**，也就是运行容器时候指定`-p`参数
+通过**端口映射**，也就是运行容器时候指定`-p`参数，这将创建一个`iptables`规则，
+映射容器端口到`docker`宿主机上的端口。`-p`参数使用样例如下：
+```bash
+-p 8080:80  映射 docker 宿主机上的 8080 端口到容器上 TCP 端口 80
+-p 192.168.1.100:8080:80  映射 docker 宿主机 IP 是 `192.168.1.100`上的 8080 端口到容器上 TCP 端口 80
+-p 8080:80/udp 映射 docker 宿主机上的 8080 端口到容器上的 UDP 端口 80
+-p 8080:80/tcp -p 8080:80/udp 映射 docker 宿主机上 TCP 端口 8080 到容器上 TCP 端口 80，docker 宿主机上 UDP 端口 8080 到容器上 UDP 端口 80
+```
+下面使用端口映射运行一个容器：
+```bash
+$ sudo docker run -it --rm -p 8080:80 ubuntu:22.04
+```
+此时查看`docker`宿主机上的`iptables`规则：
+```bash
+# nat 表增加如下规则
+-A POSTROUTING -s 172.17.0.2/32 -d 172.17.0.2/32 -p tcp -m tcp --dport 80 -j MASQUERADE
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80
+
+# filter 表增加如下规则
+-A DOCKER -d 172.17.0.2/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+```
+```bash
+$ ps aux | grep docker-proxy
+root        2871  0.0  0.0 1156012 3456 ?        Sl   23:11   0:00 /usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip 172.17.0.2 -container-port 80
+root        2877  0.0  0.0 1229744 3456 ?        Sl   23:11   0:00 /usr/bin/docker-proxy -proto tcp -host-ip :: -host-port 8080 -container-ip 172.17.0.2 -container-port 80
+```
