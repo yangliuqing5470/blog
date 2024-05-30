@@ -561,7 +561,7 @@ listening on docker0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
 ```bash
 $ sudo docker run -it --rm -p 8080:80 ubuntu:22.04
 ```
-此时查看`docker`宿主机上的`iptables`规则：
+此时查看`docker`宿主机上的`iptables`规则（部分规则，包括省略不同链跳转）：
 ```bash
 # nat 表增加如下规则
 -A POSTROUTING -s 172.17.0.2/32 -d 172.17.0.2/32 -p tcp -m tcp --dport 80 -j MASQUERADE
@@ -570,8 +570,16 @@ $ sudo docker run -it --rm -p 8080:80 ubuntu:22.04
 # filter 表增加如下规则
 -A DOCKER -d 172.17.0.2/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
 ```
+`iptables`规则样例说明如下：
++ `docker`宿主机收到外部访问数据包，此时数据包的目的地址`host ip: 8080`
++ 数据包首先经过`nat`表的`PREROUTING`链，会跳转到`DOCKER`链（这一步在上面`iptables`规则没有粘贴出来）
++ `DOCKER`链匹配后，会将数据包目的地址替换为`172.17.0.2:80`（通过`DNAT`操作）
++ 数据包下一步会经过`filter`表的`FORWARD`链。`FORWARD`匹配后会接收数据包，此时外部正常访问容器
+
+每映射一个端口，都会启动一个`docker-proxy`进程。
 ```bash
 $ ps aux | grep docker-proxy
 root        2871  0.0  0.0 1156012 3456 ?        Sl   23:11   0:00 /usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip 172.17.0.2 -container-port 80
 root        2877  0.0  0.0 1229744 3456 ?        Sl   23:11   0:00 /usr/bin/docker-proxy -proto tcp -host-ip :: -host-port 8080 -container-ip 172.17.0.2 -container-port 80
 ```
+其实`docker-proxy`进程可以关闭（默认启动`docker`是开启，有参数控制），通过`iptables`和将宿主机当路由器已经可以实现外部访问容器内部了
