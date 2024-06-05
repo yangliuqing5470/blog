@@ -1,7 +1,7 @@
-> 由于国内不能直接拉取`gcr.io`下镜像，所有加个前缀`m.daocloud.io`。
-
-`cadvisor`、`node-exporter`、`prometheus`和`grafana`。`docker compose`配置文件如下：
-```bash
+# 服务配置
+`cadvisor`、`node-exporter`、`prometheus`和`grafana`实现`docker`和宿主机运行时资源监控。
+利用`docker compose`运行多个容器，`docker compose`配置文件`compose.yaml`如下：
+```yml
 services:
   prometheus:
     image: prom/prometheus:latest
@@ -65,8 +65,12 @@ networks:
   my-net:
     driver: bridge
 ```
-`prometheus.yml`文件如下：
-```bash
+> 由于国内不能直接拉取`gcr.io`下镜像，所有加个前缀`m.daocloud.io`。
+
+上述配置中`grafana`容器`volumes`挂载的本地路径`./grafana-data`目录需要有`other`用户写权限。
+
+`prometheus`服务端配置文件`prometheus.yml`文件如下：
+```yml
 global:
   scrape_interval:     1s # By default, scrape targets every 15 seconds.
   evaluation_interval: 1s # Evaluate rules every 15 seconds.
@@ -96,3 +100,18 @@ scrape_configs:
       - targets:
         - 10.211.55.8:8080
 ```
+其中`targets`中需要更改为实际运行指标收集服务的地址。
+
+# 服务运行
+服务启动
+```bash
+sudo docker compose up -d
+```
+服务启动后，通过`http://<ip>:8080`访问`cadvisor`的 webui 界面。
+通过`http://<ip>:9090`访问`prometheus`服务的 webui 界面，在
+
+服务停止
+```bash
+sudo docker compose down
+```
+# grafana 设置
