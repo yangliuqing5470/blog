@@ -103,15 +103,30 @@ scrape_configs:
 其中`targets`中需要更改为实际运行指标收集服务的地址。
 
 # 服务运行
-服务启动
+**服务启动**
 ```bash
 sudo docker compose up -d
 ```
-服务启动后，通过`http://<ip>:8080`访问`cadvisor`的 webui 界面。
-通过`http://<ip>:9090`访问`prometheus`服务的 webui 界面，在
+1. 服务启动后，通过`http://<ip>:8080`访问`cadvisor`的 webui 界面，可以查看容器和宿主机资源使用情况。
+![cadvisor](./images/cadvisor.png)
 
-服务停止
+2. 通过`http://<ip>:9090`访问`prometheus`服务的 webui 界面，可以在表达式栏中输入`Prometheus`表达式。
+例如，开始检索`container_start_time_seconds`指标，该指标记录了容器的启动时长(以秒为单位)。
+可以使用`name="<container_name>"`表达式按名称选择特定的容器。容器名称对应于`Docker Compose`配置中的`container_name`参数。
+例如，`container_start_time_seconds{name="redis"}`表达式显示`redis`容器启动时长。
+![prometheus](./images/prometheus.png)
+
+3. 通过`http://<ip>:3000`访问`grafana`界面。初始的时候需要登录，用户名为`admim`，密码为启动`grafana`容器时`GF_SECURITY_ADMIN_PASSWORD`环境变量的值。
+登录成功后界面如下
+![grafana](./images/grafana.png)
+添加数据源`Data sources`选择`prometheus`，指定`prometheus server URL`，其他配置根据需求设置，样例：
+![datasources](./images/prometheus_datasources.png)
+配置`Dashboards`，可以从[官方下载](https://grafana.com/grafana/dashboards/)配置好的`json`文件，直接导入，如下所示：
+![dashboards](./images/dashboard.png)
+例如选择`Docker and system monitoring`模版，最终效果如下：
+![dashboards_ok](./images/dashboard_ok.png)
+
+**服务停止**
 ```bash
 sudo docker compose down
 ```
-# grafana 设置
