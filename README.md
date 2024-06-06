@@ -30,6 +30,7 @@
 - [docker使用教程](./programming/docker/tutorial.md)
 - [docker资源限制原理](./programming/docker/resources_limit.md)
 - [docker网络知多少](./programming/docker/network.md)
+- [docker资源监控](./programming/docker/resources_monitor.md)
 
 ## Windows
 - [windows服务原理](./programming/windows-service/service.md)
