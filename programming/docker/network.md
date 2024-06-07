@@ -398,34 +398,22 @@ $ sudo iptables-save
 :DOCKER-ISOLATION-STAGE-1 - [0:0]
 :DOCKER-ISOLATION-STAGE-2 - [0:0]
 :DOCKER-USER - [0:0]
-# FORWARD 链的请求跳转到 DOCKER-USER 链处理
 -A FORWARD -j DOCKER-USER
-# FORWARD 链的请求跳转到 DOCKER-ISOLATION-STAGE-1 链处理
 -A FORWARD -j DOCKER-ISOLATION-STAGE-1
 -A FORWARD -o br-6aca1043b883 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 -A FORWARD -o br-6aca1043b883 -j DOCKER
 -A FORWARD -i br-6aca1043b883 ! -o br-6aca1043b883 -j ACCEPT
 -A FORWARD -i br-6aca1043b883 -o br-6aca1043b883 -j ACCEPT
-# FORWARD 链的请求目标是 docker0 所在的网段, 而且已经建立的连接或者和已建立连接相关那么接受请求
 -A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-# FORWARD 链的请求目标是 docker0 所在的网段, 那么跳转到 DOCKER 链处理
 -A FORWARD -o docker0 -j DOCKER
-# FORWARD 链的请求来自于 docker0 所在网段, 而且目标网段不是 docker0 所在网段, 那么接收请求.
 -A FORWARD -i docker0 ! -o docker0 -j ACCEPT
-# FORWARD 链的请求来自于 docker0 所在网段, 而且目标网段也是 docker0 所在网段, 那么接收请求
 -A FORWARD -i docker0 -o docker0 -j ACCEPT
 -A DOCKER-ISOLATION-STAGE-1 -i br-6aca1043b883 ! -o br-6aca1043b883 -j DOCKER-ISOLATION-STAGE-2
-# DOCKER-ISOLATION-STAGE-1 链的请求如果来自 docker0 所在网段, 而且目标网段不属于 docker0 所在网段,
-# 那么跳转到 DOCKER-ISOLATION-STAGE-2 处理
 -A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
-# DOCKER-ISOLATION-STAGE-1 链未处理的请求返回到上一层继续处理
 -A DOCKER-ISOLATION-STAGE-1 -j RETURN
 -A DOCKER-ISOLATION-STAGE-2 -o br-6aca1043b883 -j DROP
-# DOCKER-ISOLATION-STAGE-2 链的请求如果目标的网段为 docker0 所在网段则丢弃请求
 -A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
-# DOCKER-ISOLATION-STAGE-2 链未处理的请求返回到上一层继续处理
 -A DOCKER-ISOLATION-STAGE-2 -j RETURN
-# DOCKER-USER 链未处理的请求返回到上一层继续处理
 -A DOCKER-USER -j RETURN
 COMMIT
 # Completed on Wed May 29 16:42:26 2024
@@ -436,19 +424,11 @@ COMMIT
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
 :DOCKER - [0:0]
-# 如果请求的目标地址是本机的地址, 那么将请求转到 DOCKER 链处理
 -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
-# 如果请求的目标地址不匹配 127.0.0.0/8, 并且目标地址属于本机地址, 那么将请求跳转到 DOCKER 链处理
 -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
-# 对于来自于 172.33.16.0/24 的请求, 目标地址不是 br-6aca1043b883 所在的网段的地址, 
-# POSTROUTING 链将会将该请求伪装成宿主机的请求转发到外网
 -A POSTROUTING -s 172.33.16.0/24 ! -o br-6aca1043b883 -j MASQUERADE
-# 对于来自于 172.17.0.0/16 的请求, 目标地址不是 docker0 所在的网段的地址, 
-# POSTROUTING 链将会将该请求伪装成宿主机的请求转发到外网
 -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
-# 由 br-6aca1043b883 设备传入的请求 DOCKER 链会返回上一层处理
 -A DOCKER -i br-6aca1043b883 -j RETURN
-# 由 docker0 设备传入的请求 DOCKER 链会返回上一层处理
 -A DOCKER -i docker0 -j RETURN
 COMMIT
 # Completed on Wed May 29 16:42:26 2024
@@ -495,19 +475,11 @@ $ sudo docker network connect my-net use-docker0
 ### docker内部访问外部
 默认情况下，`docker`可以直接访问外网。要理解原因，我们需要看下`iptables`的`nat`表：
 ```bash
-# 如果请求的目标地址是本机的地址, 那么将请求转到 DOCKER 链处理
 -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
-# 如果请求的目标地址不匹配 127.0.0.0/8, 并且目标地址属于本机地址, 那么将请求跳转到 DOCKER 链处理
 -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
-# 对于来自于 172.33.16.0/24 的请求, 目标地址不是 br-6aca1043b883 所在的网段的地址, 
-# POSTROUTING 链将会将该请求伪装成宿主机的请求转发到外网
 -A POSTROUTING -s 172.33.16.0/24 ! -o br-6aca1043b883 -j MASQUERADE
-# 对于来自于 172.17.0.0/16 的请求, 目标地址不是 docker0 所在的网段的地址, 
-# POSTROUTING 链将会将该请求伪装成宿主机的请求转发到外网
 -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
-# 由 br-6aca1043b883 设备传入的请求 DOCKER 链会返回上一层处理
 -A DOCKER -i br-6aca1043b883 -j RETURN
-# 由 docker0 设备传入的请求 DOCKER 链会返回上一层处理
 -A DOCKER -i docker0 -j RETURN
 ```
 上面主要是对来自`docker`网络的流量，且发往的目标地址是外部（也就是数据包的源和目的地址不是同一个网段，
