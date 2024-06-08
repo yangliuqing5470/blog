@@ -1,4 +1,5 @@
 # iptables
+## 基础概念
 `iptables`是 Linux 上的防火墙工具，用于配置和管理网络数据包的过滤规则。`iptables`分为**四表五链**（不涉及`security`表）：
 + `raw`表：可用于关闭`nat`表上启用的连接追踪机制。包含的链为：`PreRouting`，`Output`；
 + `managle`表：指定如何处理数据包，具备拆解报文、修改报文以及重新封装的功能，可用于修改 IP 头部信息，如：TTL。
@@ -17,8 +18,95 @@
 四表执行的优先级是：`raw -> mangle -> nat -> filter`。网络数据经过`iptables`执行流程如下：
 ![iptables](./images/iptables.png)
 每一个链处理结果动作包括接收（`ACCEPT`），丢弃（`DROP`），拒绝（`REJECT`），返回上层（`RETURN`）等。
+> `RETURN`：如果是在子链（自定义链）遇到`RETURN`，则返回父链的下一条规则继续进行条件的比较。
+如果是在默认链`RETURN`则直接使用默认的动作（`ACCEPT/DROP`）。
 
-`iptables`具体操作命令或者支持参数介绍，查看`man iptables`。
+## 常用命令
+`iptables`具体操作命令或者支持参数介绍，查看`man iptables`。下面给出样例说明：
+```bash
+# 在表 <table> 的 FORWARD 链末尾添加规则：接收来自 docker0 接口进来，并通过 br-6aca1043b883 接口发送的数据包
+sudo iptables -t <table> -A FORWARD -i docker0 -o br-6aca1043b883 -j ACCEPT
+# 在表 <table> 的 FORWARD 链第一行添加规则：接收来自 docker0 接口进来，并通过 br-6aca1043b883 接口发送的数据包
+sudo iptables -t <table> -I FORWARD 1 -i docker0 -o br-6aca1043b883 -j ACCEPT
+# 删除表 <table> 的 FORWARD 链的第一行规则
+sudo iptables -t <table> -D FORWARD 1
+```
+`iptables`的网卡接口参数：
++ `-i`：接收数据包的网卡。当本机有多个网卡时，可以使用`-i`选项去匹配报文是通过哪块网卡流入本机的。
+`-i`参数只能用于`PREROUTING`、`INPUT`和`FORWARD`链中。
++ `-o`：发送数据包的网卡。当主机有多块网卡时，可以使用`-o`选项，匹配报文将由哪块网卡流出。
+`-o`参数只能用于`FORWARD`、`OUTPUT`和`POSTROUTING`链。
+
+**网卡连接外面和内核，数据包经过网卡进入内核处理。数据包经过网卡发生给外面。**
+
+**`iptables`工作在宿主机内核里面。**
+
+# 路由选择
+路由在内核协议栈的位置如下：
+```bash
+|-----------------------------------------------------------------------|
+|                                 传输层                                |
+|                                                                       |
+|                          ^                                            |
+|__________________________|____________________________________|_______|
+|                          |      网络层                        V       |
+|                          |                              +----------+  |
+|                          |                              | 路由选择 |  |
+|                          |                              +----------+  |
+|                          |                                   |        |
+|                          |                                   V        |
+|                      +-------+                           +--------+   |
+|                      | INPUT |                           | OUTPUT |   |
+|                      +-------+                           +--------+   |
+|                          ^                                   |        |
+|                          |                                   V        |
+|+------------+      +----------+      +---------+      +-------------+ |
+|| PREROUTING | -- > | 路由选择 | -- > | FORWARD | -- > | POSTROUTING | |
+|+------------+      +----------+      +---------+      +-------------+ |
+|_____^________________________________________________________|________|
+      |                                                        v
+  +------+                                                  +------+
+  | 网卡 |                                                  | 网卡 |
+  +------+                                                  +------+
+```
+`linux`默认有两个路由表`local`和`default`。一般添加路由规则都在`default`表。
+
+查看`local`表
+```bash
+$ ip route list table local
+local 127.0.0.0/8 dev lo proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo proto kernel scope link src 127.0.0.1 
+local 172.17.0.1 dev docker0 proto kernel scope host src 172.17.0.1 
+broadcast 172.17.255.255 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+local 172.18.0.1 dev br-dadeff274ae2 proto kernel scope host src 172.18.0.1 
+broadcast 172.18.0.255 dev br-dadeff274ae2 proto kernel scope link src 172.18.0.1 linkdown 
+local 192.168.32.128 dev ens33 proto kernel scope host src 192.168.32.128 
+broadcast 192.168.32.255 dev ens33 proto kernel scope link src 192.168.32.128
+```
+**`local`表匹配都会走`lo`网卡。**
+
+查看`default`表
+```bash
+$ ip route list table main
+default via 192.168.32.2 dev ens33 proto dhcp metric 100 
+169.254.0.0/16 dev ens33 scope link metric 1000 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+172.18.0.0/24 dev br-dadeff274ae2 proto kernel scope link src 172.18.0.1 linkdown 
+192.168.32.0/24 dev ens33 proto kernel scope link src 192.168.32.128 metric 100
+
+$ netstat -rn
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags   MSS Window  irtt Iface
+0.0.0.0         192.168.32.2    0.0.0.0         UG        0 0          0 ens33
+169.254.0.0     0.0.0.0         255.255.0.0     U         0 0          0 ens33
+172.17.0.0      0.0.0.0         255.255.0.0     U         0 0          0 docker0
+172.18.0.0      0.0.0.0         255.255.255.0   U         0 0          0 br-dadeff274ae2
+192.168.32.0    0.0.0.0         255.255.255.0   U         0 0          0 ens33
+```
+其中`Gateway`取值`0.0.0.0`表示数据包直接从指定接口发出，不走网关。
+
+容器中发送数据包，会查询容器网络的路由表。
 
 # docker网络
 `docker`默认创建三种网络：`bridge`、`host`和`none`
@@ -366,8 +454,8 @@ docker0		8000.024262ccb22a	no		veth3aef12c
 |                           Host                                |
 +---------------------------------------------------------------+
 ```
-容器`use-my-net1`和`use-my-net2`连接相同的网络`my-net`上，可以互相通信（可以通过容器名通信）。
-容器`use-docker0`连接到默认的`bridge`网络，和其他两个容器隔离，不能通信。
+**容器`use-my-net1`和`use-my-net2`连接相同的网络`my-net`上，可以互相通信（可以通过容器名通信）。
+容器`use-docker0`连接到默认的`bridge`网络，和其他两个容器隔离，不能通信**。
 
 我们知道，不同的网络可以通过路由进行通信，如果将`docker`宿主机看成一个路由器，那么上面实验两个不同网络是否可以通信呢？
 首先查看`docker`宿主机路由表信息：
@@ -400,47 +488,17 @@ $ sudo iptables-save
 :DOCKER-USER - [0:0]
 -A FORWARD -j DOCKER-USER
 -A FORWARD -j DOCKER-ISOLATION-STAGE-1
--A FORWARD -o br-6aca1043b883 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A FORWARD -o br-6aca1043b883 -j DOCKER
--A FORWARD -i br-6aca1043b883 ! -o br-6aca1043b883 -j ACCEPT
--A FORWARD -i br-6aca1043b883 -o br-6aca1043b883 -j ACCEPT
--A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A FORWARD -o docker0 -j DOCKER
--A FORWARD -i docker0 ! -o docker0 -j ACCEPT
--A FORWARD -i docker0 -o docker0 -j ACCEPT
+...
 -A DOCKER-ISOLATION-STAGE-1 -i br-6aca1043b883 ! -o br-6aca1043b883 -j DOCKER-ISOLATION-STAGE-2
+# 数据包从 docker0 网卡进来，但不是发往 docker0 网卡（也就是不经过 docker0 发送）交给 DOCKER-ISOLATION-STAGE-2 链
 -A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
 -A DOCKER-ISOLATION-STAGE-1 -j RETURN
+# 数据包发往 br-6aca1043b883 网卡的数据包执行 DROP
 -A DOCKER-ISOLATION-STAGE-2 -o br-6aca1043b883 -j DROP
 -A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
 -A DOCKER-ISOLATION-STAGE-2 -j RETURN
 -A DOCKER-USER -j RETURN
-COMMIT
-# Completed on Wed May 29 16:42:26 2024
-# Generated by iptables-save v1.8.7 on Wed May 29 16:42:26 2024
-*nat
-:PREROUTING ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:DOCKER - [0:0]
--A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
--A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
--A POSTROUTING -s 172.33.16.0/24 ! -o br-6aca1043b883 -j MASQUERADE
--A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
--A DOCKER -i br-6aca1043b883 -j RETURN
--A DOCKER -i docker0 -j RETURN
-COMMIT
-# Completed on Wed May 29 16:42:26 2024
-```
-关注下`filter`表中的：
-```bash
--A DOCKER-ISOLATION-STAGE-1 -i br-6aca1043b883 ! -o br-6aca1043b883 -j DOCKER-ISOLATION-STAGE-2
--A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
--A DOCKER-ISOLATION-STAGE-1 -j RETURN
--A DOCKER-ISOLATION-STAGE-2 -o br-6aca1043b883 -j DROP
--A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
--A DOCKER-ISOLATION-STAGE-2 -j RETURN
+...
 ```
 **会`DROP`调`docker0`和`br-6aca1043b883`两个`docker`网络之间的双向流量，使其不能通信**。但发往其他网络比如外网，不会`DROP`。
 
@@ -475,11 +533,15 @@ $ sudo docker network connect my-net use-docker0
 ### docker内部访问外部
 默认情况下，`docker`可以直接访问外网。要理解原因，我们需要看下`iptables`的`nat`表：
 ```bash
+# 所有目的地址在本机的，都先交给 DOCKER 链处理
 -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
 -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
 -A POSTROUTING -s 172.33.16.0/24 ! -o br-6aca1043b883 -j MASQUERADE
+# 源地址是 172.17.0.0/16 （容器内部发送数据包），且数据包不经过 docker0 接口发送，
+# 也就是发往的目标接口不是 docker0 接口，则执行 MASQUERADE 操作
 -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
 -A DOCKER -i br-6aca1043b883 -j RETURN
+# 来自 docker0 接口的数据包不做任何处理，直接返回父链
 -A DOCKER -i docker0 -j RETURN
 ```
 上面主要是对来自`docker`网络的流量，且发往的目标地址是外部（也就是数据包的源和目的地址不是同一个网段，
@@ -519,6 +581,57 @@ listening on docker0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
                      |                          |
                      |                          |
 ```
+知道了`docker`容器中的数据如何发送外部，那么**出口网卡收到返回的数据包后，
+如何将数据包转发到数据的初始来源端——某个`docker`容器**，也就是如何接收回包？
+
+这时候**需要`conntrack`功能**
+> 在做`NAT`转换时，无需手动添加额外的规则来执行反向转换以实现数据的双向传输。
+`netfilter/conntrack`系统会记录`NAT`的连接状态，`NAT`地址的反向转换是根据这个状态自动完成的。
+
+以一个具体样例说明`conntrack`工作原理，首先看下`docker0`网络结构如下：
+```bash
++-----------------------------------------------+-----------------------------------+
+|                      Host                     |           Container A             |
+|                                               |                                   |
+|   +---------------------------------------+   |    +-------------------------+    |
+|   |       Network Protocol Stack          |   |    |  Network Protocol Stack |    |
+|   +----+-------------+--------------------+   |    +-----------+-------------+    |
+|        ^             ^                        |                ^                  |
+|........|.............|........................|................|..................|
+|        v             v                        |                v                  |
+|   +----+----+  +-----+------+                 |          +-----+-------+          |
+|   | .32.101 |  | 172.17.0.1 |                 |          | 172.17.0.2  |          |
+|   +---------+  +------------+                 |          +-------------+          |
+|   |  eth0   |  |   docker0  |                 |          | eth0(veth)  |          |
+|   +----+----+  +-----+------+                 |          +-----+-------+          |
+|        ^             ^                        |                ^                  |
+|        |             |                        |                |                  |
+|        |             v                        |                |                  |
+|        |          +--+---+                    |                |                  |
+|        |          | veth |                    |                |                  |
+|        |          +--+---+                    |                |                  |
+|        |             ^                        |                |                  |
+|        |             +-----------------------------------------+                  |
+|        |                                      |                                   |
+|        |                                      |                                   |
++-----------------------------------------------+-----------------------------------+
+         v
+    Physical Network  (192.168.32.0/24)
+```
+假设容器 A 往外网`bing.com`发送一个数据包，数据的流程如下：
++ 容器 A 发送的包经过`MASQUERADE`处理，将容器 ip 替换为`eht0`的 ip 发送出去。
+  > `conntrack`系统记录此连接被`NAT`处理前后的状态信息，并将其状态设置为`NEW`，
+  表示这是新发起的一个连接。
++ `bing.com`回包数据会首先经过`eth0`网卡。
++ `conntrack`查表，发现返回数据包的连接已经记录在表中并且状态为`NEW`，
+于是它将连接的状态修改为`ESTABLISHED`，并且将目的 ip 改为`172.17.0.2`然后发送出去。
++ 宿主机查找路由表，发送目的地址`172.17.0.2`数据包需要交给`docker0`网卡发送，
+接下来数据包通过`docker0`网卡进入内核，匹配`iptables`规则：
+  ```bash
+  -A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  ```
++ 数据进入容器 A，交给容器的内核协议栈处理。
+
 
 ### 外部访问docker内部
 通过**端口映射**，也就是运行容器时候指定`-p`参数，这将创建一个`iptables`规则，
@@ -555,3 +668,103 @@ root        2871  0.0  0.0 1156012 3456 ?        Sl   23:11   0:00 /usr/bin/dock
 root        2877  0.0  0.0 1229744 3456 ?        Sl   23:11   0:00 /usr/bin/docker-proxy -proto tcp -host-ip :: -host-port 8080 -container-ip 172.17.0.2 -container-port 80
 ```
 其实`docker-proxy`进程可以关闭（默认启动`docker`是开启，有参数控制），通过`iptables`和将宿主机当路由器已经可以实现外部访问容器内部了
+
+### 外部访问容器（iptables+route实现）
+实验环境如下：
++ 宿主机`192.168.32.128`启动`docker`容器，容器`ip`地址`172.17.0.2`。
++ 另一台宿主机`192.168.32.129`直接通过 ip 访问第一步启动的容器。
+
+查看`192.168.32.129`路由表如下：
+```bash
+$ netstat -rn
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags   MSS Window  irtt Iface
+0.0.0.0         192.168.32.2    0.0.0.0         UG        0 0          0 ens33
+169.254.0.0     0.0.0.0         255.255.0.0     U         0 0          0 ens33
+192.168.32.0    0.0.0.0         255.255.255.0   U         0 0          0 ens33
+```
+根据路由表可知，在`192.168.32.129`直接`ping 172.17.0.2`不通，因为没有`172.17.0.0`路由项。
+在`192.168.32.129`主机添加路由项：
+```bash
+$ sudo route add -net 172.17.0.0/16 gw 192.168.32.128 dev ens33
+
+$ netstat -rn
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags   MSS Window  irtt Iface
+0.0.0.0         192.168.32.2    0.0.0.0         UG        0 0          0 ens33
+169.254.0.0     0.0.0.0         255.255.0.0     U         0 0          0 ens33
+172.17.0.0      192.168.32.128  255.255.0.0     UG        0 0          0 ens33
+192.168.32.0    0.0.0.0         255.255.255.0   U         0 0          0 ens33
+```
+将`192.168.32.128`主机当成路由器，`192.168.32.128`主机开启路由转发功能：
+```bash
+$ sysctl net.ipv4.ip_forward
+net.ipv4.ip_forward = 1
+```
+查看`192.168.32.128`路由表如下：
+```bash
+$ netstat -rn
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags   MSS Window  irtt Iface
+0.0.0.0         192.168.32.2    0.0.0.0         UG        0 0          0 ens33
+169.254.0.0     0.0.0.0         255.255.0.0     U         0 0          0 ens33
+172.17.0.0      0.0.0.0         255.255.0.0     U         0 0          0 docker0
+172.18.0.0      0.0.0.0         255.255.255.0   U         0 0          0 br-dadeff274ae2
+192.168.32.0    0.0.0.0         255.255.255.0   U         0 0          0 ens33
+```
+根据`192.168.32.128`路由表可知，对于目的 ip 是`172.17.0.0/16`的数据包会通过`docker0`接口发送，
+所以需要添加一条路由规则以接收外网发送到`docker0`的数据包：
+```bash
+$ sudo iptables -A FORWARD -o docker0 -j ACCEPT
+```
+此时通过`tcpdump`分别抓`192.168.32.129`上的`ens33`网卡，`192.168.32.128`上的`ens33`和`docker0`网卡：
+```bash
+# 192.168.32.129 主机结果
+$ ping 172.17.0.2 -c 3
+PING 172.17.0.2 (172.17.0.2) 56(84) bytes of data.
+64 bytes from 172.17.0.2: icmp_seq=1 ttl=63 time=0.718 ms
+64 bytes from 172.17.0.2: icmp_seq=2 ttl=63 time=1.79 ms
+64 bytes from 172.17.0.2: icmp_seq=3 ttl=63 time=2.23 ms
+
+--- 172.17.0.2 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2015ms
+rtt min/avg/max/mdev = 0.718/1.581/2.234/0.636 ms
+
+$ sudo tcpdump -i ens33 icmp -n
+[sudo] password for yangliuqing: 
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on ens33, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+14:10:48.997281 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 1, length 64
+14:10:48.997983 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 1, length 64
+14:10:50.010963 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 2, length 64
+14:10:50.012714 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 2, length 64
+14:10:51.012695 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 3, length 64
+14:10:51.014881 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 3, length 64
+```
+可知，在`192.168.32.129`上可以直接访问`192.168.32.128`上的容器`172.17.0.2`。
+下面看下`192.168.32.128`上的抓包结果：
+```bash
+# 192.168.32.128 ens33 网卡
+$ sudo tcpdump -i ens33 icmp -n
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on ens33, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+14:10:48.984526 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 1, length 64
+14:10:48.984642 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 1, length 64
+14:10:49.998672 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 2, length 64
+14:10:49.998919 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 2, length 64
+14:10:51.000391 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 3, length 64
+14:10:51.000652 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 3, length 64
+
+# 192.168.32.128 docker0 网卡
+$ sudo tcpdump -i docker0 icmp -n
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on docker0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+14:10:48.984567 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 1, length 64
+14:10:48.984634 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 1, length 64
+14:10:49.998737 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 2, length 64
+14:10:49.998898 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 2, length 64
+14:10:51.000463 IP 192.168.32.129 > 172.17.0.2: ICMP echo request, id 19, seq 3, length 64
+14:10:51.000630 IP 172.17.0.2 > 192.168.32.129: ICMP echo reply, id 19, seq 3, length 64
+```
+抓包结果可知，`192.168.32.128`上的`ens33`收到外部发往`172.17.0.0/16`数据包会查询路由表，
+发送给`docker0`网卡发送。
