@@ -256,3 +256,120 @@ mysql> select count(1) from task_info;
 最终表中`id`列是主键索引，`task_id`和`usetime`两列是两个普通索引，`source`没有添加索引，`model_num`和`cube_num`是一个联合索引。
 
 ## 测试结果
+### 普通索引 vs 没有索引
+使用有普通索引的列`usetime`查询，执行计划如下：
+```bash
+mysql> explain select SQL_NO_CACHE count(1) from task_info where usetime=100;
++----+-------------+-----------+------------+------+---------------+---------------+---------+-------+------+----------+-------------+
+| id | select_type | table     | partitions | type | possible_keys | key           | key_len | ref   | rows | filtered | Extra       |
++----+-------------+-----------+------------+------+---------------+---------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | task_info | NULL       | ref  | index_usetime | index_usetime | 5       | const | 3296 |   100.00 | Using index |
++----+-------------+-----------+------------+------+---------------+---------------+---------+-------+------+----------+-------------+
+1 row in set, 2 warnings (0.00 sec)
+```
+查询使用索引`index_usetime`，查询类型为`ref`。查询结果及耗时如下：
+```bash
+mysql> select SQL_NO_CACHE count(1) from task_info where usetime=100;
++----------+
+| count(1) |
++----------+
+|     3296 |
++----------+
+1 row in set, 1 warning (0.00 sec)
+```
+不使用索引的列`source`查询，执行计划如下：
+```bash
+mysql> explain select SQL_NO_CACHE count(1) from task_info where source=3;
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+| id | select_type | table     | partitions | type | possible_keys | key  | key_len | ref  | rows    | filtered | Extra       |
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+|  1 | SIMPLE      | task_info | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 9435886 |    10.00 | Using where |
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+1 row in set, 2 warnings (0.00 sec)
+```
+查询不使用索引，查询类型为`ALL`，查询结果及耗时如下：
+```bash
+mysql> select SQL_NO_CACHE count(1) from task_info where source=3;
++----------+
+| count(1) |
++----------+
+|  1666975 |
++----------+
+1 row in set, 1 warning (5.06 sec)
+```
+结论：使用索引可以有效提高查询效率。
+
+### 联合索引
+联合索引需要满足**最左匹配原则**，例如对于联合索引`index_model_cube_num (model_num, cube_num)`，查询执行计划如下：
+```bash
+mysql> explain select SQL_NO_CACHE * from task_info where model_num=184 and cube_num=141;
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------------+------+----------+-------+
+| id | select_type | table     | partitions | type | possible_keys        | key                  | key_len | ref         | rows | filtered | Extra |
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------------+------+----------+-------+
+|  1 | SIMPLE      | task_info | NULL       | ref  | index_model_cube_num | index_model_cube_num | 10      | const,const |  148 |   100.00 | NULL  |
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------------+------+----------+-------+
+1 row in set, 2 warnings (0.00 sec)
+```
+查询条件为`model_num and cube_num`时，使用联合索引，查询类型为`ref`。查询条件为`model_num`的执行计划如下：
+```bash
+mysql> explain select SQL_NO_CACHE count(*) from task_info where model_num=184;
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------+-------+----------+-------------+
+| id | select_type | table     | partitions | type | possible_keys        | key                  | key_len | ref   | rows  | filtered | Extra       |
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------+-------+----------+-------------+
+|  1 | SIMPLE      | task_info | NULL       | ref  | index_model_cube_num | index_model_cube_num | 5       | const | 57264 |   100.00 | Using index |
++----+-------------+-----------+------------+------+----------------------+----------------------+---------+-------+-------+----------+-------------+
+1 row in set, 2 warnings (0.01 sec)
+```
+查询条件`model_num`时，使用联合索引，查询类型为`ref`。当查询条件为`cube_num`，执行计划如下：
+```bash
+mysql> explain select SQL_NO_CACHE count(*) from task_info where cube_num=141;
++----+-------------+-----------+------------+-------+----------------------+----------------------+---------+------+---------+----------+----------------------------------------+
+| id | select_type | table     | partitions | type  | possible_keys        | key                  | key_len | ref  | rows    | filtered | Extra                                  |
++----+-------------+-----------+------------+-------+----------------------+----------------------+---------+------+---------+----------+----------------------------------------+
+|  1 | SIMPLE      | task_info | NULL       | range | index_model_cube_num | index_model_cube_num | 10      | NULL | 2358971 |   100.00 | Using where; Using index for skip scan |
++----+-------------+-----------+------------+-------+----------------------+----------------------+---------+------+---------+----------+----------------------------------------+
+1 row in set, 2 warnings (0.00 sec)
+```
+查询条件为`cube_num`时，在新版的`MySQL`中使用联合索引，但查询类型为`range`，`Extra`包含`Using index for skip scan`，
+这是新版`MySQL`优化；对于老版本的`MySQL`，则不会使用联合索引，查询类型为`ALL`。查询效率对比如下：
+```bash
+# 使用 model_num 查询，满足最左匹配
+mysql> select SQL_NO_CACHE count(*) from task_info where model_num=184;
++----------+
+| count(*) |
++----------+
+|    26432 |
++----------+
+1 row in set, 1 warning (0.02 sec)
+
+# 使用 cube_num 查询，不满足最左匹配
+mysql> select SQL_NO_CACHE count(*) from task_info where cube_num=141;
++----------+
+| count(*) |
++----------+
+|    49772 |
++----------+
+1 row in set, 1 warning (0.42 sec)
+```
+
+### 索引范围查找
+对于索引范围查找，`MySQL`优化器会自动根据查询范围大小选择使用索引还是不使用索引。例如：
+```bash
+# 范围小，使用索引
+mysql> explain select SQL_NO_CACHE * from task_info where usetime>4000;
++----+-------------+-----------+------------+-------+---------------+---------------+---------+------+------+----------+-----------------------+
+| id | select_type | table     | partitions | type  | possible_keys | key           | key_len | ref  | rows | filtered | Extra                 |
++----+-------------+-----------+------------+-------+---------------+---------------+---------+------+------+----------+-----------------------+
+|  1 | SIMPLE      | task_info | NULL       | range | index_usetime | index_usetime | 5       | NULL |    1 |   100.00 | Using index condition |
++----+-------------+-----------+------------+-------+---------------+---------------+---------+------+------+----------+-----------------------+
+1 row in set, 2 warnings (0.00 sec)
+
+# 范围大，不使用索引
+mysql> explain select SQL_NO_CACHE * from task_info where usetime>1000;
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+| id | select_type | table     | partitions | type | possible_keys | key  | key_len | ref  | rows    | filtered | Extra       |
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+|  1 | SIMPLE      | task_info | NULL       | ALL  | index_usetime | NULL | NULL    | NULL | 9435886 |    50.00 | Using where |
++----+-------------+-----------+------------+------+---------------+------+---------+------+---------+----------+-------------+
+1 row in set, 2 warnings (0.01 sec)
+```
