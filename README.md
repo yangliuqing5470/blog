@@ -32,6 +32,11 @@
 - [docker网络知多少](./programming/docker/network.md)
 - [docker资源监控](./programming/docker/resources_monitor.md)
 
+## Redis
+- [redis数据结构-字符串](./programming/redis/sds.md)
+- [redis数据结构-链表](./programming/redis/list.md)
+- [redis数据结构-字典](./programming/redis/dict.md)
+
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
 
