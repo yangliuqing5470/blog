@@ -392,33 +392,48 @@ load_factor = ht[0].used / ht[0].size;
           /* Note that rehashidx can't overflow as we are sure there are more
            * elements because ht[0].used != 0 */
           assert(d->ht[0].size > (unsigned long)d->rehashidx);
+          // 旧的 ht[0] 哈希表在当前索引 d->rehashidx 上没有哈希节点，也就是没有保存健值对
+          // 当前调用在旧的 ht[0] 哈希表，最多查看 empty_visits 个空槽位
           while(d->ht[0].table[d->rehashidx] == NULL) {
               d->rehashidx++;
               if (--empty_visits == 0) return 1;
           }
+          // 取出旧的 ht[0] 哈希表在 d->rehashidx 索引对应的哈希节点，并将其包括所有
+          // 可能存在冲突的链表哈希节点都移动到新的 ht[1] 哈希表。
           de = d->ht[0].table[d->rehashidx];
           /* Move all the keys in this bucket from the old to the new hash HT */
           while(de) {
               uint64_t h;
-  
+              // 链表的下一个准备 rehash 的节点 
               nextde = de->next;
               /* Get the index in the new hash table */
+              // 计算要 rehash 的哈希节点在新的 ht[1] 哈希表的索引
               h = dictHashKey(d, de->key) & d->ht[1].sizemask;
+              // 将新加的哈希节点放在链表头位置
               de->next = d->ht[1].table[h];
               d->ht[1].table[h] = de;
+              // 旧的 ht[0] 哈希表哈希节点数减1
               d->ht[0].used--;
+              // 新的 ht[1] 哈希表哈希节点数加1
               d->ht[1].used++;
               de = nextde;
           }
+          // 更新旧的 ht[0] 哈希表在 d->rehashidx 索引处位空，因为已经 rehash 到新的 ht[1] 哈希表了
           d->ht[0].table[d->rehashidx] = NULL;
+          // 更新 d->rehashidx 值，为下次 rehash 做准备
           d->rehashidx++;
       }
   
       /* Check if we already rehashed the whole table... */
+      // 检查旧的 ht[0] 哈希表是否都 rehash 完成
       if (d->ht[0].used == 0) {
+          // 释放旧的 ht[0] 哈希表
           zfree(d->ht[0].table);
+          // 将新的 ht[1] 哈希表设置为 ht[0]
           d->ht[0] = d->ht[1];
+          // d->ht[1] 哈希表设置为空
           _dictReset(&d->ht[1]);
+          // 将 d->rehashidx 设置为 -1，表示 rehash 完成
           d->rehashidx = -1;
           return 0;
       }
@@ -469,11 +484,12 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
     long index;
     dictEntry *entry;
     dictht *ht;
-
+    // 如果在 rehash 中，执行一步 rehash 操作（rehash 一个哈希节点，也就是 rehash 一个健值对）
     if (dictIsRehashing(d)) _dictRehashStep(d);
 
     /* Get the index of the new element, or -1 if
      * the element already exists. */
+    // 获取哈希索引：如果在 rehash 中，获取是 ht[1] 哈希表索引，否则是 ht[0] 哈希表索引
     if ((index = _dictKeyIndex(d, key, dictHashKey(d,key), existing)) == -1)
         return NULL;
 
@@ -481,10 +497,13 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
      * Insert the element in top, with the assumption that in a database
      * system it is more likely that recently added entries are accessed
      * more frequently. */
+    // 如果是在 rehash 中，获取 ht[1] 哈希表对象，否则是 ht[0] 哈希表对象
     ht = dictIsRehashing(d) ? &d->ht[1] : &d->ht[0];
     entry = zmalloc(sizeof(*entry));
+    // 将新的哈希节点添加到链表头位置
     entry->next = ht->table[index];
     ht->table[index] = entry;
+    // 更新哈希表哈希节点数量
     ht->used++;
 
     /* Set the hash entry fields. */
@@ -492,6 +511,11 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
     return entry;
 }
 ```
+在节点添加之前如果判断当前字典在`rehash`中，会调用`_dictRehashStep`函数，执行一步`rehash`操作（`rehash`一个哈希节点）。
+哈希节点的添加有如下两种情况：
++ 如果在 `rehash` 中，会将新节点添加到 `ht[1]` 哈希表；
++ 如果没有在 `rehash` 中，将新节点添加到 `ht[0]` 哈希表；
+
 在哈希表删除操作实现如下：
 ```c
 /* Search and remove an element. This is an helper function for
@@ -501,28 +525,35 @@ static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
     uint64_t h, idx;
     dictEntry *he, *prevHe;
     int table;
-
+    // 判断 ht[0] 和 ht[1] 两个哈希表都没有哈希节点，直接返回NULL，表示没有找到
     if (d->ht[0].used == 0 && d->ht[1].used == 0) return NULL;
 
+    // 如果在 rehash 中，执行一步 rehash 操作（rehash 一个哈希节点，也就是 rehash 一个健值对）
     if (dictIsRehashing(d)) _dictRehashStep(d);
+    // 计算健 key 的哈希值
     h = dictHashKey(d, key);
 
     for (table = 0; table <= 1; table++) {
+        // 计算当前查找哈希表的索引
         idx = h & d->ht[table].sizemask;
         he = d->ht[table].table[idx];
         prevHe = NULL;
+        // 依次查找链表，因为可能存在哈希冲突，在一个索引处有多个哈希节点
         while(he) {
+            // 下面的删除操作其实就是从链表中删除一个节点的逻辑
             if (key==he->key || dictCompareKeys(d, key, he->key)) {
                 /* Unlink the element from the list */
                 if (prevHe)
                     prevHe->next = he->next;
                 else
+                    // 哈希表索引指向删除元素的下一个哈希节点
                     d->ht[table].table[idx] = he->next;
                 if (!nofree) {
                     dictFreeKey(d, he);
                     dictFreeVal(d, he);
                     zfree(he);
                 }
+                // 更新哈希表哈希节点数量
                 d->ht[table].used--;
                 return he;
             }
@@ -540,6 +571,9 @@ int dictDelete(dict *ht, const void *key) {
     return dictGenericDelete(ht,key,0) ? DICT_OK : DICT_ERR;
 }
 ```
+在节点删除之前如果判断当前字典在`rehash`中，会调用`_dictRehashStep`函数，执行一步`rehash`操作（`rehash`一个哈希节点）。
+删除一个哈希节点首先在`ht[0]`哈希表查找，如果在`ht[0]`哈希表没有找到且当前字典在`rehash`中，会继续在`ht[1]`哈希表查找。
+
 在哈希表查找操作如下：
 ```c
 dictEntry *dictFind(dict *d, const void *key)
@@ -548,6 +582,7 @@ dictEntry *dictFind(dict *d, const void *key)
     uint64_t h, idx, table;
 
     if (d->ht[0].used + d->ht[1].used == 0) return NULL; /* dict is empty */
+    // 如果在 rehash 中，执行一步 rehash 操作（rehash 一个哈希节点，也就是 rehash 一个健值对）
     if (dictIsRehashing(d)) _dictRehashStep(d);
     h = dictHashKey(d, key);
     for (table = 0; table <= 1; table++) {
@@ -563,3 +598,6 @@ dictEntry *dictFind(dict *d, const void *key)
     return NULL;
 }
 ```
+在节点查找之前如果判断当前字典在`rehash`中，会调用`_dictRehashStep`函数，执行一步`rehash`操作（`rehash`一个哈希节点）。
+查找一个哈希节点首先在`ht[0]`哈希表查找，如果在`ht[0]`哈希表没有找到且当前字典在`rehash`中，会继续在`ht[1]`哈希表查找。
+
