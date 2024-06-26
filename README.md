@@ -36,6 +36,7 @@
 - [redis数据结构-字符串](./programming/redis/sds.md)
 - [redis数据结构-链表](./programming/redis/list.md)
 - [redis数据结构-字典](./programming/redis/dict.md)
+- [redis数据结构-跳跃表](./programming/redis/skiplist.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
