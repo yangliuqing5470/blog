@@ -38,6 +38,7 @@
 - [redis数据结构-字典](./programming/redis/dict.md)
 - [redis数据结构-跳跃表](./programming/redis/skiplist.md)
 - [redis数据结构-整数集合](./programming/redis/intset.md)
+- [redis数据结构-压缩列表](./programming/redis/ziplist.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
