@@ -196,6 +196,72 @@ raxNode *raxNewNode(size_t children, int datafield) {
 + `children`：当前节点子节点个数；
 + `datafield`：当前节点是否有对应的`value`，取值`0`表示没有，取值非`0`表示有；
 
+新创建后`rax`数据结构如下：
+```bash               
+                      |-------------> head <----------------|
++-------------+       +--------+---------+----------+-------+----+
+|     head    |  ---> |iskey: 0|isnull: 0|iscompr: 0|size: 0|data|
++-------------+       +--------+---------+----------+-------+----+
+| numele: 0   |       
++-------------+       
+| numnodes: 1 |       
++-------------+       
+```
+## rax树节点添加子节点
+`raxNode`有压缩节点和非压缩节点，先看非压缩节点添加子节点`raxAddChild`函数实现。
+`raxAddChild`函数定义如下：
+```c
+raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink)
+```
++ `n`：表示要添加子节点的节点；
++ `c`：节点`n`要添加的字符，因为是非压缩节点，所以是一个字符；
++ `childptr`：指向插入新的子节点地址的指针；
++ `parentlink`：指向节点`n`中指向新节点地址的指针；
+
+`raxAddChild`操作主要有如下几步：
++ 节点空间分配；
+  ```c
+    assert(n->iscompr == 0);
+    // 获取节点 n 更新前的大小，header + data 的大小
+    size_t curlen = raxNodeCurrentLength(n);
+    // 因为添加一个字符，节点 size 值加 1
+    n->size++;
+    // 获取节点 你更新后的大小，header + data 的大小
+    // 添加一个字符，也会添加一个子节点指针 + 填充字节大小（内存对齐）
+    size_t newlen = raxNodeCurrentLength(n);
+    n->size--; /* For now restore the orignal size. We'll update it only on
+                  success at the end. */
+
+    /* Alloc the new child we will link to 'n'. */
+    // 分配一个空的子节点（data 属性没有数据）
+    raxNode *child = raxNewNode(0,0);
+    if (child == NULL) return NULL;
+
+    /* Make space in the original node. */
+    // 从新给节点分配空间
+    raxNode *newn = rax_realloc(n,newlen);
+    if (newn == NULL) {
+        rax_free(child);
+        return NULL;
+    }
+    n = newn;
+  ```
+  重新分配空间后，会增加一个字节存储字符`c`，填充字节用于内存对齐，一个指针指向新的子节点：
+  ```bash
+  // 分配前节点存储 abde 4个字符
+  [HDR*][abde][Aptr][Bptr][Dptr][Eptr]|AUXP|
+  // 分配后的空间
+  [HDR*][abde][Aptr][Bptr][Dptr][Eptr]|AUXP|[....][....]
+  ```
++ 查找字符`c`要在节点`n`中添加的位置；
+  ```c
+    int pos;
+    for (pos = 0; pos < n->size; pos++) {
+        if (n->data[pos] > c) break;
+    }
+  ```
+  节点中存储的字符保持字典序。
+
 ## rax树元素插入
 
 
