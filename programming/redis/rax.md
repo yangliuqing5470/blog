@@ -148,7 +148,64 @@ typedef struct raxIterator {
 + `stack`：记录从根节点到当前节点路径，用于节点向上遍历；
 + `node_cb`：节点回调函数，默认为`NULL`；
 
-## rax树迭代器创建
+## rax树创建
+`rax`树创建实现如下：
+```c
+/* Allocate a new rax and return its pointer. On out of memory the function
+ * returns NULL. */
+rax *raxNew(void) {
+    rax *rax = rax_malloc(sizeof(*rax));
+    if (rax == NULL) return NULL;
+    // 初始化元素个数（key 的个数）为 0
+    rax->numele = 0;
+    // 初始化 rax 树节点个数为 1，因为包含一个 head 节点
+    rax->numnodes = 1;
+    // 初始化 head 节点，head 节点没有子节点和指向`value`值的指针
+    rax->head = raxNewNode(0,0);
+    if (rax->head == NULL) {
+        rax_free(rax);
+        return NULL;
+    } else {
+        return rax;
+    }
+}
+```
+创建`raxNode`节点函数`raxNewNode`实现如下：
+```c
+/* Allocate a new non compressed node with the specified number of children.
+ * If datafiled is true, the allocation is made large enough to hold the
+ * associated data pointer.
+ * Returns the new node pointer. On out of memory NULL is returned. */
+raxNode *raxNewNode(size_t children, int datafield) {
+    // 计算一个 raxNode 节点大小 header + data，将节点按非压缩节点处理
+    size_t nodesize = sizeof(raxNode)+children+raxPadding(children)+
+                      sizeof(raxNode*)*children;
+    // 如果有数据，也就key是对应的 value，加上指向 value 指针的大小
+    if (datafield) nodesize += sizeof(void*);
+    raxNode *node = rax_malloc(nodesize);
+    if (node == NULL) return NULL;
+    node->iskey = 0;
+    node->isnull = 0;
+    // 初始按非压缩节点
+    node->iscompr = 0;
+    node->size = children;
+    return node;
+}
+```
+参数含义解释如下：
++ `children`：当前节点子节点个数；
++ `datafield`：当前节点是否有对应的`value`，取值`0`表示没有，取值非`0`表示有；
+
+## rax树元素插入
+
+
+
+
+
+
+
+
+## rax树迭代器启动
 `redis`创建一个`rax`迭代器的实现如下：
 ```c
 /* Initialize a Rax iterator. This call should be performed a single time
@@ -164,6 +221,7 @@ void raxStart(raxIterator *it, rax *rt) {
     it->node_cb = NULL;
     raxStackInit(&it->stack);
 }
+#define RAX_ITER_STATIC_LEN 128
 
 /* Initialize the stack. */
 static inline void raxStackInit(raxStack *ts) {
@@ -172,4 +230,6 @@ static inline void raxStackInit(raxStack *ts) {
     ts->maxitems = RAX_STACK_STATIC_ITEMS;
     ts->oom = 0;
 }
+#define RAX_STACK_STATIC_ITEMS 32
 ```
+主要完成迭代器`raxIterator`对象各个属性初始化。
