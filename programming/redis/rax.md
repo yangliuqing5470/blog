@@ -617,6 +617,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         raxNode *postfix = NULL;
 
         if (trimmedlen) {
+            // 给 trimmed 节点分配内存
             nodesize = sizeof(raxNode)+trimmedlen+raxPadding(trimmedlen)+
                        sizeof(raxNode*);
             if (h->iskey && !h->isnull) nodesize += sizeof(void*);
@@ -624,6 +625,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         }
 
         if (postfixlen) {
+            // 给 postfix 节点分配内存
             nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
                        sizeof(raxNode*);
             postfix = rax_malloc(nodesize);
@@ -640,28 +642,39 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             errno = ENOMEM;
             return 0;
         }
+        // 将压缩节点中第一个非公共字符存入到 split node 节点中
         splitnode->data[0] = h->data[j];
-
+        // 在压缩节点第一个字符不匹配（没有 trimmed 节点），
+        // 此时 split node 节点承担之前的 h 节点位置
         if (j == 0) {
             /* 3a: Replace the old node with the split node. */
             if (h->iskey) {
+                // 将原始节点中的 value 指针设置到 split node 节点中
                 void *ndata = raxGetData(h);
                 raxSetData(splitnode,ndata);
             }
             memcpy(parentlink,&splitnode,sizeof(splitnode));
+        // 在压缩节点中间某个位置不匹配（有 trimmed 节点），
+        // 此时 trimmed 节点承担之前的 h 节点位置
         } else {
             /* 3b: Trim the compressed node. */
             trimmed->size = j;
+            // 将非公共节点左边（不包含非公共节点）拷贝到 trimmed 节点
             memcpy(trimmed->data,h->data,j);
+            // 如果多个字符设置为压缩节点，单个字符设置为非压缩节点
             trimmed->iscompr = j > 1 ? 1 : 0;
+            // iskey，isnull，value-ptr 和原始节点 h 保持一致
             trimmed->iskey = h->iskey;
             trimmed->isnull = h->isnull;
             if (h->iskey && !h->isnull) {
                 void *ndata = raxGetData(h);
                 raxSetData(trimmed,ndata);
             }
+            // cp 是 trimmed 节点中最后指向子节点指针的位置
             raxNode **cp = raxNodeLastChildPtr(trimmed);
+            // trimmed 最后一个字节点指针指向 splitnode 节点
             memcpy(cp,&splitnode,sizeof(splitnode));
+            // 之前 h 的父节点设置指向 trimmed 节点
             memcpy(parentlink,&trimmed,sizeof(trimmed));
             parentlink = cp; /* Set parentlink to splitnode parent. */
             rax->numnodes++;
@@ -669,32 +682,215 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
 
         /* 4: Create the postfix node: what remains of the original
          * compressed node after the split. */
+        // 设置 postfix 节点属性值，非 key 节点，因为是 h 节点分裂出的节点
         if (postfixlen) {
             /* 4a: create a postfix node. */
             postfix->iskey = 0;
             postfix->isnull = 0;
             postfix->size = postfixlen;
-            postfix->iscompr = postfixlen > 1;
+            // 如果多个字符设置为压缩节点，单个字符设置为非压缩节点
+            postfix->iscompr = postfixlen > 1
+            // 将非公共节点右边（不包含非公共节点）拷贝到 postfix 节点
             memcpy(postfix->data,h->data+j+1,postfixlen);
             raxNode **cp = raxNodeLastChildPtr(postfix);
+            // postfix 节点的子节点指向之前保持的 next 值
             memcpy(cp,&next,sizeof(next));
             rax->numnodes++;
         } else {
             /* 4b: just use next as postfix node. */
+            // 没有 postfix 节点
             postfix = next;
         }
 
         /* 5: Set splitnode first child as the postfix node. */
+        // splitnode 节点的子节点指向 postfix 节点
         raxNode **splitchild = raxNodeLastChildPtr(splitnode);
         memcpy(splitchild,&postfix,sizeof(postfix));
 
         /* 6. Continue insertion: this will cause the splitnode to
          * get a new child (the non common character at the currently
          * inserted key). */
+        // 是否旧的节点 h
         rax_free(h);
         h = splitnode;
     ```
++ 插入的元素`s`是压缩节点的前缀；
+  ```bash
+  // 原始压缩节点
+  "ANNIBALE" -> "SCO" -> []
 
+  // 插入 ANNI
+  "ANNI" -> "BALE" -> "SCO" -> []
+  ```
+  这种情况，程序的执行流程如下：
+  + 保存插入前节点的`next`指针（指向子节点的指针）；
+    ```bash
+    "ANNIBALE" -> "SCO" -> []
+    ```
+    例如保存指向`SCO`子节点的指针；
+    ```c
+    else if (h->iscompr && i == len) {
+        /* 1: Save next pointer. */
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next;
+        memcpy(&next,childfield,sizeof(next));
+    ```
+  + 创建`trimmed`节点，保存压缩节点中分割点（`j`）左边的字符串（不包括分割点字符）和`postfix`节点，
+  保存分割点右边字符串（包括分割点字符）；
+    ```bash
+    // trimmed 节点
+    +-------+--------+---------+------+----+-------+-----+----------+
+    |iskey:?|isnull:?|iscompr:1|size:4|ANNI|padding|I-Ptr|value-ptr?|
+    +-------+--------+---------+------+----+-------+-----+----------+
+    // postfix 节点
+    +-------+--------+---------+------+---+-------+-----+----------+
+    |iskey:1|isnull:0|iscompr:1|size:4|BALE|padding|E-Ptr|value-ptr?|
+    +-------+--------+---------+------+---+-------+-----+----------+
+    ```
+    `trimmed`和`postfix`节点都是只有一个子节点。源码实现如下：
+    ```c
+        /* Allocate postfix & trimmed nodes ASAP to fail for OOM gracefully. */
+        // 分配 postfix 节点内存，postfix 节点是个 key，因为可以完整找到插入元素 s
+        size_t postfixlen = h->size - j;
+        size_t nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                          sizeof(raxNode*);
+        if (data != NULL) nodesize += sizeof(void*);
+        raxNode *postfix = rax_malloc(nodesize);
+        // 分配 trimmed 节点内存，trimmed 节点承担之前 h 节点位置
+        nodesize = sizeof(raxNode)+j+raxPadding(j)+sizeof(raxNode*);
+        if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+        raxNode *trimmed = rax_malloc(nodesize);
+
+        if (postfix == NULL || trimmed == NULL) {
+            rax_free(postfix);
+            rax_free(trimmed);
+            errno = ENOMEM;
+            return 0;
+        }
+        /* 2: Create the postfix node. */
+        postfix->size = postfixlen;
+        postfix->iscompr = postfixlen > 1;
+        // postfix 节点是个 key
+        postfix->iskey = 1;
+        postfix->isnull = 0;
+        memcpy(postfix->data,h->data+j,postfixlen);
+        raxSetData(postfix,data);
+        // postfix 节点子节点指针指向保存的 next 值
+        raxNode **cp = raxNodeLastChildPtr(postfix);
+        memcpy(cp,&next,sizeof(next));
+        rax->numnodes++;
+
+        /* 3: Trim the compressed node. */
+        trimmed->size = j;
+        trimmed->iscompr = j > 1;
+        trimmed->iskey = 0;
+        trimmed->isnull = 0;
+        memcpy(trimmed->data,h->data,j);
+        // 之前 h 的父节点设置指向 trimmed 节点
+        memcpy(parentlink,&trimmed,sizeof(trimmed));
+        if (h->iskey) {
+            void *aux = raxGetData(h);
+            // 里面会更新 iskey 和 isnull 值
+            raxSetData(trimmed,aux);
+        }
+
+        /* Fix the trimmed node child pointer to point to
+         * the postfix node. */
+        // trimmed 节点的子节点指针指向 postfix 节点
+        cp = raxNodeLastChildPtr(trimmed);
+        memcpy(cp,&postfix,sizeof(postfix));
+
+        /* Finish! We don't need to continue with the insertion
+         * algorithm for ALGO 2. The key is already inserted. */
+        rax->numele++;
+        rax_free(h);
+        return 1; /* Key inserted. */
+    }
+    ```
++ 经过上面三步，继续走到此逻辑，说明插入的元素`s`没有遍历完，也就是`i < len`，需要将插入元素剩下的字符添加到`rax`树中；
+  ```c
+    /* We walked the radix tree as far as we could, but still there are left
+     * chars in our string. We need to insert the missing nodes. */
+    while(i < len) {
+        raxNode *child;
+
+        /* If this node is going to have a single child, and there
+         * are other characters, so that that would result in a chain
+         * of single-childed nodes, turn it into a compressed node. */
+        if (h->size == 0 && len-i > 1) {
+            debugf("Inserting compressed node\n");
+            size_t comprsize = len-i;
+            if (comprsize > RAX_NODE_MAX_SIZE)
+                comprsize = RAX_NODE_MAX_SIZE;
+            // 压缩节点，看上面节点添加详细介绍
+            raxNode *newh = raxCompressNode(h,s+i,comprsize,&child);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            parentlink = raxNodeLastChildPtr(h);
+            i += comprsize;
+        } else {
+            debugf("Inserting normal node\n");
+            raxNode **new_parentlink;
+            // 非压缩节点，看上面节点添加详细介绍
+            raxNode *newh = raxAddChild(h,s[i],&child,&new_parentlink);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            parentlink = new_parentlink;
+            i++;
+        }
+        rax->numnodes++;
+        h = child;
+    }
+    // 下面主要更新指向 value 地址的指针
+    raxNode *newh = raxReallocForData(h,data);
+    if (newh == NULL) goto oom;
+    h = newh;
+    if (!h->iskey) rax->numele++;
+    raxSetData(h,data);
+    memcpy(parentlink,&h,sizeof(h));
+    return 1; /* Element inserted. */
+    
+    // 下面是 oom 处理逻辑
+    oom:
+    /* This code path handles out of memory after part of the sub-tree was
+     * already modified. Set the node as a key, and then remove it. However we
+     * do that only if the node is a terminal node, otherwise if the OOM
+     * happened reallocating a node in the middle, we don't need to free
+     * anything. */
+    if (h->size == 0) {
+        h->isnull = 1;
+        h->iskey = 1;
+        rax->numele++; /* Compensate the next remove. */
+        assert(raxRemove(rax,s,i,NULL) != 0);
+    }
+    errno = ENOMEM;
+    return 0;
+  }
+  ```
+## rax树元素查找
+查找逻辑主要是调用`raxLowWalk`函数进行遍历查找，实现如下：
+```c
+/* Find a key in the rax, returns raxNotFound special void pointer value
+ * if the item was not found, otherwise the value associated with the
+ * item is returned. */
+void *raxFind(rax *rax, unsigned char *s, size_t len) {
+    raxNode *h;
+
+    debugf("### Lookup: %.*s\n", (int)len, s);
+    int splitpos = 0;
+    size_t i = raxLowWalk(rax,s,len,&h,NULL,&splitpos,NULL);
+    if (i != len || (h->iscompr && splitpos != 0) || !h->iskey)
+        return raxNotFound;
+    return raxGetData(h);
+}
+```
+## rax树元素删除
+元素删除`raxRemove`函数定有如下：
+```c
+int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
+```
 
 
 
