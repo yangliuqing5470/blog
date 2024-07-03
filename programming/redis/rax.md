@@ -90,7 +90,7 @@ typedef struct rax {
     uint64_t numnodes;
 } rax;
 ```
-+ `head`：指向头节点（根节点）的指针；
++ `head`：指向头节点（根节点）的指针，头节点不是空节点，和正常节点一样会存储数据；
 + `numele`：表示元素的个数（`key`的数量）；
 + `numnodes`：表示节点的数量；
 
@@ -160,7 +160,7 @@ rax *raxNew(void) {
     rax->numele = 0;
     // 初始化 rax 树节点个数为 1，因为包含一个 head 节点
     rax->numnodes = 1;
-    // 初始化 head 节点，head 节点没有子节点和指向`value`值的指针
+    // 初始化 head 节点
     rax->head = raxNewNode(0,0);
     if (rax->head == NULL) {
         rax_free(rax);
@@ -261,8 +261,473 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
     }
   ```
   节点中存储的字符保持字典序。
++ 将指向`value`的指针移动到新分配空间的末尾；
+  ```c
+    unsigned char *src, *dst;
+    // 确保当前的节点 n 有指向 value 的指针
+    if (n->iskey && !n->isnull) {
+        src = ((unsigned char*)n+curlen-sizeof(void*));
+        dst = ((unsigned char*)n+newlen-sizeof(void*));
+        memmove(dst,src,sizeof(void*));
+    }
+  ```
+  移动后数据结构如下：
+  ```bash
+  [HDR*][abde][Aptr][Bptr][Dptr][Eptr][....][....]|AUXP|
+  ```
++ 移动插入位置后的指向子节点指针，给要添加新的指向子节点指针留出空间；
+  ```c
+  size_t shift = newlen - curlen - sizeof(void*);
+  src = n->data+n->size+
+        raxPadding(n->size)+
+        sizeof(raxNode*)*pos;
+  memmove(src+shift+sizeof(raxNode*),src,sizeof(raxNode*)*(n->size-pos));
+  ```
+  移动后的数据结构如下：
+  ```bash
+  [HDR*][abde][Aptr][Bptr][....][....][Dptr][Eptr]|AUXP|
+  ```
++ 移动插入位置前的指向子节点指针，给要添加字符及填充字节留出空间；
+  ```c
+    if (shift) {
+        src = (unsigned char*) raxNodeFirstChildPtr(n);
+        memmove(src+shift,src,sizeof(raxNode*)*pos);
+    }
+  ```
+  移动后的数据结构如下：
+  ```bash
+  [HDR*][abde][....][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+  ```
++ 移动插入位置后的字符，给要添加的字符留出空间；
+  ```c
+  src = n->data+pos;
+  memmove(src+1,src,n->size-pos);
+  ```
+  移动后的数据结构如下：
+  ```bash
+  [HDR*][ab.d][e...][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+  ```
++ 最后将添加的字符`c`及指向新的子节点指针添加到指定位置；
+  ```c
+  n->data[pos] = c;
+  n->size++;
+  src = (unsigned char*) raxNodeFirstChildPtr(n);
+  // 指向新节点地址指针的指针
+  raxNode **childfield = (raxNode**)(src+sizeof(raxNode*)*pos);
+  memcpy(childfield,&child,sizeof(child));
+  *childptr = child;
+  *parentlink = childfield;
+  return n;
+  ```
+  最终的数据结构如下：
+  ```bash
+  [HDR*][abcd][e...][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
+  [HDR*][abcd][e...][Aptr][Bptr][Cptr][Dptr][Eptr]|AUXP|
+  ```
+接下来看将空的非压缩节点转为压缩节点`raxCompressNode`函数实现。`raxCompressNode`函数定义如下：
+```c
+raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **child);
+```
++ `n`：待转换的节点，必须是空的非压缩节点，也就是没有任何子节点的非压缩节点；
++ `s`：添加的字符串；
++ `len`：添加字符串的长度；
++ `child`：指向存放子节点地址的指针；
+
+`raxCompressNode`的实现主要有如下几步：
++ 节点空间分配；
+  ```c
+    // 确保是空的非压缩节点
+    assert(n->size == 0 && n->iscompr == 0);
+    void *data = NULL; /* Initialized only to avoid warnings. */
+    size_t newsize;
+
+    debugf("Compress node: %.*s\n", (int)len,s);
+
+    /* Allocate the child to link to this node. */
+    // 初始化一个空的非压缩子节点
+    *child = raxNewNode(0,0);
+    if (*child == NULL) return NULL;
+
+    /* Make space in the parent node. */
+    // header大小 + 添加字符串大小 + 填充字节大小 + 指向子节点指针
+    newsize = sizeof(raxNode)+len+raxPadding(len)+sizeof(raxNode*);
+    if (n->iskey) {
+        // data 是 value 数据的地址
+        data = raxGetData(n); /* To restore it later. */
+        // 如果有指向 value 指针，在加上一个指针大小
+        if (!n->isnull) newsize += sizeof(void*);
+    }
+    raxNode *newn = rax_realloc(n,newsize);
+    if (newn == NULL) {
+        rax_free(*child);
+        return NULL;
+    }
+    n = newn;
+  ```
++ 节点数据更新，将插入的字符串`s`及指向子节点指针添加到指定位置；
+  ```c
+    // 设置节点为压缩节点
+    n->iscompr = 1;
+    n->size = len;
+    // 将字符串 s 拷贝到节点指定位置
+    memcpy(n->data,s,len);
+    // 将指向 value 指针更新到节点指定位置
+    if (n->iskey) raxSetData(n,data);
+    raxNode **childfield = raxNodeLastChildPtr(n);
+    // 更新指向子节点指针
+    memcpy(childfield,child,sizeof(*child));
+    return n;
+  ```
+
+## rax树遍历
+`rax`树遍历的函数`raxLowWalk`的定义如下：
+```c
+static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts);
+```
++ `rax`：需要遍历的`rax`树的地址；
++ `s`：查找的字符串地址；
++ `len`：查找的字符串长度；
++ `stopnode`：遍历结束的节点；
++ `plink`：在`stopnode`节点父节点中指向`stopnode`节点的指针地址；
++ `splitpos`：如果是压缩节点，表示在压缩节点中第一个不匹配`s`字符串的位置；
++ `ts`：`raxStack`结构，存放从头节点开始遍历到`stopnode`节点父节点的指针；
+
+`raxLowWalk`的返回值表示已经检查查找字符串`s`中字符的个数。
+
+`raxLowWalk`的实现如下：
+```c
+static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts) {
+    raxNode *h = rax->head;
+    raxNode **parentlink = &rax->head;
+
+    // i 表示检查字符串 s 中字符的位置，从 s[0] 开始检查
+    size_t i = 0; /* Position in the string. */
+    // j 表示当前检查节点存储的字符串中已检查的位置
+    size_t j = 0; /* Position in the node children (or bytes if compressed).*/
+    while(h->size && i < len) {
+        debugnode("Lookup current node",h);
+        // 当前检查节点存储的字符串地址
+        unsigned char *v = h->data;
+        // 压缩节点，只有一个子节点，处理逻辑
+        if (h->iscompr) {
+            for (j = 0; j < h->size && i < len; j++, i++) {
+                if (v[j] != s[i]) break;
+            }
+            // 遇到不匹配，或者 s 遍历完，提前终止遍历
+            if (j != h->size) break;
+        // 非压缩节点，每个字符一个子节点，处理逻辑
+        } else {
+            /* Even when h->size is large, linear scan provides good
+             * performances compared to other approaches that are in theory
+             * more sounding, like performing a binary search. */
+            for (j = 0; j < h->size; j++) {
+                if (v[j] == s[i]) break;
+            }
+            // 在当前节点没有找到当前 s[i] 匹配字符，终止遍历
+            if (j == h->size) break;
+            i++;
+        }
+
+        if (ts) raxStackPush(ts,h); /* Save stack of parent nodes. */
+        raxNode **children = raxNodeFirstChildPtr(h);
+        if (h->iscompr) j = 0; /* Compressed node only child is at index 0. */
+        // 更新遍历的节点 h 为下一个子节点
+        memcpy(&h,children+j,sizeof(h));
+        parentlink = children+j;
+        j = 0; /* If the new node is compressed and we do not
+                  iterate again (since i == l) set the split
+                  position to 0 to signal this node represents
+                  the searched key. */
+    }
+    debugnode("Lookup stop node is",h);
+    if (stopnode) *stopnode = h;
+    if (plink) *plink = parentlink;
+    if (splitpos && h->iscompr) *splitpos = j;
+    return i;
+}
+```
 
 ## rax树元素插入
+
+`rax`树元素插入实现如下：
+```c
+/* Overwriting insert. Just a wrapper for raxGenericInsert() that will
+ * update the element if there is already one for the same key. */
+int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
+    return raxGenericInsert(rax,s,len,data,old,1);
+}
+```
+实际会调用`raxGenericInsert`函数，`raxGenericInsert`函数的定义如下：
+```c
+int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite);
+```
++ `rax`：需要插入元素的`rax`树地址；
++ `s`：插入字符串地址；
++ `len`：插入字符串长度；
++ `data`：当前`key`对应的`value`地址（插入的每一个字符串都表示一个`key`）；
++ `old`：作为返回值，表示插入元素`s`已经存在，其对应的`value`地址；
++ `overwrite`：如果插入元素已经存在，是否更新已存在`value`地址；
+
+`raxGenericInsert`操作有多种情况，分别如下：
++ 插入的元素已经存在；
+  ```c
+    size_t i;
+    int j = 0; /* Split position. If raxLowWalk() stops in a compressed
+                  node, the index 'j' represents the char we stopped within the
+                  compressed node, that is, the position where to split the
+                  node for insertion. */
+    raxNode *h, **parentlink;
+
+    debugf("### Insert %.*s with value %p\n", (int)len, s, data);
+    // 遍历 rax 树查找元素 s。h 表示遍历终止的节点，parentlink 表示 h 的父节点中指向 h 的指针位置，
+    // j 表示压缩节点中不匹配的字符位置，i 表示已经检查字符串 s 的位置。
+    i = raxLowWalk(rax,s,len,&h,&parentlink,&j,NULL);
+
+    /* If i == len we walked following the whole string. If we are not
+     * in the middle of a compressed node, the string is either already
+     * inserted or this middle node is currently not a key, but can represent
+     * our key. We have just to reallocate the node and make space for the
+     * data pointer. */
+    // 在 rax 中存在字符串 s，且 s 不是在压缩节点中间某个位置结束，
+    // 这时候不需要分裂节点
+    if (i == len && (!h->iscompr || j == 0 /* not in the middle if j is 0 */)) {
+        debugf("### Insert: node representing key exists\n");
+        /* Make space for the value pointer if needed. */
+        if (!h->iskey || (h->isnull && overwrite)) {
+            // 从新分配空间，存放对应 value 数据的地址
+            h = raxReallocForData(h,data);
+            if (h) memcpy(parentlink,&h,sizeof(h));
+        }
+        if (h == NULL) {
+            errno = ENOMEM;
+            return 0;
+        }
+
+        /* Update the existing key if there is already one. */
+        if (h->iskey) {
+            if (old) *old = raxGetData(h);
+            if (overwrite) raxSetData(h,data);
+            errno = 0;
+            return 0; /* Element already exists. */
+        }
+
+        /* Otherwise set the node as a key. Note that raxSetData()
+         * will set h->iskey. */
+        raxSetData(h,data);
+        // 更新 rax 树 key 的个数加 1
+        rax->numele++;
+        return 1; /* Element inserted. */
+    }
+  ```
+  插入元素`s`已经存在说明在遍历终止的节点`h`的所有父节点（不包含节点`h`）可以完全匹配查找字符串`s`。节点`h`可能是一个`key`（`iskey=1`），
+  也可能不是一个`key`（`iskey=0`）。如果节点`h`没有存放对应`value`值的指针，需要重新分配节点空间存放`value`值指针，
+  否则根据参数`overwrite`执行是否更新存放`value`地址。
++ 查找的字符串`s`不存在，遍历终止的节点`h`是压缩节点，且查找字符串`s`在节点`h`中间某个位置不匹配；
+  假如插入前存在数据结构（两个压缩节点，箭头表示子节点指针）：
+  ```bash
+  "ANNIBALE" -> "SCO" -> []
+  ```
+  根据插入元素不同，分下面四种情况：
+  + 插入`ANNIENTARE`元素后如下：
+    ```bash
+              |B| -> "ALE" -> "SCO" -> []
+    "ANNI" -> |-|
+              |E| -> (... continue algo ...) "NTARE" -> []
+    ```
+  + 插入`ANNIBALI`元素后如下：
+    ```bash
+                 |E| -> "SCO" -> []
+    "ANNIBAL" -> |-|
+                 |I| -> (... continue algo ...) []
+    
+    ```
+  + 插入`AGO`元素后如下：
+    ```bash
+           |N| -> "NIBALE" -> "SCO" -> []
+    |A| -> |-|
+           |G| -> (... continue algo ...) |O| -> []
+    ```
+    插入前的原始节点需要设置`iscompr=0`。
+  + 插入`CIAO`元素后如下：
+    ```bash
+    |A| -> "NNIBALE" -> "SCO" -> []
+    |-|
+    |C| -> (... continue algo ...) "IAO" -> []
+    ```
+  针对上面的插入情况，程序执行流程如下：
+  + 保存插入前节点的`next`指针（指向子节点的指针）；
+    ```bash
+    "ANNIBALE" -> "SCO" -> []
+    ```
+    例如保存指向`SCO`子节点的指针；
+    ```c
+    // 终止节点是压缩节点，查询字符串 s 不存在，也就是在终止节点存储字符串中间某个位置不匹配
+    if (h->iscompr && i != len) {
+        /* 1: Save next pointer. */
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next;
+        memcpy(&next,childfield,sizeof(next));
+    ```
+  + 创建一个`split node`节点（存储一个字符的非压缩节点），将压缩节点中的第一个非公共字母作为`split node`存储的数据，插入元素中的非公共字母会在后面的步骤作为`split node`的子节点添加；
+  如果压缩节点第一个非公共字母左边存在字符串数据，创建一个`trimmed`节点，保存左边字符串数据。如果压缩节点第一个非公共字母右边有字符串数据，
+  创建一个`postfix`节点，保存右边的数据。
+    ```bash
+    // 原始压缩节点
+    "ANNIBALE" -> "SCO" -> []
+
+    // 例如插入 ANNIENTARE
+              |B| -> "ALE" -> "SCO" -> []
+    "ANNI" -> |-|
+              |E| -> (... continue algo ...) "NTARE" -> []
+    ```
+    创建一个`split node`节点保存压缩字符串中第一个非公共字符`B`：
+    ```bash
+    +-------+--------+---------+------+-+-------+-----+----------+
+    |iskey:0|isnull:0|iscompr:0|size:1|B|padding|B-Ptr|value-ptr?|
+    +-------+--------+---------+------+-+-------+-----+----------+
+    ```
+    创建`trimmed`节点和`postfix`节点：
+    ```bash
+    // trimmed 节点
+    +-------+--------+---------+------+----+-------+-----+----------+
+    |iskey:?|isnull:?|iscompr:1|size:4|ANNI|padding|I-Ptr|value-ptr?|
+    +-------+--------+---------+------+----+-------+-----+----------+
+    // postfix 节点
+    +-------+--------+---------+------+---+-------+-----+----------+
+    |iskey:0|isnull:0|iscompr:1|size:3|ALE|padding|E-Ptr|value-ptr?|
+    +-------+--------+---------+------+---+-------+-----+----------+
+    ```
+    源码实现如下：
+    ```c
+        /* Set the length of the additional nodes we will need. */
+        // 压缩节点中第一个非公共字符左边字符串长度（不包括用于分割的非公共字符）
+        size_t trimmedlen = j;
+        // 压缩节点中第一个非公共字符右边字符串长度（不包括用于分割的非公共字符）
+        size_t postfixlen = h->size - j - 1;
+        // 如果是在压缩节点中间某个字符不匹配，则 split node 节点肯定不是 key，此时 split node 节点父节点是 trimmed 节点，
+        // 如果是在压缩节点第一个字符不匹配，则 split node 节点是不是 key 取决于压缩节点 h，此时 split node 节点父节点是 h
+        int split_node_is_key = !trimmedlen && h->iskey && !h->isnull;
+        size_t nodesize;
+
+        /* 2: Create the split node. Also allocate the other nodes we'll need
+         *    ASAP, so that it will be simpler to handle OOM. */
+        // 创建一个只包含一个子节点的 split node 节点，非压缩节点
+        raxNode *splitnode = raxNewNode(1, split_node_is_key);
+        raxNode *trimmed = NULL;
+        raxNode *postfix = NULL;
+
+        if (trimmedlen) {
+            nodesize = sizeof(raxNode)+trimmedlen+raxPadding(trimmedlen)+
+                       sizeof(raxNode*);
+            if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+            trimmed = rax_malloc(nodesize);
+        }
+
+        if (postfixlen) {
+            nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                       sizeof(raxNode*);
+            postfix = rax_malloc(nodesize);
+        }
+
+        /* OOM? Abort now that the tree is untouched. */
+        if (splitnode == NULL ||
+            (trimmedlen && trimmed == NULL) ||
+            (postfixlen && postfix == NULL))
+        {
+            rax_free(splitnode);
+            rax_free(trimmed);
+            rax_free(postfix);
+            errno = ENOMEM;
+            return 0;
+        }
+        splitnode->data[0] = h->data[j];
+
+        if (j == 0) {
+            /* 3a: Replace the old node with the split node. */
+            if (h->iskey) {
+                void *ndata = raxGetData(h);
+                raxSetData(splitnode,ndata);
+            }
+            memcpy(parentlink,&splitnode,sizeof(splitnode));
+        } else {
+            /* 3b: Trim the compressed node. */
+            trimmed->size = j;
+            memcpy(trimmed->data,h->data,j);
+            trimmed->iscompr = j > 1 ? 1 : 0;
+            trimmed->iskey = h->iskey;
+            trimmed->isnull = h->isnull;
+            if (h->iskey && !h->isnull) {
+                void *ndata = raxGetData(h);
+                raxSetData(trimmed,ndata);
+            }
+            raxNode **cp = raxNodeLastChildPtr(trimmed);
+            memcpy(cp,&splitnode,sizeof(splitnode));
+            memcpy(parentlink,&trimmed,sizeof(trimmed));
+            parentlink = cp; /* Set parentlink to splitnode parent. */
+            rax->numnodes++;
+        }
+
+        /* 4: Create the postfix node: what remains of the original
+         * compressed node after the split. */
+        if (postfixlen) {
+            /* 4a: create a postfix node. */
+            postfix->iskey = 0;
+            postfix->isnull = 0;
+            postfix->size = postfixlen;
+            postfix->iscompr = postfixlen > 1;
+            memcpy(postfix->data,h->data+j+1,postfixlen);
+            raxNode **cp = raxNodeLastChildPtr(postfix);
+            memcpy(cp,&next,sizeof(next));
+            rax->numnodes++;
+        } else {
+            /* 4b: just use next as postfix node. */
+            postfix = next;
+        }
+
+        /* 5: Set splitnode first child as the postfix node. */
+        raxNode **splitchild = raxNodeLastChildPtr(splitnode);
+        memcpy(splitchild,&postfix,sizeof(postfix));
+
+        /* 6. Continue insertion: this will cause the splitnode to
+         * get a new child (the non common character at the currently
+         * inserted key). */
+        rax_free(h);
+        h = splitnode;
+    ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
