@@ -94,7 +94,7 @@ typedef struct rax {
 + `numele`：表示元素的个数（`key`的数量）；
 + `numnodes`：表示节点的数量；
 
-`redis`提供了`raxStack`和`raxIterator`两种数据结构用于`rax`树的遍历操作。`raxStack`的结构定义如下：
+`redis`提供了`raxStack`和`raxIterator`两种数据结构用于`rax`树的遍历操作，`raxIterator`迭代器下面介绍。`raxStack`的结构定义如下：
 ```c
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
  * a list of parent nodes to the caller. The nodes do not have a "parent"
@@ -115,38 +115,6 @@ typedef struct raxStack {
 + `maxitems`：栈可存储元素个数的最大值；
 + `static_items`：指针数组，存放`raxNode`节点的指针；
 + `oom`：取值`1`表示内存分配失败，遇到`OOM`，默认`0`；
-
-`raxIterator`用于遍历`rax`树中所有的`key`，数据结构定义如下：
-```c
-typedef int (*raxNodeCallback)(raxNode **noderef);
-#define RAX_ITER_STATIC_LEN 128
-
-typedef struct raxIterator {
-    int flags;
-    rax *rt;                /* Radix tree we are iterating. */
-    unsigned char *key;     /* The current string. */
-    void *data;             /* Data associated to this key. */
-    size_t key_len;         /* Current key length. */
-    size_t key_max;         /* Max key len the current key buffer can hold. */
-    unsigned char key_static_string[RAX_ITER_STATIC_LEN];
-    raxNode *node;          /* Current node. Only for unsafe iteration. */
-    raxStack stack;         /* Stack used for unsafe iteration. */
-    raxNodeCallback node_cb; /* Optional node callback. Normally set to NULL. */
-} raxIterator;
-```
-+ `flags`：迭代器的标志位，取值有如下三种：
-  + `RAX_ITER_JUST_SEEKED`：
-  + `RAX_ITER_EOF`：
-  + `RAX_ITER_SAFE`：
-+ `rt`：指向`rax`对象的指针；
-+ `key`：指向当前`key`的字符串数组，小字符串指向`key_static_string`，大字符串指向堆空间分配的字符串数组地址；
-+ `data`：当前`key`对应的`value`值；
-+ `key_len`：当前`key`的长度；
-+ `key_max`：存放当前`key`缓存的最大值；
-+ `key_static_string`：字符串数组，存放当前`key`；
-+ `node`：当前`key`所在的`raxNode`节点；
-+ `stack`：记录从根节点到当前节点路径，用于节点向上遍历；
-+ `node_cb`：节点回调函数，默认为`NULL`；
 
 ## rax树创建
 `rax`树创建实现如下：
@@ -880,6 +848,7 @@ void *raxFind(rax *rax, unsigned char *s, size_t len) {
 
     debugf("### Lookup: %.*s\n", (int)len, s);
     int splitpos = 0;
+    // rax 树遍历，查找元素 s，遍历操作看上面介绍
     size_t i = raxLowWalk(rax,s,len,&h,NULL,&splitpos,NULL);
     if (i != len || (h->iscompr && splitpos != 0) || !h->iskey)
         return raxNotFound;
@@ -891,49 +860,263 @@ void *raxFind(rax *rax, unsigned char *s, size_t len) {
 ```c
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
 ```
++ `rax`：`rax`树地址；
++ `s`：要删除元素（`key`）地址；
++ `len`：要删除元素的长度；
++ `old`：如果要删除元素是个`key`，`old`是对应`value`的地址，如果要删除元素不是`key`，`old`是`NULL`；
 
+删除操作涉及节点的合并操作，删除操作执行逻辑主要有以下几步：
++ 遍历查找`rax`树，如果没有找到要删除的元素`s`，直接返回`0`，否则执行下一步；
+  ```c
+  /* Remove the specified item. Returns 1 if the item was found and
+   * deleted, 0 otherwise. */
+  int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
+    raxNode *h;
+    raxStack ts;
 
+    debugf("### Delete: %.*s\n", (int)len, s);
+    // 初始化 raxStack 对象，用于存储遍历查找 s 经历的节点地址，不包括停止节点 h
+    raxStackInit(&ts);
+    int splitpos = 0;
+    size_t i = raxLowWalk(rax,s,len,&h,NULL,&splitpos,&ts);
+    // rax 中不存在 s 的 key，直接返回
+    if (i != len || (h->iscompr && splitpos != 0) || !h->iskey) {
+        raxStackFree(&ts);
+        return 0;
+    }
+  ```
++ 查找的元素存在，需要判断是否需要执行节点合并以及删除（针对停止节点是空节点）已遍历路径上那些只有一个子节点，且不是`key`的节点；
+  ```c
+    // 将删除元素对应的 value 地址存储在 old，返回给调用方
+    if (old) *old = raxGetData(h);
+    // 元素 s 要删除，所以 h->iskey 需要设置为 0 表示不是 key 节点
+    h->iskey = 0;
+    // rax 树元素（key）个数减 1
+    rax->numele--;
 
+    /* If this node has no children, the deletion needs to reclaim the
+     * no longer used nodes. This is an iterative process that needs to
+     * walk the three upward, deleting all the nodes with just one child
+     * that are not keys, until the head of the rax is reached or the first
+     * node with more than one child is found. */
+    // 标志位，是否需要执行节点合并
+    int trycompress = 0; /* Will be set to 1 if we should try to optimize the
+                            tree resulting from the deletion. */
+    // 如果停止节点是空节点（没有子节点），需要回收遍历路径上不使用的节点（回收只有一个子节点且不是 key 的节点）
+    if (h->size == 0) {
+        debugf("Key deleted in node without children. Cleanup needed.\n");
+        raxNode *child = NULL;
+        while(h != rax->head) {
+            child = h;
+            debugf("Freeing child %p [%.*s] key:%d\n", (void*)child,
+                (int)child->size, (char*)child->data, child->iskey);
+            // 释放节点内存
+            rax_free(child);
+            // 更新 rax 树的节点个数，减 1
+            rax->numnodes--;
+            h = raxStackPop(&ts);
+             /* If this node has more then one child, or actually holds
+              * a key, stop here. */
+            if (h->iskey || (!h->iscompr && h->size != 1)) break;
+        }
+        if (child) {
+            debugf("Unlinking child %p from parent %p\n",
+                (void*)child, (void*)h);
+            // 移除父节点和子节点之间的指向关系，因为子节点已经被删除了，返回值是新的父节点地址，
+            // 如果父节点是压缩节点，直接将父节点转为空节点（没有子节点）非压缩节点即可，
+            // 如果父节点不是压缩节点，需要删除指向 child 子节点指针，及对应的字符，涉及父节点内存重新分配
+            raxNode *new = raxRemoveChild(h,child);
+            // 因为 new 可能经过内存分配是个新的地址，需要更新下原始 h 父节点指向 new 的指针
+            if (new != h) {
+                raxNode *parent = raxStackPeek(&ts);
+                raxNode **parentlink;
+                if (parent == NULL) {
+                    parentlink = &rax->head;
+                } else {
+                    parentlink = raxFindParentLink(parent,h);
+                }
+                memcpy(parentlink,&new,sizeof(new));
+            }
 
+            /* If after the removal the node has just a single child
+             * and is not a key, we need to try to compress it. */
+            // 更新后的非压缩节点 new 只有一个子节点，且不是 key，可能需要执行节点合并，设置 trycompress = 1
+            if (new->size == 1 && new->iskey == 0) {
+                trycompress = 1;
+                h = new;
+            }
+        }
+    // 如果停止节点 h 只有一个子节点，可能需要执行节点合并，
+    // 这种场景下，不能回收节点，因为有其他的 key 依赖查询遍历的节点，
+    // 如果节点 h 有多个子节点，说明结构已经满足 rax 数据结构，不需要合并
+    } else if (h->size == 1) {
+        /* If the node had just one child, after the removal of the key
+         * further compression with adjacent nodes is pontentially possible. */
+        trycompress = 1;
+    }
 
+    /* Don't try node compression if our nodes pointers stack is not
+     * complete because of OOM while executing raxLowWalk() */
+    if (trycompress && ts.oom) trycompress = 0;
+  ```
++ 如果删除后需要执行节点合并。节点合并有如下几种情况：
+  ```bash
+  // 树存储 key FOO 和 key FOOBAR
+  "FOO" -> "BAR" -> [] (2)
+            (1)
 
+  // 移除 FOO 后
+  "FOOBAR" -> [] (2)
+  ```
+  另一种情况：
+  ```bash
+  // 树存储 key FOOBAR 和 key FOOTER
+           |B| -> "AR" -> [] (1)
+  "FOO" -> |-|
+           |T| -> "ER" -> [] (2)
 
+  // 移除 FOOTER
+  "FOO" -> |B| -> "AR" -> [] (1)
+  // 最后合并后
+  "FOOBAR" -> [] (1)
+  ```
+  执行合并操作首先需要向根节点方向找到可以合并的起始节点，可以合并的节点必须是非`key`节点且如果是非压缩节点必须只有一个子节点：
+  ```c
+  if (trycompress) {
+      /* Try to reach the upper node that is compressible.
+         * At the end of the loop 'h' will point to the first node we
+         * can try to compress and 'parent' to its parent. */
+        raxNode *parent;
+        // 遍历向上查找可以合并的起始节点
+        while(1) {
+            parent = raxStackPop(&ts);
+            // 非 key 节点且如果是非压缩节点只能有一个子节点才可以合并
+            if (!parent || parent->iskey ||
+                (!parent->iscompr && parent->size != 1)) break;
+            h = parent;
+            debugnode("Going up to",h);
+        }
+        raxNode *start = h; /* Compression starting node. */
+  ```
+  然后需要遍历查找合并节点的个数以及合并后节点存储字符串大小：
+  ```c
+        /* Scan chain of nodes we can compress. */
+        size_t comprsize = h->size;
+        int nodes = 1;
+        while(h->size != 0) {
+            raxNode **cp = raxNodeLastChildPtr(h);
+            memcpy(&h,cp,sizeof(h));
+            // 判断子节点是否满足合并条件
+            if (h->iskey || (!h->iscompr && h->size != 1)) break;
+            /* Stop here if going to the next node would result into
+             * a compressed node larger than h->size can hold. */
+            if (comprsize + h->size > RAX_NODE_MAX_SIZE) break;
+            nodes++;
+            comprsize += h->size;
+        }
+  ```
+  如果合并节点个数为`1`，直接返回；否则执行合并操作（合并后的节点是压缩节点）：
+  ```c
+        if (nodes > 1) {
+            /* If we can compress, create the new node and populate it. */
+            size_t nodesize =
+                sizeof(raxNode)+comprsize+raxPadding(comprsize)+sizeof(raxNode*);
+            // 合并后新的节点分配内存
+            raxNode *new = rax_malloc(nodesize);
+            /* An out of memory here just means we cannot optimize this
+             * node, but the tree is left in a consistent state. */
+            if (new == NULL) {
+                raxStackFree(&ts);
+                return 1;
+            }
+            // 合并后新的节点是个压缩节点，初始化节点属性
+            // 因为参与合并的节点都是非 key 节点，所以这里设置为 iskey=0
+            new->iskey = 0;
+            new->isnull = 0;
+            new->iscompr = 1;
+            new->size = comprsize;
+            rax->numnodes++;
 
+            /* Scan again, this time to populate the new node content and
+             * to fix the new node child pointer. At the same time we free
+             * all the nodes that we'll no longer use. */
+            comprsize = 0;
+            h = start;
+            // 将所有参与合并的节点存储的数据内容拷贝到新的节点 new 中
+            while(h->size != 0) {
+                memcpy(new->data+comprsize,h->data,h->size);
+                comprsize += h->size;
+                raxNode **cp = raxNodeLastChildPtr(h);
+                raxNode *tofree = h;
+                memcpy(&h,cp,sizeof(h));
+                rax_free(tofree); rax->numnodes--;
+                if (h->iskey || (!h->iscompr && h->size != 1)) break;
+            }
+            debugnode("New node",new);
 
+            /* Now 'h' points to the first node that we still need to use,
+             * so our new node child pointer will point to it. */
+            // 更新新的合并后的节点 new 的子节点
+            raxNode **cp = raxNodeLastChildPtr(new);
+            memcpy(cp,&h,sizeof(h));
 
+            /* Fix parent link. */
+            // 更新指向新的合并后节点的父指针
+            if (parent) {
+                raxNode **parentlink = raxFindParentLink(parent,start);
+                memcpy(parentlink,&new,sizeof(new));
+            } else {
+                rax->head = new;
+            }
 
+            debugf("Compressed %d nodes, %d total bytes\n",
+                nodes, (int)comprsize);
+        }
+  ```
+对于下面这种情况（都是压缩节点），删除后应该执行节点合并，但目前的源码并没有执行：
+```bash
+// 树存储 key FOO 和 key FOOBAR
+"FOO" -> "BAR" -> [] (2)
+          (1)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// 移除 FOO 后
+"FOOBAR" -> [] (2)
+```
+`github`上有个[`pr`](https://github.com/redis/redis/pull/10825)针对这个情况，目前还没`merge`。
 
 ## rax树迭代器启动
-`redis`创建一个`rax`迭代器的实现如下：
+迭代器`raxIterator`的数据结构如下：
+```c
+typedef struct raxIterator {
+    int flags;
+    rax *rt;                /* Radix tree we are iterating. */
+    unsigned char *key;     /* The current string. */
+    void *data;             /* Data associated to this key. */
+    size_t key_len;         /* Current key length. */
+    size_t key_max;         /* Max key len the current key buffer can hold. */
+    unsigned char key_static_string[RAX_ITER_STATIC_LEN];
+    raxNode *node;          /* Current node. Only for unsafe iteration. */
+    raxStack stack;         /* Stack used for unsafe iteration. */
+    raxNodeCallback node_cb; /* Optional node callback. Normally set to NULL. */
+} raxIterator;
+
+#define RAX_ITER_STATIC_LEN 128
+```
++ `flags`：迭代器的标志位，取值有如下三种：
+    + `RAX_ITER_JUST_SEEKED`：
+    + `RAX_ITER_EOF`：
+    + `RAX_ITER_SAFE`：
++ `rt`：指向`rax`对象的指针；
++ `key`：迭代器当前`key`的字符串数组，小字符串指向`key_static_string`，大字符串指向堆空间分配的字符串数组地址；
++ `data`：迭代器当前`key`对应的`value`值；
++ `key_len`：迭代器当前`key`的长度；
++ `key_max`：当前`key`缓存的最大值；
++ `key_static_string`：字符串数组，存放迭代器当前`key`；
++ `node`：当前`key`所在的`raxNode`节点；
++ `stack`：记录从根节点到当前节点路径，用于节点向上遍历；
++ `node_cb`：节点回调函数，默认为`NULL`；
+
+迭代器的启动`raxStart`函数实现如下：
 ```c
 /* Initialize a Rax iterator. This call should be performed a single time
  * to initialize the iterator, and must be followed by a raxSeek() call,
@@ -948,7 +1131,6 @@ void raxStart(raxIterator *it, rax *rt) {
     it->node_cb = NULL;
     raxStackInit(&it->stack);
 }
-#define RAX_ITER_STATIC_LEN 128
 
 /* Initialize the stack. */
 static inline void raxStackInit(raxStack *ts) {
@@ -957,6 +1139,6 @@ static inline void raxStackInit(raxStack *ts) {
     ts->maxitems = RAX_STACK_STATIC_ITEMS;
     ts->oom = 0;
 }
-#define RAX_STACK_STATIC_ITEMS 32
 ```
-主要完成迭代器`raxIterator`对象各个属性初始化。
+
+## rax树迭代前/后一个元素
