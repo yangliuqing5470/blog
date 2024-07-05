@@ -1103,9 +1103,9 @@ typedef struct raxIterator {
 #define RAX_ITER_STATIC_LEN 128
 ```
 + `flags`：迭代器的标志位，取值有如下三种：
-    + `RAX_ITER_JUST_SEEKED`：
-    + `RAX_ITER_EOF`：
-    + `RAX_ITER_SAFE`：
+    + `RAX_ITER_JUST_SEEKED`：刚刚调用`raxSeek`函数，这时候可以取迭代器值，并清除这个标志；
+    + `RAX_ITER_EOF`：迭代器遍历结束；
+    + `RAX_ITER_SAFE`：安全迭代器标志；
 + `rt`：指向`rax`对象的指针；
 + `key`：迭代器当前`key`的字符串数组，小字符串指向`key_static_string`，大字符串指向堆空间分配的字符串数组地址；
 + `data`：迭代器当前`key`对应的`value`值；
@@ -1142,3 +1142,392 @@ static inline void raxStackInit(raxStack *ts) {
 ```
 
 ## rax树迭代前/后一个元素
+先看下向后迭代一个元素`raxIteratorNextStep`函数的实现（迭代下一个更大的`key`），其定义如下：
+```c
+int raxIteratorNextStep(raxIterator *it, int noup);
+```
++ `it`：迭代器对象；
++ `noup`：是否可以向上遍历，取值`1`表示不向上遍历；`noup`取`1`表示迭代器的当前节点被假设是迭代器目标`key`的父节点，
+需要从迭代器当前节点查找其他的子节点。
+
+`raxIteratorNextStep`前置准备如下：
+```c
+int raxIteratorNextStep(raxIterator *it, int noup) {
+    // 标志位检查
+    if (it->flags & RAX_ITER_EOF) {
+        return 1;
+    } else if (it->flags & RAX_ITER_JUST_SEEKED) {
+        it->flags &= ~RAX_ITER_JUST_SEEKED;
+        return 1;
+    }
+
+    /* Save key len, stack items and the node where we are currently
+     * so that on iterator EOF we can restore the current key and state. */
+    size_t orig_key_len = it->key_len;
+    size_t orig_stack_items = it->stack.items;
+    raxNode *orig_node = it->node;
+```
+`raxIteratorNextStep`遍历逻辑如下：
++ 如果迭代器当前节点有子节点且不需要查找迭代器当前节点（`noup=0`），则沿着最左侧子节点（字典序最小）一直往下查找，
+直到找到一个`key`；
+  ```c
+    while(1) {
+        // 获取迭代器当前节点子节点个数
+        int children = it->node->iscompr ? 1 : it->node->size;
+        if (!noup && children) {
+            debugf("GO DEEPER\n");
+            /* Seek the lexicographically smaller key in this subtree, which
+             * is the first one found always going torwards the first child
+             * of every successive node. */
+            if (!raxStackPush(&it->stack,it->node)) return 0;
+            // 最左节点
+            raxNode **cp = raxNodeFirstChildPtr(it->node);
+            if (!raxIteratorAddChars(it,it->node->data,
+                it->node->iscompr ? it->node->size : 1)) return 0;
+            memcpy(&it->node,cp,sizeof(it->node));
+            /* Call the node callback if any, and replace the node pointer
+             * if the callback returns true. */
+            if (it->node_cb && it->node_cb(&it->node))
+                memcpy(cp,&it->node,sizeof(it->node));
+            /* For "next" step, stop every time we find a key along the
+             * way, since the key is lexicograhically smaller compared to
+             * what follows in the sub-children. */
+            if (it->node->iskey) {
+                it->data = raxGetData(it->node);
+                return 1;
+            }
+  ```
++ 如果迭代器当前节点没有子节点（或如果`noup=1`表示需要查找迭代器当前节点，这时候已经假设迭代器当前节点是目标`key`的父节点，第一次需要跳过从`raxStack`中弹出父节点），
+依次弹出`raxStack`保存的遍历路径上父节点，查找父节点的其他子节点（找比当前`key`大的子节点）；
+  ```c
+    } else {
+            /* If we finished exporing the previous sub-tree, switch to the
+             * new one: go upper until a node is found where there are
+             * children representing keys lexicographically greater than the
+             * current key. */
+            while(1) {
+                int old_noup = noup;
+
+                /* Already on head? Can't go up, iteration finished. */
+                // 到达 head 节点（head 节点也已经查找了），迭代器终止
+                if (!noup && it->node == it->rt->head) {
+                    it->flags |= RAX_ITER_EOF;
+                    it->stack.items = orig_stack_items;
+                    it->key_len = orig_key_len;
+                    it->node = orig_node;
+                    return 1;
+                }
+                /* If there are no children at the current node, try parent's
+                 * next child. */
+                unsigned char prevchild = it->key[it->key_len-1];
+                if (!noup) {
+                    // 迭代器当前节点没有子节点，取出父节点
+                    it->node = raxStackPop(&it->stack);
+                } else {
+                    // 对于 noup=1 ，第一次跳过取父节点，因为当前节点已经假设是父节点，需要查找其他子节点
+                    noup = 0;
+                }
+                /* Adjust the current key to represent the node we are
+                 * at. */
+                int todel = it->node->iscompr ? it->node->size : 1;
+                // 更新迭代器的 key，去掉当前节点存储的字符
+                raxIteratorDelChars(it,todel);
+
+                /* Try visiting the next child if there was at least one
+                 * additional child. */
+                if (!it->node->iscompr && it->node->size > (old_noup ? 0 : 1)) {
+                    raxNode **cp = raxNodeFirstChildPtr(it->node);
+                    int i = 0;
+                    // 遍历当前节点所有的子节点，找到比当前 key 大的子节点
+                    while (i < it->node->size) {
+                        debugf("SCAN NEXT %c\n", it->node->data[i]);
+                        if (it->node->data[i] > prevchild) break;
+                        i++;
+                        cp++;
+                    }
+                    // 找到了
+                    if (i != it->node->size) {
+                        debugf("SCAN found a new node\n");
+                        raxIteratorAddChars(it,it->node->data+i,1);
+                        if (!raxStackPush(&it->stack,it->node)) return 0;
+                        // 更新迭代器的节点
+                        memcpy(&it->node,cp,sizeof(it->node));
+                        /* Call the node callback if any, and replace the node
+                         * pointer if the callback returns true. */
+                        if (it->node_cb && it->node_cb(&it->node))
+                            memcpy(cp,&it->node,sizeof(it->node));
+                        if (it->node->iskey) {
+                            it->data = raxGetData(it->node);
+                            return 1;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+  ```
+向前迭代一个元素`raxIteratorPrevStep`函数（迭代下一个更小的`key`）逻辑和`raxIteratorNextStep`差不多，这里不做介绍。
+
+## rax树迭代查找
+迭代器查找中某个元素函数`raxSeek`，其定义如下：
+```c
+int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
+```
++ `it`：为`raxStart`初始化的迭代器；
++ `op`：查找操作符，取值`>`、`<`、`=`、`>=`、`<=`、`^`和`$`，其中`^`表示首元素，`$`表示末尾元素；
++ `ele`：要查找的元素`key`；
++ `len`：要查找元素的长度；
+
+`raxSeek`变量初始化及参数解析如下：
+```c
+/* Seek an iterator at the specified element.
+ * Return 0 if the seek failed for syntax error or out of memory. Otherwise
+ * 1 is returned. When 0 is returned for out of memory, errno is set to
+ * the ENOMEM value. */
+int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
+    int eq = 0, lt = 0, gt = 0, first = 0, last = 0;
+
+    it->stack.items = 0; /* Just resetting. Intialized by raxStart(). */
+    it->flags |= RAX_ITER_JUST_SEEKED;
+    it->flags &= ~RAX_ITER_EOF;
+    it->key_len = 0;
+    it->node = NULL;
+
+    /* Set flags according to the operator used to perform the seek. */
+    // 解析 op 参数
+    if (op[0] == '>') {
+        gt = 1;
+        if (op[1] == '=') eq = 1;
+    } else if (op[0] == '<') {
+        lt = 1;
+        if (op[1] == '=') eq = 1;
+    } else if (op[0] == '=') {
+        eq = 1;
+    } else if (op[0] == '^') {
+        first = 1;
+    } else if (op[0] == '$') {
+        last = 1;
+    } else {
+        errno = 0;
+        return 0; /* Error. */
+    }
+```
+查找首元素或者尾元素实现如下：
+```c
+    /* If there are no elements, set the EOF condition immediately and
+     * return. */
+    // 如果 rax 树没有元素，直接返回
+    if (it->rt->numele == 0) {
+        it->flags |= RAX_ITER_EOF;
+        return 1;
+    }
+    // 查找首元素
+    if (first) {
+        /* Seeking the first key greater or equal to the empty string
+         * is equivalent to seeking the smaller key available. */
+        return raxSeek(it,">=",NULL,0);
+    }
+    // 查找尾元素
+    if (last) {
+        /* Find the greatest key taking always the last child till a
+         * final node is found. */
+        it->node = it->rt->head;
+        if (!raxSeekGreatest(it)) return 0;
+        assert(it->node->iskey);
+        it->data = raxGetData(it->node);
+        return 1;
+    }
+```
+其中查找尾元素直接在`rax`树中找最右侧叶子节点，调用`raxSeekGreatest`函数，实现如下：
+```c
+/* Seek the grestest key in the subtree at the current node. Return 0 on
+ * out of memory, otherwise 1. This is an helper function for different
+ * iteration functions below. */
+int raxSeekGreatest(raxIterator *it) {
+    while(it->node->size) {
+        if (it->node->iscompr) {
+            // 压缩节点
+            if (!raxIteratorAddChars(it,it->node->data,
+                it->node->size)) return 0;
+        } else {
+            // 非压缩节点
+            if (!raxIteratorAddChars(it,it->node->data+it->node->size-1,1))
+                return 0;
+        }
+        raxNode **cp = raxNodeLastChildPtr(it->node);
+        if (!raxStackPush(&it->stack,it->node)) return 0;
+        // 继续查找最右侧的子节点
+        memcpy(&it->node,cp,sizeof(it->node));
+    }
+    return 1;
+}
+```
+`raxSeek`查找指定的元素`key`，程序执行有如下流程：
++ 如果指定的元素`ele`在`rax`树中找到，且`op`包含`=`，则操作完成；
+  ```c
+    /* We need to seek the specified key. What we do here is to actually
+     * perform a lookup, and later invoke the prev/next key code that
+     * we already use for iteration. */
+    int splitpos = 0;
+    // 遍历 rax 树，查找 ele，it->node 是遍历终止节点
+    size_t i = raxLowWalk(it->rt,ele,len,&it->node,NULL,&splitpos,&it->stack);
+
+    /* Return OOM on incomplete stack info. */
+    if (it->stack.oom) return 0;
+
+    if (eq && i == len && (!it->node->iscompr || splitpos == 0) &&
+        it->node->iskey)
+    {
+        /* We found our node, since the key matches and we have an
+         * "equal" condition. */
+        if (!raxIteratorAddChars(it,ele,len)) return 0; /* OOM. */
+        it->data = raxGetData(it->node);
+    }
+  ```
++ 如果指定的元素`ele`在`rax`树中没找到，且`op`设置为`=`，则设置迭代器标志为`RAX_ITER_EOF`返回；
+  ```c
+    else {
+        /* If we are here just eq was set but no match was found. */
+        it->flags |= RAX_ITER_EOF;
+        return 1;
+    }
+  ```
++ 如果指定的元素`ele`在`rax`树中没找到，且`op`包含`>`或者`<`，则继续查找；
+  + 更新`it->key`值，也就是将遍历到终止节点经历的所有节点数据存储到`it->key`：
+    ```c
+      else if (lt || gt) {
+        /* Exact key not found or eq flag not set. We have to set as current
+         * key the one represented by the node we stopped at, and perform
+         * a next/prev operation to seek. To reconstruct the key at this node
+         * we start from the parent and go to the current node, accumulating
+         * the characters found along the way. */
+        if (!raxStackPush(&it->stack,it->node)) return 0;
+        for (size_t j = 1; j < it->stack.items; j++) {
+            raxNode *parent = it->stack.stack[j-1];
+            raxNode *child = it->stack.stack[j];
+            if (parent->iscompr) {
+                // 压缩节点
+                if (!raxIteratorAddChars(it,parent->data,parent->size))
+                    return 0;
+            } else {
+                // 非压缩节点
+                raxNode **cp = raxNodeFirstChildPtr(parent);
+                unsigned char *p = parent->data;
+                // 找到子节点位置
+                while(1) {
+                    raxNode *aux;
+                    memcpy(&aux,cp,sizeof(aux));
+                    if (aux == child) break;
+                    cp++;
+                    p++;
+                }
+                if (!raxIteratorAddChars(it,p,1)) return 0;
+            }
+        }
+        raxStackPop(&it->stack);
+    ```
+  + 如果终止节点`it->node`是非压缩节点，且待查找的元素`ele`没有比较完，也就是`i != len`（由于不匹配停止在非压缩节点中间），
+  直接在迭代器当前节点（也就是停止节点）查找子节点（将当前节点作为父节点，`noup=1`）：
+    ```c
+        if (i != len && !it->node->iscompr) {
+            /* If we stopped in the middle of a normal node because of a
+             * mismatch, add the mismatching character to the current key
+             * and call the iterator with the 'noup' flag so that it will try
+             * to seek the next/prev child in the current node directly based
+             * on the mismatching character. */
+            if (!raxIteratorAddChars(it,ele+i,1)) return 0;
+            debugf("Seek normal node on mismatch: %.*s\n",
+                (int)it->key_len, (char*)it->key);
+
+            it->flags &= ~RAX_ITER_JUST_SEEKED;
+            if (lt && !raxIteratorPrevStep(it,1)) return 0;
+            if (gt && !raxIteratorNextStep(it,1)) return 0;
+            it->flags |= RAX_ITER_JUST_SEEKED; /* Ignore next call. */
+        }
+    ```
+  + 如果终止节点`it->node`是压缩节点，且待查找的元素`ele`没有比较完，也就是`i != len`（由于不匹配停止在压缩节点中间）：
+    ```c
+        else if (i != len && it->node->iscompr) {
+            debugf("Compressed mismatch: %.*s\n",
+                (int)it->key_len, (char*)it->key);
+            /* In case of a mismatch within a compressed node. */
+            // 终止节点中不匹配的字符
+            int nodechar = it->node->data[splitpos];
+            // 待查找元素不匹配字符
+            int keychar = ele[i];
+            it->flags &= ~RAX_ITER_JUST_SEEKED;
+            if (gt) {
+                /* If the key the compressed node represents is greater
+                 * than our seek element, continue forward, otherwise set the
+                 * state in order to go back to the next sub-tree. */
+                // 如果是 > ，且终止节点不匹配字符已经大于待查找元素不匹配字符，直接在终止节点的子节点查找即可
+                if (nodechar > keychar) {
+                    if (!raxIteratorNextStep(it,0)) return 0;
+                } else {
+                    // 终止节点不匹配字符小于待查找元素不匹配字符，由于是压缩节点，更新 it->key 为了可以正确在父节点查找其他子节点
+                    // 在 raxIteratorNextStep 中，对于压缩节点，it->key 会直接删除压缩节点全部字符串，所有这里先加上
+                    if (!raxIteratorAddChars(it,it->node->data,it->node->size))
+                        return 0;
+                    if (!raxIteratorNextStep(it,1)) return 0;
+                }
+            }
+            if (lt) {
+                /* If the key the compressed node represents is smaller
+                 * than our seek element, seek the greater key in this
+                 * subtree, otherwise set the state in order to go back to
+                 * the previous sub-tree. */
+                if (nodechar < keychar) {
+                    // 终止节点不匹配字符小于待查找元素不匹配字符，直接查找终止节点的最右侧的子树
+                    if (!raxSeekGreatest(it)) return 0;
+                    it->data = raxGetData(it->node);
+                } else {
+                    // 终止节点不匹配字符大于待查找元素不匹配字符，更新 it->key 为了可以正确在父节点查找其他子节点，
+                    // 在 raxIteratorNextStep 中，对于压缩节点，it->key 会直接删除压缩节点全部字符串，所有这里先加上
+                    if (!raxIteratorAddChars(it,it->node->data,it->node->size))
+                        return 0;
+                    if (!raxIteratorPrevStep(it,1)) return 0;
+                }
+            }
+            it->flags |= RAX_ITER_JUST_SEEKED; /* Ignore next call. */
+        }
+    ```
+  + 如果所有`ele`元素匹配完成，但停止在压缩节点中间，或者停止节点不是`key`：
+    ```c
+        else {
+            debugf("No mismatch: %.*s\n",
+                (int)it->key_len, (char*)it->key);
+            /* If there was no mismatch we are into a node representing the
+             * key, (but which is not a key or the seek operator does not
+             * include 'eq'), or we stopped in the middle of a compressed node
+             * after processing all the key. Continue iterating as this was
+             * a legitimate key we stopped at. */
+            it->flags &= ~RAX_ITER_JUST_SEEKED;
+            if (it->node->iscompr && it->node->iskey && splitpos && lt) {
+                /* If we stopped in the middle of a compressed node with
+                 * perfect match, and the condition is to seek a key "<" than
+                 * the specified one, then if this node is a key it already
+                 * represents our match. For instance we may have nodes:
+                 *
+                 * "f" -> "oobar" = 1 -> "" = 2
+                 *
+                 * Representing keys "f" = 1, "foobar" = 2. A seek for
+                 * the key < "foo" will stop in the middle of the "oobar"
+                 * node, but will be our match, representing the key "f".
+                 *
+                 * So in that case, we don't seek backward. */
+            } else {
+                if (gt && !raxIteratorNextStep(it,0)) return 0;
+                if (lt && !raxIteratorPrevStep(it,0)) return 0;
+            }
+            it->flags |= RAX_ITER_JUST_SEEKED; /* Ignore next call. */
+        }
+    ```
+## rax树迭代器停止
+`raxStop`实现如下：
+```c
+/* Free the iterator. */
+void raxStop(raxIterator *it) {
+    if (it->key != it->key_static_string) rax_free(it->key);
+    raxStackFree(&it->stack);
+}
+```
