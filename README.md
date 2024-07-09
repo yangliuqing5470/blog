@@ -43,6 +43,7 @@
 - [redis数据结构-listpack](./programming/redis/listpack.md)
 - [redis数据结构-rax树](./programming/redis/rax.md)
 - [redis数据结构-stream](./programming/redis/stream.md)
+- [redis服务启动](./programming/redis/server.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)

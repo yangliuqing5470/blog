@@ -393,3 +393,46 @@ typedef struct aeFileEvent {
     void *clientData;
 } aeFileEvent;
 ```
++ `mask`：文件事件类型，取值`AE_READABLE`（可读）、`AE_WRITABLE`（可写）和`AE_BARRIER`；
++ `rfileProc`：函数指针，指向读事件处理函数；
++ `wfileProc`：函数指针，指向写事件处理函数；
++ `clientData`：对应的客户端对象；
+
+时间事件`aeTimeEvent`定义如下：
+```c
+typedef struct aeTimeEvent {
+    long long id; /* time event identifier. */
+    long when_sec; /* seconds */
+    long when_ms; /* milliseconds */
+    aeTimeProc *timeProc;
+    aeEventFinalizerProc *finalizerProc;
+    void *clientData;
+    struct aeTimeEvent *prev;
+    struct aeTimeEvent *next;
+} aeTimeEvent;
+```
++ `id`：时间事件的唯一`ID`，通过`aeEventLoop->timeEventNextId`实现；
++ `when_sec`：时间事件触发的秒数；
++ `when_ms`：时间事件触发的微妙数；
++ `timeProc`：函数指针，指向时间事件处理函数；
++ `finalizerProc`：函数指针，删除时间事件节点前调用此函数；
++ `clientData`：对应的客户端对象；
++ `prev`：指向前一个时间事件节点；
++ `next`：指向下一个时间事件节点；
+
+## 服务启动
+### 初始化配置
+
+### 加载解析配置文件
+
+### 初始化服务
+
+### 创建事件循环
+
+### 创建socket并启动监听
+
+### 创建文件事件和时间时间
+
+### 开启事件循环
+
+## 命令处理流程
