@@ -421,9 +421,138 @@ typedef struct aeTimeEvent {
 + `next`：指向下一个时间事件节点；
 
 ## 服务启动
+`redis`服务启动流程介绍不涉及集群模式（哨兵模式和集群模式）及持久化（`AOF`和`RDB`），后续有相关章节单独介绍。
+
 ### 初始化配置
+服务配置初始化主要是初始化设置`redisServer`对象的相关字段，主要由函数`initServerConfig`实现：
+```c
+void initServerConfig(void) {
+    ...
+    // serverCron 函数（定时事件函数）执行频率，默认 CONFIG_DEFAULT_HZ=10
+    server.hz = server.config_hz = CONFIG_DEFAULT_HZ;
+    // 监听端口号，默认 CONFIG_DEFAULT_SERVER_PORT=6379
+    server.port = CONFIG_DEFAULT_SERVER_PORT;
+    // listen 函数的 backlog 参数值，默认 CONFIG_DEFAULT_TCP_BACKLOG=511
+    server.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
+    // 数据库数目，默认 CONFIG_DEFAULT_DBNUM=16
+    server.dbnum = CONFIG_DEFAULT_DBNUM;
+    // 客户端超时时间，默认 CONFIG_DEFAULT_CLIENT_TIMEOUT=0，表示没有超时时间
+    server.maxidletime = CONFIG_DEFAULT_CLIENT_TIMEOUT;
+    // 最大同时连接的客户端数目，默认 CONFIG_DEFAULT_MAX_CLIENTS=10000
+    server.maxclients = CONFIG_DEFAULT_MAX_CLIENTS;
+    ...
+    // 将 redisCommandTable 数组中所有命令转存在 server->commands 字典，提高命令查找效率，
+    // 上面的命令小节有介绍
+    populateCommandTable();
+    // 初始化删除命令，使得后续此命令可直接读取，不需要查询 server->commands 字典
+    server.delCommand = lookupCommandByCString("del");
+    ...
+}
+```
+初始化常用命令，提高命令查询效率，避免从字典查找，例如初始化删除命令函数`lookupCommandByCString`实现如下：
+```c
+struct redisCommand *lookupCommandByCString(char *s) {
+    struct redisCommand *cmd;
+    sds name = sdsnew(s);
+
+    cmd = dictFetchValue(server.commands, name);
+    sdsfree(name);
+    return cmd;
+}
+```
 
 ### 加载解析配置文件
+加载解析配置文件的函数是`loadServerConfig`，实现如下：
+```c
+void loadServerConfig(char *filename, char *options) {
+    // 创建空的 sds 字符串对象，存放解析后的配置文件内容
+    sds config = sdsempty();
+    // 一个缓存数组，存放配置文件一行内容，配置文件一行字符数不超过 CONFIG_MAX_LINE=1024 个
+    char buf[CONFIG_MAX_LINE+1];
+
+    /* Load the file content */
+    if (filename) {
+        FILE *fp;
+
+        if (filename[0] == '-' && filename[1] == '\0') {
+            fp = stdin;
+        } else {
+            if ((fp = fopen(filename,"r")) == NULL) {
+                serverLog(LL_WARNING,
+                    "Fatal error, can't open config file '%s'", filename);
+                exit(1);
+            }
+        }
+        // fgets 从流 fp 读取一行，存放在 buf 指定的字符数组，当读取 (CONFIG_MAX_LINE+1)-1 个字符，
+        // 或者遇到换行符，或者到达文件末尾则停止
+        while(fgets(buf,CONFIG_MAX_LINE+1,fp) != NULL)
+            config = sdscat(config,buf);
+        if (fp != stdin) fclose(fp);
+    }
+    /* Append the additional options */
+    // 如果启动服务命令行后有输入配置参数，换行追加到 config 后
+    if (options) {
+        config = sdscat(config,"\n");
+        config = sdscat(config,options);
+    }
+    // 解析配置
+    loadServerConfigFromString(config);
+    sdsfree(config);
+}
+```
++ `filename`：配置文件路径；
++ `options`：命令行输入的配置参数，例如使用如下命令启动服务：
+  ```bash
+  /home/user/redis/redis-server /home/user/redis/redis.conf -p 4000
+  ```
+加载完配置文件后，会调用`loadServerConfigFromString`函数进行解析：
+```c
+void loadServerConfigFromString(char *config) {
+    char *err = NULL;
+    int linenum = 0, totlines, i;
+    int slaveof_linenum = 0;
+    sds *lines;
+    // 将加载的配置按 "\n" 分割为多行，totlines 是总行数
+    lines = sdssplitlen(config,strlen(config),"\n",1,&totlines);
+
+    for (i = 0; i < totlines; i++) {
+        sds *argv;
+        int argc;
+
+        linenum = i+1;
+        lines[i] = sdstrim(lines[i]," \t\r\n");
+
+        /* Skip comments and blank lines */
+        // 跳过注释行和空行
+        if (lines[i][0] == '#' || lines[i][0] == '\0') continue;
+
+        /* Split into arguments */
+        argv = sdssplitargs(lines[i],&argc);
+        if (argv == NULL) {
+            err = "Unbalanced quotes in configuration line";
+            goto loaderr;
+        }
+
+        /* Skip this line if the resulting command vector is empty. */
+        if (argc == 0) {
+            sdsfreesplitres(argv,argc);
+            continue;
+        }
+        sdstolower(argv[0]);
+
+        /* Execute config directives */
+        if (!strcasecmp(argv[0],"timeout") && argc == 2) {
+            server.maxidletime = atoi(argv[1]);
+            if (server.maxidletime < 0) {
+                err = "Invalid timeout value"; goto loaderr;
+            }
+        }
+        // 其他配置
+        ...
+    }
+    ...
+}
+```
 
 ### 初始化服务
 
