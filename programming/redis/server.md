@@ -553,8 +553,72 @@ void loadServerConfigFromString(char *config) {
     ...
 }
 ```
+`loadServerConfigFromString`主要读取配置文件中的各个参数，并更新`redisServer`对象。
 
 ### 初始化服务
+服务初始化由`initServer`函数实现，`initServer`样例说明如下：
+```c
+void initServer(void) {
+    int j;
+
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    // 注册信号处理函数
+    setupSignalHandlers();
+
+    if (server.syslog_enabled) {
+        openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
+            server.syslog_facility);
+    }
+
+    // serverCron 函数（定时事件函数）执行频率，默认 10
+    server.hz = server.config_hz;
+    server.pid = getpid();
+    server.current_client = NULL;
+    // 创建一个链表，存放所有连接的客户端对象
+    server.clients = listCreate();
+    // 创建一个 rax 数，存放每个客户端的 ID
+    server.clients_index = raxNew();
+    ...
+    createSharedObjects();
+    adjustOpenFilesLimit();
+    ...
+    // 初始化数据库
+    server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+    ...
+    /* Create the Redis databases, and initialize other internal state. */
+    for (j = 0; j < server.dbnum; j++) {
+        server.db[j].dict = dictCreate(&dbDictType,NULL);
+        server.db[j].expires = dictCreate(&keyptrDictType,NULL);
+        server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
+        server.db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+        server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
+        server.db[j].id = j;
+        server.db[j].avg_ttl = 0;
+        server.db[j].defrag_later = listCreate();
+    }
+    ...
+}
+```
+根据上面数据结构定义小节可知，`redis`的对象`redisObject`有一个`refcount`字段表示对象的引用次数，可以用于对象的共享。
+服务初始化阶段会调用函数`createSharedObjects`创建一些共享对象，`createSharedObjects`函数主要是对`sharedObjectsStruct`结构体进行初始化设置。
+```c
+struct sharedObjectsStruct {
+    robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *cnegone, *pong, *space,
+    *colon, *nullbulk, *nullmultibulk, *queued,
+    *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
+    *outofrangeerr, *noscripterr, *loadingerr, *slowscripterr, *bgsaveerr,
+    *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
+    *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
+    *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
+    *rpop, *lpop, *lpush, *rpoplpush, *zpopmin, *zpopmax, *emptyscan,
+    *select[PROTO_SHARED_SELECT_CMDS],
+    *integers[OBJ_SHARED_INTEGERS],
+    *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
+    *bulkhdr[OBJ_SHARED_BULKHDR_LEN];  /* "$<value>\r\n" */
+    sds minstring, maxstring;
+};
+```
 
 ### 创建事件循环
 
