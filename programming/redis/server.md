@@ -600,7 +600,7 @@ void initServer(void) {
     ...
 }
 ```
-根据上面数据结构定义小节可知，`redis`的对象`redisObject`有一个`refcount`字段表示对象的引用次数，可以用于对象的共享。
+根据上面数据结构定义小节可知，`redis`对象`redisObject`有一个`refcount`字段表示对象的引用次数，可以用于对象的共享。
 服务初始化阶段会调用函数`createSharedObjects`创建一些共享对象，`createSharedObjects`函数主要是对`sharedObjectsStruct`结构体进行初始化设置。
 ```c
 struct sharedObjectsStruct {
@@ -619,13 +619,736 @@ struct sharedObjectsStruct {
     sds minstring, maxstring;
 };
 ```
+其中`integers`整数数组存放`0-10000`的整数，且其中每一个整数对象`refcount`值设置为`INT_MAX`，确保不会被释放：
+```c
+// OBJ_SHARED_INTEGERS = 10000
+for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
+    shared.integers[j] =
+        makeObjectShared(createObject(OBJ_STRING,(void*)(long)j));
+    shared.integers[j]->encoding = OBJ_ENCODING_INT;
+}
+
+// 更新 refcount 值为 INT_MAX
+robj *makeObjectShared(robj *o) {
+    serverAssert(o->refcount == 1);
+    o->refcount = OBJ_SHARED_REFCOUNT;
+    return o;
+}
+
+#define OBJ_SHARED_REFCOUNT INT_MAX
+```
+在`initServer`函数中默认会初始化`server.dbnum=16`个数据库，以初始化数据库`dict`属性为例，其字典的`type`属性是`dbDictType`对象，
+定义了字典键的哈希函数，键比较函数及键和值的销毁函数：
+```c
+dictType dbDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    dictObjectDestructor   /* val destructor */
+};
+```
 
 ### 创建事件循环
+在`initServer`函数中，也会完成时间循环的创建：
+```c
+// CONFIG_FDSET_INCR = 128
+server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
+```
+函数`aeCreateEventLoop`的实现如下：
+```c
+aeEventLoop *aeCreateEventLoop(int setsize) {
+    aeEventLoop *eventLoop;
+    int i;
+
+    if ((eventLoop = zmalloc(sizeof(*eventLoop))) == NULL) goto err;
+    // 分配存放文件事件对象的数组大小
+    eventLoop->events = zmalloc(sizeof(aeFileEvent)*setsize);
+    // 分配存放被触发的文件事件对象的数组大小
+    eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
+    if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
+    eventLoop->setsize = setsize;
+    eventLoop->lastTime = time(NULL);
+    // 时间事件链表头节点初始化
+    eventLoop->timeEventHead = NULL;
+    eventLoop->timeEventNextId = 0;
+    eventLoop->stop = 0;
+    eventLoop->maxfd = -1;
+    eventLoop->beforesleep = NULL;
+    eventLoop->aftersleep = NULL;
+    // 初始化 apidata 对象，表示不同的 IO 多路复用对象封装
+    if (aeApiCreate(eventLoop) == -1) goto err;
+    /* Events with mask == AE_NONE are not set. So let's initialize the
+     * vector with it. */
+    for (i = 0; i < setsize; i++)
+        eventLoop->events[i].mask = AE_NONE;
+    return eventLoop;
+
+err:
+    if (eventLoop) {
+        zfree(eventLoop->events);
+        zfree(eventLoop->fired);
+        zfree(eventLoop);
+    }
+    return NULL;
+}
+```
+`aeCreateEventLoop`主要完成对事件循环对象`aeEventLoop`的成员初始化，其中`setsize`参数表示用户配置的最大同时连接的客户端数目。
+函数`aeApiCreate`内部会调用`epoll_create`创建`epoll`对象（对于`linux`系统），并更新事件循环对象的`eventloop->apidata`属性：
+```c
+typedef struct aeApiState {
+    int epfd;
+    struct epoll_event *events;
+} aeApiState;
+
+static int aeApiCreate(aeEventLoop *eventLoop) {
+    aeApiState *state = zmalloc(sizeof(aeApiState));
+
+    if (!state) return -1;
+    state->events = zmalloc(sizeof(struct epoll_event)*eventLoop->setsize);
+    if (!state->events) {
+        zfree(state);
+        return -1;
+    }
+    state->epfd = epoll_create(1024); /* 1024 is just a hint for the kernel */
+    if (state->epfd == -1) {
+        zfree(state->events);
+        zfree(state);
+        return -1;
+    }
+    eventLoop->apidata = state;
+    return 0;
+}
+```
 
 ### 创建socket并启动监听
+在`initServer`内部，也会完成对服务器地址的监听（`ip + port`），完成和客户端基于`socket`通信的准备工作：
+```c
+/* Open the TCP listening socket for the user commands. */
+if (server.port != 0 &&
+    listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
+    exit(1);
+```
++ `server.ipfd`：一个数组，存放监听绑定的`socket`文件描述符；
++ `server.ipfd_count`：`server.ipfd`数组最后一个元素的下标，初始值是`0`；
 
-### 创建文件事件和时间时间
+`listenToPort`函数主要实现如下（只给出了`IPV4`相关实现）：
+```c
+/* Bind IPv4 address. */
+fds[*count] = anetTcpServer(server.neterr,port,server.bindaddr[j],
+    server.tcp_backlog);
+// 将 socket 设置为非阻塞
+anetNonBlock(NULL,fds[*count]);
+(*count)++;
+```
+`listenToPort`内部首先调用`anetTcpServer`函数创建监听`socket`并完成绑定监听，然后调用`anetNonBlock`将监听`socket`设置为非阻塞。
+函数`anetTcpServer`实现如下：
+```c
+int anetTcpServer(char *err, int port, char *bindaddr, int backlog)
+{
+    return _anetTcpServer(err, port, bindaddr, AF_INET, backlog);
+}
+
+static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backlog)
+{
+    int s = -1, rv;
+    char _port[6];  /* strlen("65535") */
+    struct addrinfo hints, *servinfo, *p;
+
+    snprintf(_port,6,"%d",port);
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = af;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;    /* No effect if bindaddr != NULL */
+
+    if ((rv = getaddrinfo(bindaddr,_port,&hints,&servinfo)) != 0) {
+        anetSetError(err, "%s", gai_strerror(rv));
+        return ANET_ERR;
+    }
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        // 创建监听 socket
+        if ((s = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1)
+            continue;
+
+        if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
+        // 设置地址重用
+        if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
+        // 绑定和监听端口
+        if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) s = ANET_ERR;
+        goto end;
+    }
+    if (p == NULL) {
+        anetSetError(err, "unable to bind socket, errno: %d", errno);
+        goto error;
+    }
+
+error:
+    if (s != -1) close(s);
+    s = ANET_ERR;
+end:
+    freeaddrinfo(servinfo);
+    return s;
+}
+```
+`anetTcpServer`服务内部会完成如下工作：
++ 创建监听`socket`；
++ 将`socket`设置地址重用；
++ 调用`bind`和`listen`完成绑定和监听；
+
+对于`unix domain socket`，其初始化操作如下，这里不做详细介绍：
+```c
+/* Open the listening Unix domain socket. */
+if (server.unixsocket != NULL) {
+    unlink(server.unixsocket); /* don't care if this fails */
+    server.sofd = anetUnixServer(server.neterr,server.unixsocket,
+        server.unixsocketperm, server.tcp_backlog);
+    if (server.sofd == ANET_ERR) {
+        serverLog(LL_WARNING, "Opening Unix socket: %s", server.neterr);
+        exit(1);
+    }
+    anetNonBlock(NULL,server.sofd);
+}
+```
+
+### 创建文件事件和时间事件
+完成对监听`socket`的创建、绑定及监听后，`initServer`会继续创建文件事件（`socket`读写事件）：
+```c
+/* Create an event handler for accepting new connections in TCP and Unix
+ * domain sockets. */
+for (j = 0; j < server.ipfd_count; j++) {
+    if (aeCreateFileEvent(server.el, server.ipfd[j], AE_READABLE,
+        acceptTcpHandler,NULL) == AE_ERR)
+        {
+            serverPanic(
+                "Unrecoverable error creating server.ipfd file event.");
+        }
+}
+```
+创建文件事件`aeCreateEventLoop`函数实现如下：
+```c
+int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
+        aeFileProc *proc, void *clientData)
+{
+    // 确保 socker 文件描述符不能超过用户配置的最大值
+    if (fd >= eventLoop->setsize) {
+        errno = ERANGE;
+        return AE_ERR;
+    }
+    // 文件描述符对应的文件事件初始对象
+    aeFileEvent *fe = &eventLoop->events[fd];
+    // 调用 epoll_ctl 完成对事件的注册
+    if (aeApiAddEvent(eventLoop, fd, mask) == -1)
+        return AE_ERR;
+    // 更新 aeFileEvent 对象其他属性，例如设置事件处理函数，事件类型等
+    fe->mask |= mask;
+    if (mask & AE_READABLE) fe->rfileProc = proc;
+    if (mask & AE_WRITABLE) fe->wfileProc = proc;
+    fe->clientData = clientData;
+    if (fd > eventLoop->maxfd)
+        eventLoop->maxfd = fd;
+    return AE_OK;
+}
+```
+事件处理函数`acceptTcpHandler`主要完成`accept`操作和客户端对象的创建。客户端对象的创建函数`createClient`实现样例如下：
+```c
+client *createClient(int fd) {
+    client *c = zmalloc(sizeof(client));
+
+    /* passing -1 as fd it is possible to create a non connected client.
+     * This is useful since all the commands needs to be executed
+     * in the context of a client. When commands are executed in other
+     * contexts (for instance a Lua script) we need a non connected client. */
+    if (fd != -1) {
+        // 将和客户端通信的 socket 设置非阻塞
+        anetNonBlock(NULL,fd);
+        // 设置 TCP_NODELAY 标志
+        anetEnableTcpNoDelay(NULL,fd);
+        if (server.tcpkeepalive)
+            // 设置 SO_KEEPALIVE 属性
+            anetKeepAlive(NULL,fd,server.tcpkeepalive);
+        // 注册和客户端通信的 socket 读事件，事件处理函数是 readQueryFromClient
+        if (aeCreateFileEvent(server.el,fd,AE_READABLE,
+            readQueryFromClient, c) == AE_ERR)
+        {
+            close(fd);
+            zfree(c);
+            return NULL;
+        }
+    }
+    // 默认选择 0 号数据库
+    selectDb(c,0);
+    uint64_t client_id;
+    atomicGetIncr(server.next_client_id,client_id,1);
+    // 更新客户端其他属性，例如客户端 id等
+    c->id = client_id;
+    c->fd = fd;
+    ...
+}
+```
+`TCP`是基于字节流的可靠传输层协议，为了提升网络利用率，一般默认都会开启`Nagle`。当应用层调用`write`函数发送数据时，
+`TCP`并不一定立刻将数据发送出去，根据`Nagle`算法，须满足一定条件。`Nagle`是这样规定的：
++ 如果数据包长度大于一定门限时，则立即发送；
++ 如果数据包中含有`FIN`（表示断开`TCP`链接）字段，则立即发送；
++ 如果当前设置了`TCP_NODELAY`选项，则立即发送；
++ 如果以上所有条件都不满足，则默认需要等待`200`毫秒超时后才会发送；
+
+`redis`服务器向客户端返回命令回复时，希望`TCP`能立即将该回复发送给客户端，因此需要设置`TCP_NODELAY`。如果不设置，从客户端分析，命令请求的响应时间会大大加长。
+
+`TCP`是可靠的传输层协议，每次都需要经历“三次握手”与“四次挥手”，为了提升效率，可以设置`SO_KEEPALIVE`，即`TCP`长连接，
+这样`TCP`传输层会定时发送心跳包确认该连接的可靠性。应用层也不再需要频繁地创建与释放`TCP`连接了。
+
+和客户端通信的`socket`读事件处理函数是`readQueryFromClient`，在下一小节开启事件循环会详细介绍。
+
+
+接下来我们看下在`initServer`内部创建时间事件的相关实现：
+```c
+/* Create the timer callback, this is our way to process many background
+ * operations incrementally, like clients timeout, eviction of unaccessed
+ * expired keys and so forth. */
+// 创建一个 1ms 后触发的时间事件
+if (aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL) == AE_ERR) {
+    serverPanic("Can't create event loop timers.");
+    exit(1);
+}
+```
+创建时间事件`aeCreateTimeEvent`函数的实现如下：
+```c
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
+        aeTimeProc *proc, void *clientData,
+        aeEventFinalizerProc *finalizerProc)
+{
+    // 时间事件节点 id
+    long long id = eventLoop->timeEventNextId++;
+    aeTimeEvent *te;
+
+    te = zmalloc(sizeof(*te));
+    if (te == NULL) return AE_ERR;
+    te->id = id;
+    // 更新 aeTimeEvent 对象的各个属性
+    aeAddMillisecondsToNow(milliseconds,&te->when_sec,&te->when_ms);
+    te->timeProc = proc;
+    te->finalizerProc = finalizerProc;
+    te->clientData = clientData;
+    te->prev = NULL;
+    // 将节点放在链表头
+    te->next = eventLoop->timeEventHead;
+    if (te->next)
+        te->next->prev = te;
+    // 更新事件循环时间事件链表头
+    eventLoop->timeEventHead = te;
+    return id;
+}
+```
+时间事件用链表存储，每个时间事件都是链表中一个节点，新创建的时间事件节点都放在链表头。时间事件处理函数是`serverCron`，
+`serverCron`函数实现了`redis`服务所有定时任务的周期执行。`serverCron`函数部分样例代码如下：
+```c
+int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    ...
+    run_with_period(100) {
+        // 100ms 周期执行
+        ...
+    }
+    run_with_period(5000) {
+        // 5s 周期执行
+        ...
+    }
+    /* We need to do a few operations on clients asynchronously. */
+    // 清除超时客户端连接
+    clientsCron();
+
+    /* Handle background operations on Redis databases. */
+    // 处理数据库，例如清理过期键等
+    databasesCron();
+    ...
+    server.cronloops++;
+    return 1000/server.hz;
+}
+```
+`server.cronloops`记录函数`serverCron`执行次数，`server.hz`表示`serverCron`函数执行频率（一秒执行多少次）。
+`serverCron`函数返回值`1000/server.hz`表示当前`serverCron`执行周期（在`processTimeEvents`函数调用时间事件处理函数会用次返回值更新时间事件执行周期）。
+`run_with_period`宏定义了定时任务按照指定时间周期（`_ms_`）执行，宏定义如下：
+```c
+/* Using the following macro you can run code inside serverCron() with the
+ * specified period, specified in milliseconds.
+ * The actual resolution depends on server.hz. */
+#define run_with_period(_ms_) if ((_ms_ <= 1000/server.hz) || !(server.cronloops%((_ms_)/(1000/server.hz))))
+```
+`serverCron`函数执行时间不能太长，否则可能会影响客户端命令响应。下面以过期键删除为例子，说明`serverCron`函数执行时间不能太长。
+过期键删除通过`activeExpireCycle`函数实现，其由`databasesCron`函数调用。`activeExpireCycle`实现部分样例代码如下：
+```c
+void activeExpireCycle(int type) {
+    ...
+    // CRON_DBS_PER_CALL=16，此函数每次执行最多遍历数据库个数 dbs_per_call
+    int dbs_per_call = CRON_DBS_PER_CALL;
+    ...
+    /* We can use at max ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC percentage of CPU time
+     * per iteration. Since this function gets called with a frequency of
+     * server.hz times per second, the following is the max amount of
+     * microseconds we can spend in this function. */
+    timelimit = 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
+    timelimit_exit = 0;
+    ...
+    // 遍历查找每一个数据库
+    for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
+        int expired;
+        redisDb *db = server.db+(current_db % server.dbnum);
+        ...
+        /* Continue to expire if at the end of the cycle more than 25%
+         * of the keys were expired. */
+        // 处理一个数据库中的过期键
+        do {
+            ...
+            iteration++;
+            ...
+            /* The main collection cycle. Sample random keys among keys
+             * with an expire set, checking for expired ones. */
+            // 处理的过期键个数
+            expired = 0;
+            ttl_sum = 0;
+            ttl_samples = 0;
+            // ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP = 20，表示一个数据库中过期键一次处理的最大数
+            if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+                num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
+            // 一次最多处理 num 个过期键
+            while (num--) {
+                dictEntry *de;
+                long long ttl;
+
+                if ((de = dictGetRandomKey(db->expires)) == NULL) break;
+                ttl = dictGetSignedIntegerVal(de)-now;
+                if (activeExpireCycleTryExpire(db,de,now)) expired++;
+                ...
+            }
+            ...
+            // 一个数据库每迭代处理 16 次，检查是否超时
+            if ((iteration & 0xf) == 0) { /* check once every 16 iterations. */
+                elapsed = ustime()-start;
+                if (elapsed > timelimit) {
+                    timelimit_exit = 1;
+                    server.stat_expired_time_cap_reached_count++;
+                    break;
+                }
+            }
+        } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
+    }
+    ...
+}
+```
+函数`activeExpireCycle`最多遍历`dbs_per_call`个数据库，并限制每个数据库每次执行删除最多过期键数目为`20`（如果一个数据库过期键太多，在`do-while`中分多次执行）。
+同时为了避免每个数据库执行时间太长（`do-while`循环执行太久），会每个`do-while`执行`16`次迭代就检查函数`activeExpireCycle`耗费时间是否超时，如果超过就退出此函数。
+超时时间`timelimit`计算如下：
+```c
+// ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC = 25
+// 1000000 表示 1s
+timelimit = 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
+```
+`timelimit`结果表示`activeExpireCycle`函数执行时间占`CPU`时间`25%`，也就是每秒里面函数`activeExpireCycle`执行时间最多`1000000/25/100`微妙，
+每秒钟函数`activeExpireCycle`执行`server.hz`次，所以每次`activeExpireCycle`执行时间就是`timelimit`值。
+
+如果因为超时退出，下次调用`activeExpireCycle`会接着从上次位置继续执行，直到把所有数据库过期键删除。
 
 ### 开启事件循环
+在`initServer`最后会启动事件循环。通过调用`aeMain`函数实现：
+```c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        if (eventLoop->beforesleep != NULL)
+            eventLoop->beforesleep(eventLoop);
+        // 事件处理函数
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|AE_CALL_AFTER_SLEEP);
+    }
+}
+```
+事件循环主要做两件事：
++ 处理事件之前执行`eventLoop->beforesleep`函数；
++ 执行处理事件函数；
+
+先看下处理事件函数`aeProcessEvents`实现，`aeProcessEvents`函数定义如下：
+```c
+/* Process every pending time event, then every pending file event
+ * (that may be registered by time event callbacks just processed).
+ * Without special flags the function sleeps until some file event
+ * fires, or when the next time event occurs (if any).
+ *
+ * If flags is 0, the function does nothing and returns.
+ * if flags has AE_ALL_EVENTS set, all the kind of events are processed.
+ * if flags has AE_FILE_EVENTS set, file events are processed.
+ * if flags has AE_TIME_EVENTS set, time events are processed.
+ * if flags has AE_DONT_WAIT set the function returns ASAP until all
+ * if flags has AE_CALL_AFTER_SLEEP set, the aftersleep callback is called.
+ * the events that's possible to process without to wait are processed.
+ *
+ * The function returns the number of events processed. */
+int aeProcessEvents(aeEventLoop *eventLoop, int flags);
+```
+`aeProcessEvents`函数主要完成以下功能：
++ 如果`flags`既不包括时间事件，也不包括文件事件，则直接返回：
+  ```c
+  /* Nothing to do? return ASAP */
+  if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
+  ```
++ 如果注册了文件事件，为了在调用`epoll_wait`阻塞期间可以执行到期的定时任务，函数在调用`aeApiPoll`之前会先遍历时间事件列表，
+查找最早发生的时间事件，以此计算得到`aeApiPoll`函数的超时时间，具体实现如下：
+  ```c
+  // eventLoop->maxfd != -1 说明已经注册过文件事件
+  if (eventLoop->maxfd != -1 ||
+      ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
+      int j;
+      aeTimeEvent *shortest = NULL;
+      struct timeval tv, *tvp;
+
+      if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+          // 查找最早发生的时间事件
+          shortest = aeSearchNearestTimer(eventLoop);
+      if (shortest) {
+          long now_sec, now_ms;
+
+          aeGetTime(&now_sec, &now_ms);
+          tvp = &tv;
+
+          long long ms =
+              (shortest->when_sec - now_sec)*1000 +
+              shortest->when_ms - now_ms;
+          // 设置 aeApiPoll 函数的超时时间
+          if (ms > 0) {
+              // 当前没有到期的时间事件
+              tvp->tv_sec = ms/1000;
+              tvp->tv_usec = (ms % 1000)*1000;
+          } else {
+              // 当前有到期的时间事件
+              tvp->tv_sec = 0;
+              tvp->tv_usec = 0;
+          }
+      } else {
+          // 没有时间事件，也就是时间事件的链表为空
+          if (flags & AE_DONT_WAIT) {
+              tv.tv_sec = tv.tv_usec = 0;
+              tvp = &tv;
+          } else {
+              /* Otherwise we can block */
+              tvp = NULL; /* wait forever */
+          }
+      }
+      // 内部会调用 epoll_wait 获取发生的事件，将发生的事件存放在 eventLoop->fires 字典
+      numevents = aeApiPoll(eventLoop, tvp);
+
+      /* After sleep callback. */
+      // 有事件触发，调用注册的 aftersleep 函数
+      if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP)
+          eventLoop->aftersleep(eventLoop);
+      // 处理发生的文件事件
+      for (j = 0; j < numevents; j++) {
+          // 已注册的文件事件
+          aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
+          // 触发的文件事件类型
+          int mask = eventLoop->fired[j].mask;
+          // 触发的文件事件描述符
+          int fd = eventLoop->fired[j].fd;
+          int fired = 0; /* Number of events fired for current fd. */
+          // 正常情况下是先处理读事件，然后处理写事件；如果设置 AE_BARRIER 类型，
+          // 则先处理写事件，然后处理读事件（AE_BARRIER 含义详细介绍在下面命令处理章节说明）
+          int invert = fe->mask & AE_BARRIER;
+          // 处理读事件
+          if (!invert && fe->mask & mask & AE_READABLE) {
+              fe->rfileProc(eventLoop,fd,fe->clientData,mask);
+              fired++;
+          }
+          // 处理写事件
+          if (fe->mask & mask & AE_WRITABLE) {
+              if (!fired || fe->wfileProc != fe->rfileProc) {
+                  fe->wfileProc(eventLoop,fd,fe->clientData,mask);
+                  fired++;
+              }
+          }
+          // 设置了 invert，这里开始处理读事件，因为写事件前面处理了
+          if (invert && fe->mask & mask & AE_READABLE) {
+              if (!fired || fe->wfileProc != fe->rfileProc) {
+                  fe->rfileProc(eventLoop,fd,fe->clientData,mask);
+                  fired++;
+              }
+          }
+          // 已经处理的事件个数
+          processed++;
+      }
+  }
+  ```
+  其中查找最早发生的时间事件函数`aeSearchNearestTimer`实现如下，通过遍历时间事件链表，查找到期事件最小的节点：
+  ```c
+  static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
+  {
+      aeTimeEvent *te = eventLoop->timeEventHead;
+      aeTimeEvent *nearest = NULL;
+  
+      while(te) {
+          if (!nearest || te->when_sec < nearest->when_sec ||
+                  (te->when_sec == nearest->when_sec &&
+                   te->when_ms < nearest->when_ms))
+              nearest = te;
+          te = te->next;
+      }
+      return nearest;
+  }
+  ```
+  等待事件发生的函数`aeApiPoll`实现如下：
+  ```c
+  static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+      // 获取封装的 io 多路复用对象，对于 linux 系统就是 epoll
+      aeApiState *state = eventLoop->apidata;
+      int retval, numevents = 0;
+  
+      retval = epoll_wait(state->epfd,state->events,eventLoop->setsize,
+              tvp ? (tvp->tv_sec*1000 + tvp->tv_usec/1000) : -1);
+      // 将发生的事件存放在 eventLoop->fired 字典
+      if (retval > 0) {
+          int j;
+  
+          numevents = retval;
+          for (j = 0; j < numevents; j++) {
+              int mask = 0;
+              struct epoll_event *e = state->events+j;
+  
+              if (e->events & EPOLLIN) mask |= AE_READABLE;
+              if (e->events & EPOLLOUT) mask |= AE_WRITABLE;
+              if (e->events & EPOLLERR) mask |= AE_WRITABLE;
+              if (e->events & EPOLLHUP) mask |= AE_WRITABLE;
+              eventLoop->fired[j].fd = e->data.fd;
+              eventLoop->fired[j].mask = mask;
+          }
+      }
+      // 返回发生事件个数
+      return numevents;
+  }
+  ```
++ 如果`flags`包含了时间事件标志，调用`processTimeEvents`函数处理时间事件，函数`processTimeEvents`实现如下：
+  ```c
+  static int processTimeEvents(aeEventLoop *eventLoop) {
+      int processed = 0;
+      aeTimeEvent *te;
+      long long maxId;
+      time_t now = time(NULL);
+      // 如果系统时间被修改过，更新所有时间事件节点到期时间为0，这样所有的时间事件都会认为到期，在下面都会执行一次
+      if (now < eventLoop->lastTime) {
+          te = eventLoop->timeEventHead;
+          while(te) {
+              te->when_sec = 0;
+              te = te->next;
+          }
+      }
+      eventLoop->lastTime = now;
+  
+      te = eventLoop->timeEventHead;
+      maxId = eventLoop->timeEventNextId-1;
+      while(te) {
+          long now_sec, now_ms;
+          long long id;
+  
+          /* Remove events scheduled for deletion. */
+          // 在链表中删除当前时间事件节点
+          if (te->id == AE_DELETED_EVENT_ID) {
+              aeTimeEvent *next = te->next;
+              if (te->prev)
+                  te->prev->next = te->next;
+              else
+                  eventLoop->timeEventHead = te->next;
+              if (te->next)
+                  te->next->prev = te->prev;
+              if (te->finalizerProc)
+                  // 调用 finalizerProc 函数
+                  te->finalizerProc(eventLoop, te->clientData);
+              zfree(te);
+              te = next;
+              continue;
+          }
+          // 确保在函数执行期间创建的时间事件不会执行
+          if (te->id > maxId) {
+              te = te->next;
+              continue;
+          }
+          aeGetTime(&now_sec, &now_ms);
+          if (now_sec > te->when_sec ||
+              (now_sec == te->when_sec && now_ms >= te->when_ms))
+          {
+              int retval;
+  
+              id = te->id;
+              // 当前的时间事件到期，执行 timeProc 函数，retval 返回是函数 timeProc 处理周期
+              retval = te->timeProc(eventLoop, id, te->clientData);
+              processed++;
+              if (retval != AE_NOMORE) {
+                  // 更新当前时间事件下次到期时间
+                  aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+              } else {
+                  te->id = AE_DELETED_EVENT_ID;
+              }
+          }
+          te = te->next;
+      }
+      return processed;
+  }
+  ```
+  `processTimeEvents`函数主要完成以下工作：
+  + 针对时间异常，例如系统时间被修改小于次函数上次执行时间，则将链表中所有时间事件到期时间设置为`0`，这样所有的时间事件都会认为到期被执行；
+  + 如果时间事件节点需要删除，从链表删除，并执行对应的`finalizerProc`函数；
+  + 确保在此函数执行期间注册的时间事件不会执行，直接跳过；
+  + 遍历链表，查找到期时间事件，执行注册的`timeProc`函数，并更新此时间事件下次到期时间；
+
+最后看下`eventLoop->beforesleep`函数。在每次事件循环中，`eventLoop->beforesleep`函数在处理事件函数`aeProcessEvents`执行前被调用。
+`eventLoop->beforesleep`函数主要做一些不耗时操作，例如集群相关操作，快速过期键删除，给客户端回复数据等。下面以快速过期键删除为例进行简单说明：
+```c
+void beforeSleep(struct aeEventLoop *eventLoop) {
+    ...
+    if (server.active_expire_enabled && server.masterhost == NULL)
+        activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+    ...
+}
+```
+`server.masterhost`字段存储当前`redis`服务器的`master`服务器的域名，如果为`NULL`说明当前服务器不是某个`redis`服务器的`slaver`。
+`redis`过期键删除有两种策略：
++ 在访问数据库键时，会先检查键是否过期，如果过期则删除；
++ 周期性删除，在`eventLoop->beforesleep`和`serverCron`函数都会执行；
+
+快速过期键删除也是调用`activeExpireCycle`函数，参数传`ACTIVE_EXPIRE_CYCLE_FAST`，下面是部分样例代码实现：
+```c
+void activeExpireCycle(int type) {
+    /* This function has some global state in order to continue the work
+     * incrementally across calls. */
+    static unsigned int current_db = 0; /* Last DB tested. */
+    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
+    ...
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        /* Don't start a fast cycle if the previous cycle did not exit
+         * for time limit. Also don't repeat a fast cycle for the same period
+         * as the fast cycle total duration itself. */
+        if (!timelimit_exit) return;
+        // ACTIVE_EXPIRE_CYCLE_FAST_DURATION = 1000
+        if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+        last_fast_cycle = start;
+    }
+    ...
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
+    ...
+}
+```
+快速过期键删除有以下限制：
++ 如果上次执行函数`activeExpireCycle`没有遇到超时退出，直接返回；因为`timelimit_exit`变量是静态变量，会保留上次结果；
+  ```c
+  if (!timelimit_exit) return;
+  ```
++ 上次执行快速过期键删除的时间距离当前时间小于`2000`微秒时直接返回；也是利用`last_fast_cycle`变量是静态变量；
+  ```c
+  // ACTIVE_EXPIRE_CYCLE_FAST_DURATION = 1000
+  if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+  last_fast_cycle = start;
+  ```
++ 设置函数`activeExpireCycle`执行的时间限制为`1000`微妙；
+  ```c
+  if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+      timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
+  ```
 
 ## 命令处理流程
+`redis`使用自定义的命令请求协议。
