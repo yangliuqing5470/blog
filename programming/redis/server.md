@@ -1351,4 +1351,14 @@ void activeExpireCycle(int type) {
   ```
 
 ## 命令处理流程
-`redis`使用自定义的命令请求协议。
+`redis`使用自定义的命令请求协议。例如客户端输入如下命令：
+```bash
+SET redis-key value1
+```
+客户端会转为下面格式发送给服务端：
+```bash
+*3\r\n$3\r\nSET\r\n$9\r\nredis-key\r\n$6\r\nvalue1\r\n
+```
+其中`\r\n`用于区分命令请求各个参数；`*3`表示该命令请求有三个参数；`$3`、`$9`和`$6`表示该参数字符串长度。
+服务端收到客户端命令请求后，会调用`readQueryFromClient`事件处理函数将接收的命令请求存放在客户端对象的`querybuf`输入缓存中。
+然后调用`processInputBuffer`函数解析命令。
