@@ -1351,6 +1351,7 @@ void activeExpireCycle(int type) {
   ```
 
 ## 命令处理流程
+### 命令解析与处理
 `redis`使用自定义的命令请求协议。例如客户端输入如下命令：
 ```bash
 SET redis-key value1
@@ -1360,5 +1361,215 @@ SET redis-key value1
 *3\r\n$3\r\nSET\r\n$9\r\nredis-key\r\n$6\r\nvalue1\r\n
 ```
 其中`\r\n`用于区分命令请求各个参数；`*3`表示该命令请求有三个参数；`$3`、`$9`和`$6`表示该参数字符串长度。
+
 服务端收到客户端命令请求后，会调用`readQueryFromClient`事件处理函数将接收的命令请求存放在客户端对象的`querybuf`输入缓存中。
-然后调用`processInputBuffer`函数解析命令。
+然后调用`processInputBuffer`函数解析命令。最终解析的命令及参数会存放在客户端对象`client->argc`和`client->argv`参数中。
+
+服务端解析完客户端请求命令后，会调用`processCommand`函数处理命令。`processCommand`首先进行请求命令的各种校验，例如：
++ 如果是`quit`命令，直接返回并关闭客户端对象；
+  ```c
+  if (!strcasecmp(c->argv[0]->ptr,"quit")) {
+      addReply(c,shared.ok);
+      c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+      return C_ERR;
+  }
+  ```
++ 查找命令，如果请求的命令不存在，则响应错误并返回；
+  ```c
+  c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+  if (!c->cmd) {
+      flagTransaction(c);
+      sds args = sdsempty();
+      int i;
+      for (i=1; i < c->argc && sdslen(args) < 128; i++)
+          args = sdscatprintf(args, "`%.*s`, ", 128-(int)sdslen(args), (char*)c->argv[i]->ptr);
+      addReplyErrorFormat(c,"unknown command `%s`, with args beginning with: %s",
+          (char*)c->argv[0]->ptr, args);
+      sdsfree(args);
+      return C_OK;
+  }
+  ```
+  其中查找命令`lookupCommand`主要就是查找`server.commands`字典，实现如下：
+  ```c
+  struct redisCommand *lookupCommand(sds name) {
+      return dictFetchValue(server.commands, name);
+  }
+  ```
++ 校验命令的请求参数，校验失败响应错误并返回；
+  ```c
+  else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
+             (c->argc < -c->cmd->arity)) {
+      flagTransaction(c);
+      addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
+          c->cmd->name);
+      return C_OK;
+  }
+  ```
+  其中`c->cmd->arity`表示命令参数个数，用于校验命令请求格式是否正确。如果`arity < 0`，则命令的参数个数不能超过`(-1) * arity`；
+  如果`arity > 0`，则命令的参数个数必须等于`arity`；命令的本身也是一个参数。
++ 身份校验，如果配置文件用`requirepass`指定了密码且客户端没有通过`AUTH`命令认证，则响应错误并返回；
+  ```c
+  /* Check if the user is authenticated */
+  if (server.requirepass && !c->authenticated && c->cmd->proc != authCommand)
+  {
+      flagTransaction(c);
+      addReply(c,shared.noautherr);
+      return C_OK;
+  }
+  ```
++ 还包括内存`OOM`（配置了最大内存），集群相关，持久化相关，主从复制相关，发布订阅相关，事务等相关校验；
+
+当校验都通过后，会开始执行命令：
+```c
+call(c,CMD_CALL_FULL);
+c->woff = server.master_repl_offset;
+if (listLength(server.ready_keys))
+    handleClientsBlockedOnKeys();
+```
+执行命令的核心是`call`函数，其中执行命令相关操作如下：
+```c
+/* Call the command. */
+dirty = server.dirty;
+updateCachedTime(0);
+start = server.ustime;
+// 调用命令处理函数
+c->cmd->proc(c);
+duration = ustime()-start;
+dirty = server.dirty-dirty;
+if (dirty < 0) dirty = 0;
+```
+执行命令`call`函数除了调用具有的命令处理函数，还会涉及更新统计信息，更新慢查询日志，命令传播，`AOF`请求持久化等操作。
+
+### 命令请求回复
+`redis`响应命令回复类型有如下几种，客户端可以根据返回结果第一个字符判断响应类型：
++ 状态回复，第一个字符是`+`；
+  ```c
+  addReply(c,shared.ok);
+  shared.ok = createObject(OBJ_STRING,sdsnew("+OK\r\n"));
+  ```
++ 错误回复，第一个字符是`-`；例如当请求命令不存在，执行如下调用：
+  ```c
+  addReplyErrorFormat(c,"unknown command `%s`, with args beginning with: %s", (char*)c->argv[0]->ptr, args);
+  // 在 addReplyErrorFormat 内部会拼接回复字符串
+  if (!len || s[0] != '-') addReplyString(c,"-ERR ",5);
+  addReplyString(c,s,len);
+  addReplyString(c,"\r\n",2);
+  ```
++ 整数回复，第一个字符是`:`；例如执行`incr`命令后，成功会调用如下回复函数：
+  ```c
+  // shared.colon = createObject(OBJ_STRING,sdsnew(":"));
+  addReply(c,shared.colon);
+  // new 是更新后的 value 对象
+  addReply(c,new);
+  // createObject(OBJ_STRING,sdsnew("\r\n"));
+  addReply(c,shared.crlf);
+  ```
++ 批量回复，第一个字符是`$`；例如执行`GET`命令后，成功会调用如下函数：
+  ```c
+  /* Add a Redis Object as a bulk reply */
+  void addReplyBulk(client *c, robj *obj) {
+      // 计算返回对象 obj 的长度，拼接为字符串`${len}\r\n`
+      addReplyBulkLen(c,obj);
+      // obj 是查询的 value 值
+      addReply(c,obj);
+      // createObject(OBJ_STRING,sdsnew("\r\n"));
+      addReply(c,shared.crlf);
+  }
+  ```
++ 多批量回复，第一个字符是`*`；例如执行`LRANGE`命令，返回多个值，例如`*2\r\n$6\r\nvalue1\r\n$6\r\nvalue2\r\n`，
+其中`*2`表示有两个返回值，`$6`表示当前返回值字符串长度；
+
+命令执行结果的回复，都是通过调用`addReply`类似函数完成，`addReply`函数并不是直接调用`socket`相关`API`将结果回复给客户端，
+而是将回复结果存放在客户端对象`client`的输出缓存`client->buf`或者输出列表`client->reply`中。`addReply`函数实现如下：
+```c
+void addReply(client *c, robj *obj) {
+    if (prepareClientToWrite(c) != C_OK) return;
+
+    if (sdsEncodedObject(obj)) {
+        if (_addReplyToBuffer(c,obj->ptr,sdslen(obj->ptr)) != C_OK)
+            _addReplyStringToList(c,obj->ptr,sdslen(obj->ptr));
+    } else if (obj->encoding == OBJ_ENCODING_INT) {
+        /* For integer encoded strings we just convert it into a string
+         * using our optimized function, and attach the resulting string
+         * to the output buffer. */
+        char buf[32];
+        size_t len = ll2string(buf,sizeof(buf),(long)obj->ptr);
+        if (_addReplyToBuffer(c,buf,len) != C_OK)
+            _addReplyStringToList(c,buf,len);
+    } else {
+        serverPanic("Wrong obj->encoding in addReply()");
+    }
+}
+```
++ 首先，`addReply`函数会调用`prepareClientToWrite`函数，根据需要将此客户端对象添加到服务对象`server.clients_pending_write`链表中，
+以用于事件循环中`beforesleep`函数遍历`server.clients_pending_write`链表中每一个客户端，发送输出缓存区或输出链表数据；实现如下：
+  ```c
+  int prepareClientToWrite(client *c) {
+      // 各种条件检查校验
+      ...
+      if (!clientHasPendingReplies(c)) clientInstallWriteHandler(c);
+
+      /* Authorize the caller to queue in the output buffer of this client. */
+      return C_OK;
+  }
+  ```
+  `clientHasPendingReplies`函数会判断当前客户端对象输出缓存或输出链表是否有需要回复的数据，如果没有则调用`clientInstallWriteHandler`函数，
+  将此客户端对象添加到`server.clients_pending_write`链表中，相关实现如下：
+  ```c
+  int clientHasPendingReplies(client *c) {
+      return c->bufpos || listLength(c->reply);
+  }
+
+  void clientInstallWriteHandler(client *c) {
+      if (!(c->flags & CLIENT_PENDING_WRITE) &&
+          (c->replstate == REPL_STATE_NONE ||
+           (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack)))
+      {
+          c->flags |= CLIENT_PENDING_WRITE;
+          listAddNodeHead(server.clients_pending_write,c);
+      }
+  }
+  ```
++ 然后`addReply`会先调用`_addReplyToBuffer`函数尝试将要回复的数据添加到输出缓存`buf`中，如果添加失败，会调用`_addReplyStringToList`函数继续添加到输出链表`reply`中；
+
+要回复的数据添加到对应客户端对象的输出缓存`buf`或者输出链表`reply`中，那什么时候会执行实际的发送呢？答案就是在前面讲解开启事件循环小节介绍的`event->beforesleep`函数。
+`event->beforesleep`函数内会调用`handleClientsWithPendingWrites`函数，`handleClientsWithPendingWrites`函数会遍历`server.clients_pending_write`链表中每一个客户端，
+将输出缓存`buf`或输出链表`reply`数据发送给对应客户端；
+```c
+int handleClientsWithPendingWrites(void) {
+    listIter li;
+    listNode *ln;
+    int processed = listLength(server.clients_pending_write);
+
+    listRewind(server.clients_pending_write,&li);
+    // 开始遍历每一个客户端
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        c->flags &= ~CLIENT_PENDING_WRITE;
+        listDelNode(server.clients_pending_write,ln);
+
+        /* If a client is protected, don't do anything,
+         * that may trigger write error or recreate handler. */
+        if (c->flags & CLIENT_PROTECTED) continue;
+
+        /* Try to write buffers to the client socket. */
+        if (writeToClient(c->fd,c,0) == C_ERR) continue;
+        // 如果当前客户端数据每发送完
+        if (clientHasPendingReplies(c)) {
+            int ae_flags = AE_WRITABLE;
+            if (server.aof_state == AOF_ON &&
+                server.aof_fsync == AOF_FSYNC_ALWAYS)
+            {
+                ae_flags |= AE_BARRIER;
+            }
+            // 注册可写文件事件，事件触发函数是 sendReplyToClient
+            if (aeCreateFileEvent(server.el, c->fd, ae_flags,
+                sendReplyToClient, c) == AE_ERR)
+            {
+                    freeClientAsync(c);
+            }
+        }
+    }
+    return processed;
+}
+```
