@@ -114,7 +114,7 @@ typedef struct redisObject {
       val->lru = (LFUGetTimeInMinutes()<<8) | counter;
   }
   ```
-  如果是`LFU`测试，则`lru`低`8`位更新为频率值，高`16`位为对象上次访问时间，以分支为单位。需要注意的是，是通过`LFUDecrAndReturn`函数获取对象访问频率，
+  如果是`LFU`策略，则`lru`低`8`位更新为频率值，高`16`位为对象上次访问时间，以分钟单位。需要注意的是，是通过`LFUDecrAndReturn`函数获取对象访问频率，
   并在此基础上累积，原因是因为越老的数据一般被访问次数越大，越新的数据被访问次数越少，即使老的数据很久没被访问，这是不公平的。所以，
   `LFUDecrAndReturn`函数实现了访问次数随时间衰减的过程；
 + `refcount`：当前对象的引用次数，用于对象的共享；共享对象时，`refcount`值加`1`；删除对象时，`refcount`值减`1`；当`refcount`值为`0`时，
