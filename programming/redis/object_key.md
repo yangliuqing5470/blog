@@ -2,7 +2,7 @@
 
 `redis`对象`redisObject`和数据库`redisDb`的定义及介绍参考[redis服务启动](./server.md)的数据结构定义小节。
 # redis键对象
-# 查看键属性
+## 查看键属性
 **命令`object`** 用于查看`redis`对象的属性，命令格式如下：
 ```bash
 object subcommand <key>
@@ -201,3 +201,70 @@ void ttlGenericCommand(client *c, int output_ms) {
 EXPIRE <key> <seconds>
 ```
 类似的命令还有`expireat`、`pexpire`和`pexpireat`，区别是参数的单位（秒或者毫秒）或时间（相对时间还是绝对时间）。
+键设置过期时间相关源码如下：
+```c
+/* EXPIRE key seconds */
+void expireCommand(client *c) {
+    expireGenericCommand(c,mstime(),UNIT_SECONDS);
+}
+
+/* EXPIREAT key time */
+void expireatCommand(client *c) {
+    expireGenericCommand(c,0,UNIT_SECONDS);
+}
+
+/* PEXPIRE key milliseconds */
+void pexpireCommand(client *c) {
+    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
+}
+
+/* PEXPIREAT key ms_time */
+void pexpireatCommand(client *c) {
+    expireGenericCommand(c,0,UNIT_MILLISECONDS);
+}
+```
+键过期的底层调用都是`expireGenericCommand`函数，其实现如下：
+```c
+void expireGenericCommand(client *c, long long basetime, int unit) {
+    robj *key = c->argv[1], *param = c->argv[2];
+    long long when; /* unix time in milliseconds when the key will expire. */
+    // 获取参数 param 指定的过期时间值存在 when，转为 long long 类型
+    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
+        return;
+    // 更新过期时间点 when，统一转为毫秒
+    if (unit == UNIT_SECONDS) when *= 1000;
+    when += basetime;
+
+    // key 不存在，返回 0
+    if (lookupKeyWrite(c->db,key) == NULL) {
+        addReply(c,shared.czero);
+        return;
+    }
+
+    if (when <= mstime() && !server.loading && !server.masterhost) {
+        robj *aux;
+
+        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
+                                                    dbSyncDelete(c->db,key);
+        serverAssertWithInfo(c,key,deleted);
+        server.dirty++;
+
+        /* Replicate/AOF this as an explicit DEL or UNLINK. */
+        aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
+        rewriteClientCommandVector(c,2,aux,key);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+        addReply(c, shared.cone);
+        return;
+    } else {
+        // 在过期字典 expires 插入键 key，值是 when
+        setExpire(c,c->db,key,when);
+        // 回复 1
+        addReply(c,shared.cone);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
+        server.dirty++;
+        return;
+    }
+}
+```

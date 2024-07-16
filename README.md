@@ -44,6 +44,7 @@
 - [redis数据结构-rax树](./programming/redis/rax.md)
 - [redis数据结构-stream](./programming/redis/stream.md)
 - [redis服务启动](./programming/redis/server.md)
+- [redis对象-键](./programming/redis/object_key.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
