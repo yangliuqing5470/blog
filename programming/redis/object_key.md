@@ -428,10 +428,11 @@ void keysCommand(client *c) {
 ```bash
 SCAN cursor [MATCH pattern] [COUNT count]
 ```
-类似的命令还有`hscan`和`sscan`。
-+ `cursor`：
-+ `MATCH`：
-+ `COUNT`：
+类似的命令还有`hscan`（迭代哈希键中的键值对）、`sscan`（迭代集合键中的元素）和`zscan`（迭代有序集合中的元素，包括元素成员和元素分值）。
++ `cursor`：命令每次被调用之后，都会向用户返回一个新的游标，用户在下次迭代时需要使用这个新游标作为命令的游标参数，以此来延续之前的迭代过程。
+游标参数被设置为`0`时，服务器将开始一次新的迭代，而当服务器向用户返回值为`0`的游标时，表示迭代已结束；
++ `MATCH`：匹配模式，用于正则匹配；
++ `COUNT`：指定每次调用返回元素个数最大值，只针对哈希编码或者跳跃表编码实现的对象有效，其他编码会忽略这个值；
 
 `scan`命令，包括`hscan`和`sscan`命令底层都是调用`scanGenericCommand`函数，`scanGenericCommand`函数执行逻辑主要有四步：
 + 解析命令参数；
@@ -490,6 +491,7 @@ SCAN cursor [MATCH pattern] [COUNT count]
   ```c
   void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
       ...
+      // 参数 o 不存在或者参数对象 o 底层编码是 OBJ_ENCODING_HT/OBJ_ENCODING_SKIPLIST 时才会更新 ht（哈希表）
       ht = NULL;
       if (o == NULL) {
           ht = c->db->dict;
@@ -505,31 +507,32 @@ SCAN cursor [MATCH pattern] [COUNT count]
       }
 
       if (ht) {
+          // privdata 参数是 scanCallback 函数的参数
           void *privdata[2];
-          /* We set the max number of iterations to ten times the specified
-           * COUNT, so if the hash table is in a pathological state (very
-           * sparsely populated) we avoid to block too much time at the cost
-           * of returning no or very few elements. */
+          // 设置迭代次数为 10*count，避免稀疏的哈希表一次返回元素太少而导致阻塞多次查找
           long maxiterations = count*10;
-
-          /* We pass two pointers to the callback: the list to which it will
-           * add new elements, and the object containing the dictionary so that
-           * it is possible to fetch more data in a type-dependent way. */
           privdata[0] = keys;
           privdata[1] = o;
           do {
+              // dictScan 逻辑很有意思，可以单独查看学习，每次都返回一个游标，给下次调用，
+              // 返回游标为 0 表示整个数据库遍历完成。
+              // 遍历到元素后在dictScan内部都会调用 scanCallback 函数，将元素对象添加到 keys 链表中
               cursor = dictScan(ht, cursor, scanCallback, NULL, privdata);
           } while (cursor &&
                 maxiterations-- &&
+                // 确保一次查找的元素个数不超过 count
                 listLength(keys) < (unsigned long)count);
       } else if (o->type == OBJ_SET) {
+          // 走到这里说明对象 o 的底层存储是整数集合，一次查找整数集合中所有元素
           int pos = 0;
           int64_t ll;
 
           while(intsetGet(o->ptr,pos++,&ll))
               listAddNodeTail(keys,createStringObjectFromLongLong(ll));
+          // 设置游标为 0 表示查找结束
           cursor = 0;
       } else if (o->type == OBJ_HASH || o->type == OBJ_ZSET) {
+          // 走到这里说明对象 o 的底层存储是压缩列表，一次查找压缩列表中所有元素
           unsigned char *p = ziplistIndex(o->ptr,0);
           unsigned char *vstr;
           unsigned int vlen;
@@ -542,10 +545,468 @@ SCAN cursor [MATCH pattern] [COUNT count]
                                    createStringObjectFromLongLong(vll));
               p = ziplistNext(o->ptr,p);
           }
+          // 设置游标为 0 表示查找结束
           cursor = 0;
       } else {
           serverPanic("Not handled encoding in SCAN.");
       }
       ...
   }
+  ```
+  如果需要遍历的对象是哈希表，则调用`dictScan`函数时，会将查找存在的每一个元素都调用`scanCallback`函数，将元素添加到链表`keys`中，
+  `scanCallback`函数实现如下：
+  ```c
+  void scanCallback(void *privdata, const dictEntry *de) {
+      void **pd = (void**) privdata;
+      // 存储元素的链表
+      list *keys = pd[0];
+      // 调用 scanGenericCommand 的参数 o 对象
+      robj *o = pd[1];
+      robj *key, *val = NULL;
+
+      if (o == NULL) {
+          // 只查找 key
+          sds sdskey = dictGetKey(de);
+          key = createStringObject(sdskey, sdslen(sdskey));
+      } else if (o->type == OBJ_SET) {
+          // 只查找 key
+          sds keysds = dictGetKey(de);
+          key = createStringObject(keysds,sdslen(keysds));
+      } else if (o->type == OBJ_HASH) {
+          // 查找 key value
+          sds sdskey = dictGetKey(de);
+          sds sdsval = dictGetVal(de);
+          key = createStringObject(sdskey,sdslen(sdskey));
+          val = createStringObject(sdsval,sdslen(sdsval));
+      } else if (o->type == OBJ_ZSET) {
+          // 查找 key value
+          sds sdskey = dictGetKey(de);
+          key = createStringObject(sdskey,sdslen(sdskey));
+          // val 表示 score 值
+          val = createStringObjectFromLongDouble(*(double*)dictGetVal(de),0);
+      } else {
+          serverPanic("Type not handled in SCAN callback.");
+      }
+
+      listAddNodeTail(keys, key);
+      if (val) listAddNodeTail(keys, val);
+  }
+  ```
+  如果查找是`key`和`value`，会将`key`和`value`作为两个节点元素存放在链表`keys`中。
++ 过滤元素；
+  ```c
+  void scanCallback(void *privdata, const dictEntry *de) {
+      ...
+      /* Step 3: Filter elements. */
+      node = listFirst(keys);
+      while (node) {
+          robj *kobj = listNodeValue(node);
+          nextnode = listNextNode(node);
+          // 表示当前节点元素是否需要过滤，0表示不需要，1表示需要
+          int filter = 0;
+          // 如果需要模式匹配，排除 keys 列表中不匹配的节点
+          if (!filter && use_pattern) {
+              if (sdsEncodedObject(kobj)) {
+                  // 节点元素是字符串编码
+                  if (!stringmatchlen(pat, patlen, kobj->ptr, sdslen(kobj->ptr), 0))
+                      filter = 1;
+              } else {
+                  // 整数编码
+                  char buf[LONG_STR_SIZE];
+                  int len;
+                  serverAssert(kobj->encoding == OBJ_ENCODING_INT);
+                  len = ll2string(buf,sizeof(buf),(long)kobj->ptr);
+                  if (!stringmatchlen(pat, patlen, buf, len, 0)) filter = 1;
+              }
+          }
+
+          /* Filter element if it is an expired key. */
+          if (!filter && o == NULL && expireIfNeeded(c->db, kobj)) filter = 1;
+
+          /* Remove the element and its associted value if needed. */
+          if (filter) {
+              decrRefCount(kobj);
+              listDelNode(keys, node);
+          }
+          // 如果参数对象 o 是有序集合或者哈希表，列表keys中存储是 key 和 value，下次迭代需要跳过 value
+          if (o && (o->type == OBJ_ZSET || o->type == OBJ_HASH)) {
+              node = nextnode;
+              nextnode = listNextNode(node);
+              if (filter) {
+                  kobj = listNodeValue(node);
+                  decrRefCount(kobj);
+                  listDelNode(keys, node);
+              }
+          }
+          node = nextnode;
+      }
+  }
+  ```
+  排除列表`keys`中过期或者模式不匹配的元素节点。
++ 回复客户端；
+  ```c
+  void scanCallback(void *privdata, const dictEntry *de) {
+      ...
+      /* Step 4: Reply to the client. */
+      addReplyMultiBulkLen(c, 2);
+      addReplyBulkLongLong(c,cursor);
+
+      addReplyMultiBulkLen(c, listLength(keys));
+      while ((node = listFirst(keys)) != NULL) {
+          robj *kobj = listNodeValue(node);
+          addReplyBulk(c, kobj);
+          decrRefCount(kobj);
+          listDelNode(keys, node);
+      }
+  }
+  ```
+
+**命令`randomkey`** 用于从当前数据库中随机返回(不删除)一个未过期的`key`。命令格式如下：
+```bash
+RANDOMKEY
+```
+`randomkey`命令相关源码实现如下：
+```c
+void randomkeyCommand(client *c) {
+    robj *key;
+    // 随机查找一个不过期的 key
+    if ((key = dbRandomKey(c->db)) == NULL) {
+        addReply(c,shared.nullbulk);
+        return;
+    }
+    // 回复给客户端
+    addReplyBulk(c,key);
+    // 引用计数减 1，如果为 1 则删除对象，因为 key 对象是临时创建的，回复后需要清理
+    decrRefCount(key);
+}
+```
+随机返回一个`key`通过`dbRandomKey`函数实现，其源码如下：
+```c
+robj *dbRandomKey(redisDb *db) {
+    dictEntry *de;
+    // 最大迭代查找次数，针对从节点。因为从节点不会删除过期的key
+    int maxtries = 100;
+    // 表示是否所有的键都设置了过期时间
+    int allvolatile = dictSize(db->dict) == dictSize(db->expires);
+
+    while(1) {
+        sds key;
+        robj *keyobj;
+        // 从数据库随机选择一个 key，
+        // 如果没有在做rehash操作，从ht[0]哈希表选择，如果在rehash操作，ht[0]和ht[1]都会作为目标选择
+        de = dictGetRandomKey(db->dict);
+        if (de == NULL) return NULL;
+
+        key = dictGetKey(de);
+        keyobj = createStringObject(key,sdslen(key));
+        // 判断选择的 key 对象是否在过期字典存在（存在说明 key 设置了过期时间）
+        if (dictFind(db->expires,key)) {
+            if (allvolatile && server.masterhost && --maxtries == 0) {
+                return keyobj;
+            }
+            // 对于主节点，如果键过期，则删除数据库对应的键值对，
+            // 对于从节点，如果键过期，则不会删除
+            if (expireIfNeeded(db,keyobj)) {
+                // 删除临时对象
+                decrRefCount(keyobj);
+                continue; /* search for another key. This expired. */
+            }
+        }
+        return keyobj;
+    }
+}
+```
++ 对于从节点来说，如果整个数据库键都设置了过期时间，且所有键都过期了（或者绝大部分过期），为了避免调用`dbRandomKey`函数陷入死循环，
+增加最大迭代次数`maxtries=100`。
++ 对于主节点来说，遇到过期键，在`expireIfNeeded`函数内部会删除过期键值对，如果过期键比较多，操作执行较慢；
+
+## 键操作
+**命令`del`** 用于同步删除一个或者多个键值对，命令格式如下：
+```bash
+DEL <key1> [<key2> <key3> ...]
+```
+删除类似的命令还有`unlink`，用于异步删除。二者底层都是调用`delGenericCommand`函数，`delGenericCommand`实现如下：
+```c
+void delGenericCommand(client *c, int lazy) {
+    int numdel = 0, j;
+
+    for (j = 1; j < c->argc; j++) {
+        // 从库不会删除过期键，主库会删除过期键
+        expireIfNeeded(c->db,c->argv[j]);
+        int deleted  = lazy ? dbAsyncDelete(c->db,c->argv[j]) :
+                              dbSyncDelete(c->db,c->argv[j]);
+        if (deleted) {
+            // 删除成功，执行键修改通知
+            signalModifiedKey(c->db,c->argv[j]);
+            // 键空间通知，用于发布/订阅模式
+            notifyKeyspaceEvent(NOTIFY_GENERIC,
+                "del",c->argv[j],c->db->id);
+            // 用于统计，记录数据库修改的次数（脏数据指被修改但没有持久化到磁盘）
+            server.dirty++;
+            numdel++;
+        }
+    }
+    // 回复客户端删除成功的数量
+    addReplyLongLong(c,numdel);
+}
+```
+其中同步删除`dbSyncDelete`的实现如下：
+```c
+int dbSyncDelete(redisDb *db, robj *key) {
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+    if (dictDelete(db->dict,key->ptr) == DICT_OK) {
+        // 如果是集群模式，删除槽位和键对应
+        if (server.cluster_enabled) slotToKeyDel(key);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+```
+同步删除会删除过期字典`db->expires`和数据库`db->dict`中指定的键值对。过期字典`db->expires`和数据库`db->dict`中的键都是指向键对象的指针，
+过期字典`db->expires`中删除键不会实际删除键对象，因为在服务启动阶段`initServer`中初始化数据库时候：
+```c
+for (j = 0; j < server.dbnum; j++) {
+    server.db[j].dict = dictCreate(&dbDictType,NULL);
+    server.db[j].expires = dictCreate(&keyptrDictType,NULL);
+    ...
+}
+```
+指定字典对象`type`属性是`keyptrDictType`，其定义如下：
+```c
+/* Db->expires */
+dictType keyptrDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    NULL,                       /* key destructor */
+    NULL                        /* val destructor */
+};
+```
+没有指定键和值对象释放函数。
+
+下面看下异步删除`dbAsyncDelete`的实现：
+```c
+#define LAZYFREE_THRESHOLD 64
+int dbAsyncDelete(redisDb *db, robj *key) {
+    // 先删除过期字典中存在的，这步和同步删除一样
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+    // 惰性删除数据库 dict 中存在的，只是调整指针关系，没有做实际对象删除操作，he 表示要删除对象指针
+    dictEntry *de = dictUnlink(db->dict,key->ptr);
+    if (de) {
+        robj *val = dictGetVal(de);
+        // 如果要删除的值对象是容器类型，例如哈希表，集合，列表等，返回元素个数，否则返回 1
+        size_t free_effort = lazyfreeGetFreeEffort(val);
+        // 如果实际要删除元素个数超过 64，且当前要删除对象没有其他地方引用，走异步删除，也就是删除有后台线程执行
+        if (free_effort > LAZYFREE_THRESHOLD && val->refcount == 1) {
+            atomicIncr(lazyfree_objects,1);
+            // 创建后台任务
+            bioCreateBackgroundJob(BIO_LAZY_FREE,val,NULL,NULL);
+            dictSetVal(db->dict,de,NULL);
+        }
+    }
+
+    if (de) {
+        // 实际开始释放键值对对象，或者只是释放键对象，因为值对象在后台线程删除，已经被设置为 NULL
+        dictFreeUnlinkedEntry(db->dict,de);
+        // 如果是集群模式，删除槽位和键对应
+        if (server.cluster_enabled) slotToKeyDel(key);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+```
+如果要删除的值对象包含太多的元素，对于异步删除会使用后台线程实际处理删除操作，不阻塞当前线程。创建后台删除任务`bioCreateBackgroundJob`实现如下：
+```c
+void bioCreateBackgroundJob(int type, void *arg1, void *arg2, void *arg3) {
+    // 创建一个后台任务 job，设置时间和参数
+    struct bio_job *job = zmalloc(sizeof(*job));
+    job->time = time(NULL);
+    job->arg1 = arg1;
+    job->arg2 = arg2;
+    job->arg3 = arg3;
+    pthread_mutex_lock(&bio_mutex[type]);
+    // 任务添加到列表尾，bio_jobs 是个数组，每个元素是一个双端链表
+    listAddNodeTail(bio_jobs[type],job);
+    bio_pending[type]++;
+    // 通知线程开始处理（条件变量）
+    pthread_cond_signal(&bio_newjob_cond[type]);
+    pthread_mutex_unlock(&bio_mutex[type]);
+}
+```
+`bioCreateBackgroundJob`函数是线程安全的。参数`type`表示异步类型类型，取值有如下三个：
++ `BIO_CLOSE_FILE`
++ `BIO_AOF_FSYNC`
++ `BIO_LAZY_FREE`
+
+在服务启动阶段，`InitServerLast`函数内部会调用`bioInit`函数生成三个异步线程，`bioInit`函数实现如下：
+```c
+/* Initialize the background system, spawning the thread. */
+void bioInit(void) {
+    pthread_attr_t attr;
+    pthread_t thread;
+    size_t stacksize;
+    int j;
+
+    // BIO_NUM_OPS = 3
+    for (j = 0; j < BIO_NUM_OPS; j++) {
+        pthread_mutex_init(&bio_mutex[j],NULL);
+        pthread_cond_init(&bio_newjob_cond[j],NULL);
+        pthread_cond_init(&bio_step_cond[j],NULL);
+        // 初始化链表，用于存放需要异步处理的任务
+        bio_jobs[j] = listCreate();
+        bio_pending[j] = 0;
+    }
+
+    // 设置线程栈大小
+    pthread_attr_init(&attr);
+    pthread_attr_getstacksize(&attr,&stacksize);
+    if (!stacksize) stacksize = 1; /* The world is full of Solaris Fixes */
+    while (stacksize < REDIS_THREAD_STACK_SIZE) stacksize *= 2;
+    pthread_attr_setstacksize(&attr, stacksize);
+    // 创建 BIO_NUM_OPS=3 个后台线程，线程函数是 bioProcessBackgroundJobs
+    for (j = 0; j < BIO_NUM_OPS; j++) {
+        void *arg = (void*)(unsigned long) j;
+        if (pthread_create(&thread,&attr,bioProcessBackgroundJobs,arg) != 0) {
+            serverLog(LL_WARNING,"Fatal: Can't initialize Background Jobs.");
+            exit(1);
+        }
+        bio_threads[j] = thread;
+    }
+}
+```
+创建的异步线程入口函数是`bioProcessBackgroundJobs`，其会从每个`type`类型对应的链表首取出一个要处理的对象进行处理。
+`bioProcessBackgroundJobs`函数是线程安全的，内部涉及锁的获取与释放。
+
+**命令`dump`** 用于将给定`key`对应的值进行序列化，并返回序列化后的数据。命令格式如下：
+```bash
+DUMP key
+```
+序列号后的数据结构如下：
+```bash
+----------------+---------------------+---------------+
+... RDB payload | 2 bytes RDB version | 8 bytes CRC64 |
+----------------+---------------------+---------------+
+```
+`dump`命令使用样例如下：
+```bash
+my-redis:6379> SET my-key "hello world"
+OK
+my-redis:6379> DUMP my-key
+"\x00\x0bhello world\x0b\x00b#\xf4\xca[XI\xbd"
+my-redis:6379> DUMP my
+(nil)
+```
+
+**命令`restore`** 用于反序列化，将反序列化后的结果和给定的`key`关联。命令格式如下：
+```bash
+RESTORE key ttl serialized-value
+```
+其中`ttl`表示以毫秒为单位设置的生存时间，如果`ttl=0`表示不给键`key`设置生存时间。指定的`key`必须是个不存在的新`key`。
+
+**命令`move`** 用于将当前数据库的`key`移动到给定的数据库`db`当中。**命令`migrate`** 用于将`key`原子性地从当前实例传送到目标实例的指定数据库上，一旦传送成功，
+`key`保证会出现在目标实例上，而当前实例上的`key`会被删除。这两个迁移命令这里不做详细结束。
+
+**命令`sort`** 用于返回或保存给定列表、集合、有序集合`key`中经过排序的元素。命令格式如下：
+```bash
+SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA] [STORE destination]
+```
++ 不传任何附加参数，默认以数字排序；
+  ```bash
+  # 创建一个列表 key
+  my-redis:6379> LPUSH test-list "wo"
+  (integer) 1
+  my-redis:6379> LPUSH test-list "men"
+  (integer) 2
+  my-redis:6379> LPUSH test-list "hao"
+  (integer) 3
+  my-redis:6379> LPUSH test-list "li"
+  (integer) 4
+  my-redis:6379> LPUSH test-list "hai"
+  (integer) 5
+  # 默认排序
+  my-redis:6379> SORT test-list
+  (error) ERR One or more scores can't be converted into double
+  ```
+  因为默认以数字排序，不能将值字符串转为浮点数，所以报错。
++ `ALPHA`：对字符串排序；
+  ```bash
+  my-redis:6379> SORT test-list alpha
+  1) "hai"
+  2) "hao"
+  3) "li"
+  4) "men"
+  5) "wo"
+  ```
++ `ASC|DESC`：正序或者倒序排序；
++ `LIMIT`：限制排序返回的元素；
+  ```bash
+  my-redis:6379> RPUSH rank 1 3 5 7 9 2 4 6 8 10
+  (integer) 10
+  my-redis:6379> SORT rank limit 1 5
+  1) "2"
+  2) "3"
+  3) "4"
+  4) "5"
+  5) "6"
+  my-redis:6379> SORT rank limit 2 5
+  1) "3"
+  2) "4"
+  3) "5"
+  4) "6"
+  5) "7"
+  ```
+  其中`offset`参数表示要跳过的元素数量；`count`参数表示跳过`offset`个元素之后，要返回多少个对象。
++ `BY`：使用其他键的值作为权重进行排序，如果其他键不存在则跳过排序，直接返回；例如有如下的数据结构：
+  |uid|user_name_{uid}|user_level_{uid}|
+  |---|---------------|----------------|
+  | 1 | admain | 999 |
+  | 2 | jack | 10 |
+  | 3 | peter | 25 |
+  | 4 | mary | 70 |
+  ```bash
+  my-redis:6379> LPUSH uid 1 2 3 4
+  (integer) 4
+  my-redis:6379> SET user_name_1 admain
+  OK
+  my-redis:6379> SET user_level_1 999
+  OK
+  my-redis:6379> SET user_name_2 jack
+  OK
+  my-redis:6379> SET user_level_2 10
+  OK
+  my-redis:6379> SET user_name_3 peter
+  OK
+  my-redis:6379> SET user_level_3 25
+  OK
+  my-redis:6379> SET user_name_4 mary
+  OK
+  my-redis:6379> SET user_level_4 70
+  OK
+  my-redis:6379> SORT uid by user_level_*
+  1) "2"
+  2) "3"
+  3) "4"
+  4) "1"
+  ```
+  通过`BY`参数指定`user_level_{uid}`列值进行排序。
++ `GET`：根据排序的结果来取出相应的键值；
+  ```bash
+  my-redis:6379> SORT uid by user_level_* get user_name_*
+  1) "jack"
+  2) "peter"
+  3) "mary"
+  4) "admain"
+  ```
++ `STORE`：将排序后的结果保存到指定的键`destination`；
+  ```bash
+  my-redis:6379> SORT uid by user_level_* get user_name_* store new-key
+  (integer) 4
+  my-redis:6379> LRANGE new-key 0 -1
+  1) "jack"
+  2) "peter"
+  3) "mary"
+  4) "admain"
   ```
