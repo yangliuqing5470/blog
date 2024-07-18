@@ -991,7 +991,12 @@ SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC 
   3) "4"
   4) "1"
   ```
-  通过`BY`参数指定`user_level_{uid}`列值进行排序。
+  通过`BY`参数指定`user_level_{uid}`列值进行排序。如果`BY`后面的参数有`*`，则首先获取排序键`uid`包含的元素`1 2 3 4`，然后调用函数
+  ```c
+  robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst);
+  ```
+  将元素值添加到`user_level_*`中`*`位置，组合成键`user_level_1 user_level_2 user_level_3 user_level_4`，查找对应键的值作为排序比较对象。
+  如果`BY`后面的参数没有`*`，则返回结果不会排序，也就是返回原始顺序。
 + `GET`：根据排序的结果来取出相应的键值；
   ```bash
   my-redis:6379> SORT uid by user_level_* get user_name_*
@@ -1000,6 +1005,11 @@ SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC 
   3) "mary"
   4) "admain"
   ```
+  `GET`后面参数`user_name_*`有`*`，处理逻辑和`BY`一样，也是先获取排序键`uid`包含的元素`1 2 3 4`，然后调用
+  ```c
+  robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst);
+  ```
+  将元素值添加到`user_name_*`中`*`位置，组合成键`user_name_1 user_name_2 user_name_3 user_name_4`，查找对应键的值返回。
 + `STORE`：将排序后的结果保存到指定的键`destination`；
   ```bash
   my-redis:6379> SORT uid by user_level_* get user_name_* store new-key
