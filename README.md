@@ -46,6 +46,7 @@
 - [redis服务启动](./programming/redis/server.md)
 - [redis对象-键](./programming/redis/object_key.md)
 - [redis发布-订阅](./programming/redis/pubsub.md)
+- [redis事务](./programming/redis/transaction.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
