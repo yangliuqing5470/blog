@@ -47,6 +47,7 @@
 - [redis对象-键](./programming/redis/object_key.md)
 - [redis发布-订阅](./programming/redis/pubsub.md)
 - [redis事务](./programming/redis/transaction.md)
+- [redis高可用-主从复制](./programming/redis/masterslave.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
