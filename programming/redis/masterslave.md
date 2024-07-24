@@ -284,4 +284,63 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 }
 ```
 首先将从库复制状态设置为`REPL_STATE_SEND_PSYNC`，表示开始往主库发送`PSYNC`命令，开始实际的数据同步。接着`syncWithMaster`函数继续往下执行，
-调用`slaveTryPartialResynchronization`函数向主库发送`PSYNC`命令。
+调用`slaveTryPartialResynchronization`函数向主库发送`PSYNC`命令，最后将从库复制状态设置为`REPL_STATE_RECEIVE_PSYNC`。
+
+从库调用的`slaveTryPartialResynchronization`函数，负责向主库发送数据同步的命令。主库收到命令后，会根据从库发送的主库`ID`、
+复制进度值`offset`，来判断是进行全量复制还是增量复制，或者是返回错误。`slaveTryPartialResynchronization`函数代码如下：
+```c
+int slaveTryPartialResynchronization(int fd, int read_reply) {
+    ...
+    // 给主库发送 PSYNC 命令
+    if (!read_reply) {
+        server.master_initial_offset = -1;
+        ...
+        // 调用 sendSynchronousCommand 发送 PSYNC 命令
+        reply = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",psync_replid,psync_offset,NULL);
+        ...
+        // 发送命令后，等待主库响应
+        return PSYNC_WAIT_REPLY;
+    }
+
+    // 读主库的响应
+    reply = sendSynchronousCommand(SYNC_CMD_READ,fd,NULL);
+    ...
+    // 取消读事件，因为此函数还是在事件处理函数 syncWithMaster 上下文中调用，不需要监听读事件，
+    // 如果遇到错误，也可以确保 socket 上注册的事件都移除
+    aeDeleteFileEvent(server.el,fd,AE_READABLE);
+
+    // 主库返回 FULLRESYNC，全量复制
+    if (!strncmp(reply,"+FULLRESYNC",11)) {
+        ...
+        return PSYNC_FULLRESYNC;
+    }
+    // 主库返回 CONTINUE，执行增量复制
+    if (!strncmp(reply,"+CONTINUE",9)) {
+        ...
+        return PSYNC_CONTINUE;
+    }
+
+    // 主库返回 NOMASTERLINK 或者 LOADING 表示应该稍后重试同步
+    if (!strncmp(reply,"-NOMASTERLINK",13) ||
+        !strncmp(reply,"-LOADING",8))
+    {
+        ...
+        return PSYNC_TRY_LATER;
+    }
+    // 主库返回 ERR
+    if (strncmp(reply,"-ERR",4)) {
+        /* If it's not an error, log the unexpected event. */
+        serverLog(LL_WARNING,
+            "Unexpected reply to PSYNC from master: %s", reply);
+    } else {
+        serverLog(LL_NOTICE,
+            "Master does not support PSYNC or is in "
+            "error state (reply: %s)", reply);
+    }
+    sdsfree(reply);
+    replicationDiscardCachedMaster();
+    return PSYNC_NOT_SUPPORTED;
+}
+```
+因为`slaveTryPartialResynchronization`是在`syncWithMaster`函数中调用，当该函数返回`PSYNC`命令不同的结果时，
+`syncWithMaster`函数就会根据结果值执行不同处理。
