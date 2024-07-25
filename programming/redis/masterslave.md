@@ -344,3 +344,48 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
 ```
 因为`slaveTryPartialResynchronization`是在`syncWithMaster`函数中调用，当该函数返回`PSYNC`命令不同的结果时，
 `syncWithMaster`函数就会根据结果值执行不同处理。
+```c
+void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
+    ...
+    // 读取主库回复的 PSYNC 命令结果
+    psync_result = slaveTryPartialResynchronization(fd,1);
+    // 主库还没有回复 PSYNC 命令，函数执行完成（此时读事件还在监听，没有取消）
+    if (psync_result == PSYNC_WAIT_REPLY) return; /* Try again later... */
+    // 主库执行 PSYNC 命令遇到错误，直接回复初始状态，从头开始尝试，此时从库复制状态是 REPL_STATE_CONNECT
+    if (psync_result == PSYNC_TRY_LATER) goto error;
+    // 走到这里，读事件在 slaveTryPartialResynchronization 函数中已经被移除了
+    // 增量复制，直接返回，后续执行增量复制（slaveTryPartialResynchronization 
+    // 内部会修改从节点复制状态为 REPL_STATE_CONNECTED）
+    if (psync_result == PSYNC_CONTINUE) {
+        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization.");
+        return;
+    }
+
+    ...
+    // 全量同步，注册读事件，事件处理函数是 readSyncBulkPayload
+    if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
+            == AE_ERR)
+    {
+        serverLog(LL_WARNING,
+            "Can't create readable event for SYNC: %s (fd=%d)",
+            strerror(errno),fd);
+        goto error;
+    }
+    // 更新从节点复制状态为 REPL_STATE_TRANSFER
+    server.repl_state = REPL_STATE_TRANSFER;
+    server.repl_transfer_size = -1;
+    server.repl_transfer_read = 0;
+    server.repl_transfer_last_fsync_off = 0;
+    server.repl_transfer_fd = dfd;
+    server.repl_transfer_lastio = server.unixtime;
+    server.repl_transfer_tmpfile = zstrdup(tmpfile);
+    return;
+    ...
+}
+```
+如果返回的是`PSYNC_CONTINUE`，表明可以执行部分重同步（函数`slaveTryPartialResynchronization`内部会修改状态为`REPL_STATE_CONNECTED`）。
+否则说明需要执行完整重同步，从服务器需要准备接收主服务器发送的`RDB`文件，进而创建文件读事件，处理函数为`readSyncBulkPayload`，
+并修改状态为`REPL_STATE_TRANSFER`。
+
+函数`readSyncBulkPayload`实现了`RDB`文件的接收与加载，加载完成后同时会修改状态为`REPL_STATE_CONNECTED`。
+当从服务器状态成为`REPL_STATE_CONNECTED`时，表明从服务器已经成功与主服务器建立连接，从服务器只需要接收并执行主服务器同步过来的命令请求即可。
