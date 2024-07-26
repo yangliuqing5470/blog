@@ -1,10 +1,11 @@
 > 基于`redis`源码分支`5.0`
-# 主从复制
+
 主从复制主要解决以下问题：
 + 读写分离：可以部署一台主节点，多台从节点，主节点负责写请求，从节点负责读请求，减轻主节点压力。从节点通过复制功能同步主节点数据。
 也可以关闭主节点持久化操作，让从节点执行持久化操作。
 + 数据备份：从节点通过复制功能同步主节点数据，一旦主节点宕机，可以将请求切换到从节点，避免`redis`服务中断。
 
+# 主从复制-从节点
 主从复制能力主要分为以下四个阶段：
 + 初始化；
 + 主从节点建立连接；
@@ -314,7 +315,8 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         ...
         return PSYNC_FULLRESYNC;
     }
-    // 主库返回 CONTINUE，执行增量复制
+    // 主库返回 CONTINUE，执行增量复制，增量复制就和普通的客户端命令请求差不多，
+    // 依次请求从节点需要“复制”的每一个命令
     if (!strncmp(reply,"+CONTINUE",9)) {
         ...
         return PSYNC_CONTINUE;
@@ -389,3 +391,270 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
 函数`readSyncBulkPayload`实现了`RDB`文件的接收与加载，加载完成后同时会修改状态为`REPL_STATE_CONNECTED`。
 当从服务器状态成为`REPL_STATE_CONNECTED`时，表明从服务器已经成功与主服务器建立连接，从服务器只需要接收并执行主服务器同步过来的命令请求即可。
+
+# 主从复制-主节点
+从节点和主节点建立连接后，从节点会通过`replconf`命令往主节点同步信息，主节点执行`replconf`命令：
+```c
+void replconfCommand(client *c) {
+    ...
+    /* Process every option-value pair. */
+    for (j = 1; j < c->argc; j+=2) {
+        if (!strcasecmp(c->argv[j]->ptr,"listening-port")) {
+            long port;
+
+            if ((getLongFromObjectOrReply(c,c->argv[j+1],
+                    &port,NULL) != C_OK))
+                return;
+            c->slave_listening_port = port;
+        } else if (!strcasecmp(c->argv[j]->ptr,"ip-address")) {
+            sds ip = c->argv[j+1]->ptr;
+            if (sdslen(ip) < sizeof(c->slave_ip)) {
+                memcpy(c->slave_ip,ip,sdslen(ip)+1);
+            } else {
+                addReplyErrorFormat(c,"REPLCONF ip-address provided by "
+                    "replica instance is too long: %zd bytes", sdslen(ip));
+                return;
+            }
+        } else if (!strcasecmp(c->argv[j]->ptr,"capa")) {
+            /* Ignore capabilities not understood by this master. */
+            if (!strcasecmp(c->argv[j+1]->ptr,"eof"))
+                c->slave_capa |= SLAVE_CAPA_EOF;
+            else if (!strcasecmp(c->argv[j+1]->ptr,"psync2"))
+                c->slave_capa |= SLAVE_CAPA_PSYNC2;
+        }
+    ...
+    }
+    addReply(c,shared.ok);
+}
+```
+`replconfCommand`函数主要解析客户端（从节点）请求参数并存储在客户端对象`client`中。主要解析如下信息：
++ 从节点的`IP`和端口，分别存储在客户端对象`c->slave_ip`和`c->slave_listening_port`中。
++ 当前从节点支持的能力，存储在客户端对象（从节点）的`c->slave_capa`中。
+  + `eof`：主服务器可以直接将数据库中数据以`RDB`协议格式通过`socket`发送给从服务器，免去了本地磁盘文件不必要
+的读写操作；
+  + `psync2`：从服务器支持`psync2`协议，从服务器可以识别主服务器回复的`+CONTINUE <new_repl_id>`；
++ 从服务器的复制偏移量以及交互时间，存放在`c->repl_ack_off`和`repl_ack_time`中。
+  ```c
+  if ((getLongLongFromObject(c->argv[j+1], &offset) != C_OK))
+      return;
+  if (offset > c->repl_ack_off)
+      c->repl_ack_off = offset;
+  c->repl_ack_time = server.unixtime;
+  ```
+
+## 部分同步
+下面主节点继续响应从节点发送的`psync`命令。先调用命令处理函数`syncCommand`，其中首先调用`masterTryPartialResynchronization`函数判断是否可以执行部分同步。
+满足下面条件才可以进行部分同步：
++ 服务器的运行`ID`合法，复制偏移量合法。
+  ```c
+  int masterTryPartialResynchronization(client *c) {
+      long long psync_offset, psync_len;
+      char *master_replid = c->argv[1]->ptr;
+      ...
+      if (getLongLongFromObjectOrReply(c,c->argv[2],&psync_offset,NULL) != C_OK) goto need_full_resync;
+      ...
+      // 服务器运行 ID 和复制偏移量合法
+      if (strcasecmp(master_replid, server.replid) &&
+        (strcasecmp(master_replid, server.replid2) ||
+         psync_offset > server.second_replid_offset))
+      {
+          ...
+          goto need_full_resync;
+      }
+  }
+  ```
++ 复制偏移量必须包含在复制缓冲区中。
+  ```c
+  int masterTryPartialResynchronization(client *c) {
+      long long psync_offset, psync_len;
+      char *master_replid = c->argv[1]->ptr;
+      ...
+      if (getLongLongFromObjectOrReply(c,c->argv[2],&psync_offset,NULL) != C_OK) goto need_full_resync;
+      ...
+      // 复制偏移量必须包含在复制缓冲区中
+      if (!server.repl_backlog ||
+          psync_offset < server.repl_backlog_off ||
+          psync_offset > (server.repl_backlog_off + server.repl_backlog_histlen))
+      {
+            ...
+            goto need_full_resync;
+      }
+  }
+  ```
+当部分同步条件满足时，在`masterTryPartialResynchronization`函数中将当前客户端（从节点）标记为`CLIENT_SLAVE`，状态设置为`SLAVE_STATE_ONLINE`，
+并将客户端（从节点）添加到`server.slaves`链表中：
+```c
+int masterTryPartialResynchronization(client *c) {
+    ...
+    c->flags |= CLIENT_SLAVE;
+    c->replstate = SLAVE_STATE_ONLINE;
+    c->repl_ack_time = server.unixtime;
+    c->repl_put_online_on_ack = 0;
+    listAddNodeTail(server.slaves,c);
+    ...
+}
+```
+然后主节点根据从节点同步的能力是否有`psync2`决定返回`+CONTINUE`还是`+CONTINUE <replid>`：
+```c
+int masterTryPartialResynchronization(client *c) {
+    ...
+    if (c->slave_capa & SLAVE_CAPA_PSYNC2) {
+        buflen = snprintf(buf,sizeof(buf),"+CONTINUE %s\r\n", server.replid);
+    } else {
+        buflen = snprintf(buf,sizeof(buf),"+CONTINUE\r\n");
+    }
+    if (write(c->fd,buf,buflen) != buflen) {
+        freeClientAsync(c);
+        return C_OK;
+    }
+    ...
+}
+```
+接着主节点根据`psync`命令指定的复制偏移量，将复制缓存区中命令同步给从节点：
+```c
+int masterTryPartialResynchronization(client *c) {
+    ...
+    psync_len = addReplyReplicationBacklog(c,psync_offset);
+    ...
+}
+```
+最后主节点更新有效从节点数目，以实现`min_slaves`功能：
+```c
+void refreshGoodSlavesCount(void) {
+    listIter li;
+    listNode *ln;
+    int good = 0;
+
+    if (!server.repl_min_slaves_to_write ||
+        !server.repl_min_slaves_max_lag) return;
+
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+        time_t lag = server.unixtime - slave->repl_ack_time;
+        // 有效节点判断
+        if (slave->replstate == SLAVE_STATE_ONLINE &&
+            lag <= server.repl_min_slaves_max_lag) good++;
+    }
+    server.repl_good_slaves_count = good;
+}
+```
+
+## 全量同步
+当部分同步条件不满足时，`syncCommand`命令处理函数会执行全量同步逻辑。
+
+首先，将当前客户端（从节点）标记为`CLIENT_SLAVE`，状态设置为`SLAVE_STATE_WAIT_BGSAVE_START`，
+并将客户端（从节点）添加到`server.slaves`链表中：
+```c
+void syncCommand(client *c) {
+    ...
+    c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+    if (server.repl_disable_tcp_nodelay)
+        anetDisableTcpNoDelay(NULL, c->fd); /* Non critical if it fails. */
+    c->repldbfd = -1;
+    c->flags |= CLIENT_SLAVE;
+    listAddNodeTail(server.slaves,c);
+    ...
+}
+```
+然后在周期执行函数`replicationCron`周期执行函数或者当前`syncCommand`函数中调用`startBgsaveForReplication`函数执行实际的全量同步。
+
+根据客户端同步的能力，全量同步有两种：
++ 将数据库进行`RDB`持久化，然后直接通过`socket`发送给从节点。
++ 持久化数据到本地文件（`RDB`持久化），待持久化完成后再将该文件发送给从节点。
+
+```c
+int startBgsaveForReplication(int mincapa) {
+    ...
+    int socket_target = server.repl_diskless_sync && (mincapa & SLAVE_CAPA_EOF);
+    ...
+    rsiptr = rdbPopulateSaveInfo(&rsi);
+    if (rsiptr) {
+        if (socket_target)
+            // 直接通过 socket 发送
+            retval = rdbSaveToSlavesSockets(rsiptr);
+        else
+            // 先保存本地文件，然后发送文件
+            retval = rdbSaveBackground(server.rdb_filename,rsiptr);
+    }
+}
+```
+其中变量`server.repl_diskless_sync`可通过配置文件参数`repl-disklesssync`进行设置，默认为`0`。**持久化操作都是在子进行中进行**。
+
+全量同步会回复从节点`+FULLRESYNC <replid> <offset>`，其中`<replid>`表示主节点的`RUN_ID`，`<offset>`表示主节点**开始**复制偏移量。
+
+## 命令广播
+主节点每次接收到写命令请求时，都会将该命令请求广播给所有从节点，同时记录在复制缓冲区中。通过`replicationFeedSlaves`函数实现。
+
+函数`replicationFeedSlaves`逻辑主要有以下三步：
++ 当前客户端（从节点）连接的数据库可能并不是上次向从节点同步数据的数据库，因此可能需要先向从节点同步`select`命令修改数据库；
++ 将命令请求同步给所有从节点；
++ 将命令记录到缓存区；
+
+# 主从复制-部分同步原理
+每台`redis`服务器都有一个运行`ID`，从节点每次发送`psync`请求同步数据时，会携带自己需要同步主节点的运行`ID`。
+主节点接收到`psync`命令时，需要判断命令参数指定的`ID`与自己的运行`ID`是否相等，只有相等才有可能执行部分重同步。
+
+部分同步需要满足以下两个条件：
++ `RUN_ID`必须一样；
++ 复制偏移量必须包含在复制缓冲区中；
+
+实际生产中还会存在以下情况：
++ 从节点重启（复制信息丢失）；
++ 主节点故障导致主从切换（从多个从节点重新选举出一台机器作为主节点，主节点运行`ID`发生改变）；
+
+针对上面发生的两种情况，从`redis4.0`开始提出优化`psync2`协议：
++ 针对从节点重启情况，持久化主从复制信息到`RDB`中（复制的主服务器`RUN_ID`与复制偏移量），等到节点重启加载`RDB`文件时，回复主从复制信息。
+  ```c
+  int rdbSaveInfoAuxFields(rio *rdb, int flags, rdbSaveInfo *rsi) {
+      ...
+      if (rsi) {
+          if (rdbSaveAuxFieldStrInt(rdb,"repl-stream-db",rsi->repl_stream_db)
+              == -1) return -1;
+          if (rdbSaveAuxFieldStrStr(rdb,"repl-id",server.replid)
+              == -1) return -1;
+          if (rdbSaveAuxFieldStrInt(rdb,"repl-offset",server.master_repl_offset)
+              == -1) return -1;
+      }
+      ...
+  }
+  ```
++ 针对主从切换情况，存储上一个主节点复制信息。从节点的`server->replid`存储是主节点的`RUN_ID`。在全量同步的时候，
+从节点会更新`server->replid`和`server->master_repl_offset`：
+  ```c
+  void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
+      ...
+      // 更新 server->master 属性
+      replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
+      server.repl_state = REPL_STATE_CONNECTED;
+      server.repl_down_since = 0;
+      memcpy(server.replid,server.master->replid,sizeof(server.replid));
+      server.master_repl_offset = server.master->reploff;
+      clearReplicationId2();
+      ...
+  }
+  ```
+  当某个从节点变为主节点时候，`shiftReplicationId`函数会调用：
+  ```c
+  // 将老的主节点 RUN_ID 和复制偏移值保存在 replid2 和 second_replid_offset 中
+  void shiftReplicationId(void) {
+      memcpy(server.replid2,server.replid,sizeof(server.replid));
+      server.second_replid_offset = server.master_repl_offset+1;
+      changeReplicationId();
+  }
+  // 随机设置 server->replid 值
+  void changeReplicationId(void) {
+      getRandomHexChars(server.replid,CONFIG_RUN_ID_SIZE);
+      server.replid[CONFIG_RUN_ID_SIZE] = '\0';
+  }
+  ```
+  判断是否可执行部分同步比较主节点`RUN_ID`条件更新为：
+  ```c
+  if (strcasecmp(master_replid, server.replid) &&
+    (strcasecmp(master_replid, server.replid2) ||
+     psync_offset > server.second_replid_offset))
+  {
+      ...
+      goto need_full_resync;
+  }
+  ```
