@@ -5,7 +5,9 @@
 也可以关闭主节点持久化操作，让从节点执行持久化操作。
 + 数据备份：从节点通过复制功能同步主节点数据，一旦主节点宕机，可以将请求切换到从节点，避免`redis`服务中断。
 
-# 主从复制-从节点
+# 主从复制实现
+## 从节点
+
 主从复制能力主要分为以下四个阶段：
 + 初始化；
 + 主从节点建立连接；
@@ -31,7 +33,7 @@ struct redisServer {
 `redis`的主从复制是基于**状态机**实现，`redisServer`结构体中的`repl_state`表示复制过程中的各个状态。
 基于状态机实现主从复制的好处就是只需要考虑清楚在不同状态下具体要执行的操作，以及状态之间的跳转条件。
 
-## 初始化
+### 初始化
 将一个`redis`实例设置为从节点有三种方式实现：
 + 通过一个客户端给准备作为从节点的实例发送`replicaof <masterip> <masterport>`命令，其中`<masterip>`为主节点的地址，`<masterport>`为主节点的端口。
   ```bash
@@ -120,7 +122,7 @@ void replicationSetMaster(char *ip, int port) {
 ```
 初始化阶段完成后，从库实例状态更新为`REPL_STATE_CONNECT`。
 
-## 主从节点建立连接
+### 主从节点建立连接
 初始化完成后，从库的状态变为`REPL_STATE_CONNECT`，接下来就需要从库和主库建立`TCP`连接，并且会在建立好的网络连接上，监听是否有主库发送的命令。
 
 连接的建立是在`redis`的定时任务`serverCron`函数中执行：
@@ -178,7 +180,7 @@ int connectWithMaster(void) {
 ```
 和主库的`TCP`连接建立完成后，从库的复制状态更新为`REPL_STATE_CONNECTING`
 
-## 主从节点握手
+### 主从节点握手
 和主库的网络连接建立完成后，从库开始和主库进行握手。握手过程就是主从库间相互发送`ping-pong`消息，同时从库根据配置信息向主库进行验证。
 最后，从库把自己的`IP`、端口号等信息发给主库。
 
@@ -261,7 +263,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
 最终主从节点握手完成后，从节点复制状态变为`REPL_STATE_RECEIVE_CAPA`。
 
-## 复制类型判断与执行
+### 复制类型判断与执行
 握手阶段完成后，从库会等待主库回复`CAPA`消息，此时从库的复制状态为`REPL_STATE_RECEIVE_CAPA`，当收到主库回复的`CAPA`消息后：
 ```c
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -392,7 +394,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 函数`readSyncBulkPayload`实现了`RDB`文件的接收与加载，加载完成后同时会修改状态为`REPL_STATE_CONNECTED`。
 当从服务器状态成为`REPL_STATE_CONNECTED`时，表明从服务器已经成功与主服务器建立连接，从服务器只需要接收并执行主服务器同步过来的命令请求即可。
 
-# 主从复制-主节点
+## 主节点
 从节点和主节点建立连接后，从节点会通过`replconf`命令往主节点同步信息，主节点执行`replconf`命令：
 ```c
 void replconfCommand(client *c) {
@@ -442,7 +444,7 @@ void replconfCommand(client *c) {
   c->repl_ack_time = server.unixtime;
   ```
 
-## 部分同步
+### 部分同步
 下面主节点继续响应从节点发送的`psync`命令。先调用命令处理函数`syncCommand`，其中首先调用`masterTryPartialResynchronization`函数判断是否可以执行部分同步。
 满足下面条件才可以进行部分同步：
 + 服务器的运行`ID`合法，复制偏移量合法。
@@ -540,7 +542,7 @@ void refreshGoodSlavesCount(void) {
 }
 ```
 
-## 全量同步
+### 全量同步
 当部分同步条件不满足时，`syncCommand`命令处理函数会执行全量同步逻辑。
 
 首先，将当前客户端（从节点）标记为`CLIENT_SLAVE`，状态设置为`SLAVE_STATE_WAIT_BGSAVE_START`，
@@ -583,7 +585,7 @@ int startBgsaveForReplication(int mincapa) {
 
 全量同步会回复从节点`+FULLRESYNC <replid> <offset>`，其中`<replid>`表示主节点的`RUN_ID`，`<offset>`表示主节点**开始**复制偏移量。
 
-## 命令广播
+### 命令广播
 主节点每次接收到写命令请求时，都会将该命令请求广播给所有从节点，同时记录在复制缓冲区中。通过`replicationFeedSlaves`函数实现。
 
 函数`replicationFeedSlaves`逻辑主要有以下三步：
@@ -591,7 +593,7 @@ int startBgsaveForReplication(int mincapa) {
 + 将命令请求同步给所有从节点；
 + 将命令记录到缓存区；
 
-# 主从复制-部分同步原理
+## 部分同步原理
 每台`redis`服务器都有一个运行`ID`，从节点每次发送`psync`请求同步数据时，会携带自己需要同步主节点的运行`ID`。
 主节点接收到`psync`命令时，需要判断命令参数指定的`ID`与自己的运行`ID`是否相等，只有相等才有可能执行部分重同步。
 
@@ -658,3 +660,7 @@ int startBgsaveForReplication(int mincapa) {
       goto need_full_resync;
   }
   ```
+# 主从复制流程
++ 从节点执行`replicaof <masterip> <masterport>`命令和主节点建立连接。
+
+# 缓存实现
