@@ -661,6 +661,188 @@ int startBgsaveForReplication(int mincapa) {
   }
   ```
 # 主从复制流程
-+ 从节点执行`replicaof <masterip> <masterport>`命令和主节点建立连接。
+## 流程
+
++ 从库执行`replicaof <masterip> <masterport>`命令和主节点建立连接，包括建立`TCP`连接，信息同步等；
++ 从库发送`psync <master_runid> <offset>`命令请求同步，第一次从库不知道主库`RUN_ID`，会发送`psync ? -1`，
+主库会回复`+FULLRESYNC <RUN_ID> <offset>`，然后**从库**会更新`master_replid`和`master_initial_offset`字段：
+  ```c
+  int slaveTryPartialResynchronization(int fd, int read_reply) {
+      ...
+      memcpy(server.master_replid, replid, offset-replid-1);
+      server.master_replid[CONFIG_RUN_ID_SIZE] = '\0';
+      server.master_initial_offset = strtoll(offset,NULL,10);
+      ...
+  }
+  ```
++ 主库开始执行全量同步（第一次）。主库子进程执行`RDB`将数据库持久化，持久化完成后，主库将`RDB`发送给从库，从库加载`RDB`文件，完成数据同步。
+在主库数据持久化和`RDB`发送期间，主库可以继续处理新的写命令，并将新的写命令存放到客户端（从库）回复缓存中；
+  ```c
+  void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
+      ...
+      /* Write the command to every slave. */
+      listRewind(slaves,&li);
+      while((ln = listNext(&li))) {
+          client *slave = ln->value;
+
+          if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
+          // 将新的命令存放在客户端（从节点）回复缓存中
+          addReplyMultiBulkLen(slave,argc);
+          for (j = 0; j < argc; j++)
+              addReplyBulk(slave,argv[j]);
+      }
+      ...
+  }
+  ```
+  在子进程执行`RDB`持久化操作前，主节点就将从节点复制状态更新为`SLAVE_STATE_WAIT_BGSAVE_END`，所以主节点新的写命令都可以存放在客户端（从节点）回复缓存中。<br>
+  时间事件循环`serverCron`函数中会检查后台的`RDB`保存或者`AOF`进程是否结束：
+  ```c
+  int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+      ...
+      if (server.rdb_child_pid != -1 || server.aof_child_pid != -1 ||
+          ldbPendingChildren())
+      {
+          ...
+          else if (pid == server.rdb_child_pid) {
+              // RDB 子任务
+              backgroundSaveDoneHandler(exitcode,bysignal);
+              if (!bysignal && exitcode == 0) receiveChildInfo();
+          } else if (pid == server.aof_child_pid) {
+              // AOF 子任务
+              backgroundRewriteDoneHandler(exitcode,bysignal);
+              if (!bysignal && exitcode == 0) receiveChildInfo();
+          }
+          ...
+      }
+      ...
+  }
+  ```
+  继续跟踪函数调用关系，主库在函数`updateSlaveWaitingBgsave`函数中会注册和从库通信`socket`的可写事件：
+  ```c
+  void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
+      ...
+      // 注册写事件，事件处理函数是 sendBulkToSlave
+      if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
+          freeClient(slave);
+          continue;
+      }
+  }
+  ```
+  写事件处理函数`sendBulkToSlave`会将`RDB`发送给从库。
++ 主库继续将客户端（从库）回复缓存中命令发送给从库。在上一步主库通过写事件处理函数`sendBulkToSlave`将`RDB`发送给从库后，
+会调用`putSlaveOnline`函数将从库设置为在线：
+  ```c
+  void putSlaveOnline(client *slave) {
+      // 更新当前从库状态为 SLAVE_STATE_ONLINE
+      slave->replstate = SLAVE_STATE_ONLINE;
+      slave->repl_put_online_on_ack = 0;
+      slave->repl_ack_time = server.unixtime; /* Prevent false timeout. */
+      // 注册一个写事件，将对应从库回复缓存中数据发送给从库
+      if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
+          sendReplyToClient, slave) == AE_ERR) {
+          serverLog(LL_WARNING,"Unable to register writable event for replica bulk transfer: %s", strerror(errno));
+          freeClient(slave);
+          return;
+      }
+      refreshGoodSlavesCount();
+      serverLog(LL_NOTICE,"Synchronization with replica %s succeeded",
+          replicationGetSlaveName(slave));
+  }
+  ```
+  主库会通过`sendReplyToClient`写事件函数将对应从库（客户端）回复缓冲区中的命令发送给从库。
++ 后续新的写命令都会通过命令广播发送给从库；
+  ```c
+  void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
+      ...
+      /* Write the command to every slave. */
+      listRewind(slaves,&li);
+      while((ln = listNext(&li))) {
+          client *slave = ln->value;
+
+          if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
+          // 将新的命令存放在客户端（从节点）回复缓存中
+          addReplyMultiBulkLen(slave,argc);
+          for (j = 0; j < argc; j++)
+              addReplyBulk(slave,argv[j]);
+      }
+      ...
+  }
+  ```
+## 样例
+启动两个`redis`服务实例，其中`172.17.0.2:6379`是主库，`172.17.0.3:6380`是从库。启动一个客户端连接从库，并执行`REPLICAOF`命令和主库同步，
+观察主库和从库日志。
+### 主库日志
++ 从库给主库发送`psync`命令后，主库开始执行`syncCommand`函数处理，会打印如下日志：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.118 * Replica 172.18.0.3:6380 asks for synchronization
+  ```
++ 在`syncCommand`函数中首先调用`masterTryPartialResynchronization`函数，判断能否进行部分同步，判断条件不满足，输出如下日志：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.118 * Partial resynchronization not accepted: Replication ID mismatch (Replica asked for '827139ed6e5f903a6b54573a34b125cb3471560f', my replication IDs are '4b9069ee4a91a5c997561525852e39903d8475b4' and '0000000000000000000000000000000000000000')
+  ```
++ 在`syncCommand`函数中走全量同步逻辑，调用`startBgsaveForReplication`函数开始生成`RDB`，输出如下日志：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.118 * Starting BGSAVE for SYNC with target: disk
+  ```
++ 接着调用`rdbSaveBackground`函数的父进程更新相关状态信息，打印如下日志返回，子进行开始执行`RDB`持久化操作：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.118 * Background saving started by pid 15
+  ```
++ 执行`RDB`持久化子进程执行完后继续输出如下日志：
+  ```bash
+  15:C 29 Jul 2024 07:34:26.120 * DB saved on disk
+  15:C 29 Jul 2024 07:34:26.120 * RDB: 0 MB of memory used by copy-on-write
+  ```
++ 在时间时间函数`serverCron`中检测到执行`RDB`持久化子进行结束，会调用`backgroundSaveDoneHandler`函数，然后根据配置文件配置，
+`RDB`先保存为文件然后发送给从库策略，会继续调用`backgroundSaveDoneHandlerDisk`函数，进而输出如下日志：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.213 * Background saving terminated with success
+  ```
++ 最后会调用`updateSlavesWaitingBgsave`函数将`RDB`文件发送给从库，发送完成后会调用`putSlaveOnline`函数，将从库（客服端）输出缓存命令发送给从库，
+最后输出如下日志：
+  ```bash
+  1:M 29 Jul 2024 07:34:26.213 * Synchronization with replica 172.18.0.3:6380 succeeded
+  ```
+
+### 从库日志
++ 从库接收`replicaof`命令执行`replicaofCommand`命令处理函数，在内部会调用`replicationSetMaster`函数设置主库的地址和端口号等。
+如果当前的从库之前不是从库（主库）会调用`replicationCacheMasterUsingMyself`函数执行将`master`转为`slave`设置，会输出如下日志：
+  ```bash
+  1:S 29 Jul 2024 07:34:25.212 * Before turning into a replica, using my master parameters to synthesize a cached master: I may be able to synchronize with the new master with just a partial transfer.
+  ```
++ 在`replicaofCommand`函数中最后会打印如下日志：
+  ```bash
+  1:S 29 Jul 2024 07:34:25.212 * REPLICAOF my-redis:6379 enabled (user request from 'id=3 addr=172.18.0.4:54308 fd=8 name= age=558 idle=0 flags=N db=0 sub=0 psub=0 multi=-1 qbuf=43 qbuf-free=32725 obl=0 oll=0 omem=0 events=r cmd=replicaof')
+  ```
++ 然后在周期执行函数`replicationCron`函数执行`connectWithMaster`函数和`master`建立`TCP`连接操作，输出如下日志：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.112 * Connecting to MASTER my-redis:6379
+  # 和 master 建立 TCP 成功后会输出此日志
+  1:S 29 Jul 2024 07:34:26.117 * MASTER <-> REPLICA sync started
+  ```
++ 开始执行上一步注册的事件处理函数`syncWithMaster`，输出如下日志：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.117 * Non blocking connect for SYNC fired the event.
+  ```
++ 在事件处理函数`syncWithMaster`中完成和`master`的`PING`操作，身份验证，信息同步等：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.118 * Master replied to PING, replication can continue...
+  ```
++ 在事件处理函数`syncWithMaster`中调用`slaveTryPartialResynchronization`发送`psync`同步命令及读取`master`返回结果：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.118 * Trying a partial resynchronization (request 827139ed6e5f903a6b54573a34b125cb3471560f:1).
+  1:S 29 Jul 2024 07:34:26.119 * Full resync from master: 69f3f72c743522c5ac74fba9f397a3c7231901d5:0
+  ```
++ 在上一步判断走全量同步逻辑，接着会继续调用`replicationDiscardCachedMaster`函数设置`cached_master`属性为空：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.119 * Discarding previously cached master state.
+  ```
++ 在`syncWithMaster`中会注册事件处理函数`readSyncBulkPayload`，用于接收主库发送的`RDB`及加载`RDB`到内存：
+  ```bash
+  1:S 29 Jul 2024 07:34:26.213 * MASTER <-> REPLICA sync: receiving 225 bytes from master
+  1:S 29 Jul 2024 07:34:26.214 * MASTER <-> REPLICA sync: Flushing old data
+  1:S 29 Jul 2024 07:34:26.214 * MASTER <-> REPLICA sync: Loading DB in memory
+  1:S 29 Jul 2024 07:34:26.214 * MASTER <-> REPLICA sync: Finished with success
+  ```
 
 # 缓存实现
