@@ -721,7 +721,9 @@ int startBgsaveForReplication(int mincapa) {
   ```c
   void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
       ...
-      // 注册写事件，事件处理函数是 sendBulkToSlave
+      // 删除旧的可写事件
+      aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+      // 注册新的写事件，事件处理函数是 sendBulkToSlave
       if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
           freeClient(slave);
           continue;
@@ -729,6 +731,15 @@ int startBgsaveForReplication(int mincapa) {
   }
   ```
   写事件处理函数`sendBulkToSlave`会将`RDB`发送给从库。
++ 从库通过注册的`readSyncBulkPayload`写事件函数接收主库发送的`RDB`，从库接收完`RDB`文件后，会将`RDB`保存到本地磁盘，
+然后清空自身老的数据库，加载接收的`RDB`文件到内存数据库。接着调用`replicationCreateMasterClient`创建一个和主库正常通信的客户端对象（接收常规的命令）：
+  ```c
+  void replicationCreateMasterClient(int fd, int dbid) {
+      server.master = createClient(fd);
+      ...
+  }
+  ```
+  在`createClient`中会注册读事件函数`readQueryFromClient`用于接收命令。
 + 主库继续将客户端（从库）回复缓存中命令发送给从库。在上一步主库通过写事件处理函数`sendBulkToSlave`将`RDB`发送给从库后，
 会调用`putSlaveOnline`函数将从库设置为在线：
   ```c
@@ -846,3 +857,225 @@ int startBgsaveForReplication(int mincapa) {
   ```
 
 # 缓存实现
+用于主从同步的缓存有两种：客户端输出缓存（用于缓存回复客户端内容，在主从复制中存放是发送给从库的命令），循环缓存（用于主从断开重连的增量同步）。
+## 输出缓存
+每个客户端对象都有一个自己的输出缓存配置：
+```c
+typedef struct client {
+    ...
+    list *reply;            /* List of reply objects to send to the client. */
+    ...
+    /* Response buffer */
+    int bufpos;
+    char buf[PROTO_REPLY_CHUNK_BYTES];
+} client;
+```
+输出缓存大小限制可通过配置项`client-output-buffer-limit`配置，`client-output-buffer-limit`说明如下：
++ 对于客户端没有足够快读取服务端输出缓存数据场景，例如对于发布/订阅模式下，消费者消费慢于生产者。客户端输出缓存大小限制可以用于强制断开客户端连接。
++ 服务端可以针对三种不同的客户端对象分别设置缓存大小限制：
+  ```bash
+  client-output-buffer-limit normal 0 0 0
+  client-output-buffer-limit replica 256mb 64mb 60
+  client-output-buffer-limit pubsub 32mb 8mb 60
+  ```
+  + `normal`：表示正常普通的客户端；
+  + `replica`：针对主从复制从节点；
+  + `pubsub`：订阅某个模式或者通道的客户端；
++ 配置格式如下：
+  ```bash
+  client-output-buffer-limit <class> <hard limit> <soft limit> <soft seconds>
+  ```
+  如果客户端缓存达到`<hard limit>`，则立刻断开客户端连接。或者`<soft limit>`达到且连续`<soft seconds>`时间都达到软限制，则断开客户端连接。
+
+每次将回复数据写到客户端缓存中时（列表对象），都会检查缓存是否达到限制：
+```c
+void _addReplyStringToList(client *c, const char *s, size_t len) {
+    ...
+    asyncCloseClientOnOutputBufferLimitReached(c);
+}
+```
+**在主从复制中，客户端输出缓存主要用于记录全量同步过程中新的写命令，用于全量同步完成后，将新增写命令同步给从库，保证数据一致性**。
+
+## 循环缓存
+循环缓存工作原理：
++ 循环缓冲区有**一个写指针**，表示主节点在缓冲区中的当前写入位置。如果写指针已经指向了缓冲区末尾，那么此时主节点再写入数据，
+写指针就会重新指向缓冲区头部，从头部开始再次写入数据，这样就可以复用缓冲区空间了。
++ 循环缓冲区有**一个或多个读指针**，表示不同从节点在缓冲区中的当前读取位置。表示不同从节点在缓冲区中的当前读取位置。
+当读指针指向缓冲区末尾时，从节点也会把读指针重新指向缓冲区头部，从缓冲区头部开始继续读取数据。
+
+循环缓存主要用于主从断开重连后的增量同步，也就是将断开期间的命令同步给从库，避免全量同步操作。**每个主库只有一个循环缓存**，所有的从库共享此循环缓存。
+和循环缓存相关的数据结构如下：
+```c
+struct redisServer {
+...
+char *repl_backlog;             //基于字符数组的循环缓冲区
+long long repl_backlog_size;    //循环缓冲区总长度
+long long repl_backlog_histlen; //循环缓冲区中当前累积的数据的长度
+long long repl_backlog_idx;     //循环缓冲区的写指针位置
+long long repl_backlog_off;   //循环缓冲区最早保存的数据的首字节在全局范围内的偏移
+...
+}
+```
++ `repl_backlog_size`：记录循环缓冲区本身的总长度。这个值也对应了`redis.conf`配置文件中的`repl-backlog-size`配置项（默认`1Mb`）。
++ `repl_backlog_histlen`：记录循环缓冲区中目前累积的数据的长度，这个值不会超过缓冲区的总长度。
++ `repl_backlog_idx`：记录循环缓冲区接下来写数据时应该写入的位置，也就是循环缓冲区的写指针。
++ `repl_backlog_off`：记录循环缓冲区中最早保存的数据的首字节在全局范围内的偏移值。因为循环缓冲区会被重复使用，
+所以一旦缓冲区写满后，又开始从头写数据时，缓冲区中的旧数据会被覆盖。因此，这个值就记录了仍然保存在缓冲区中，
+又是最早写入的数据的首字节，在全局范围内的偏移量。
+
+在主从复制中，主节点会累积记录它收到的要进行复制的命令总长度，这个总长度我们称之为全局范围内的复制偏移量，对应`master_repl_offset`变量。
+从节点从主节点读取命令时，也会记录它读到的累积命令的位置，这个位置称之为全局范围内的读取偏移量。
+
+假设主节点收到三条命令，每条命令长度都是`16`字节，那么此时，全局复制偏移量是`48`。假设一个从节点从主节点上读了一条命令，此时，该从节点的全局读取位置就是`16`。
+
+循环缓存的创建`createReplicationBacklog`的实现如下：
+```c
+void createReplicationBacklog(void) {
+    serverAssert(server.repl_backlog == NULL);
+    server.repl_backlog = zmalloc(server.repl_backlog_size);
+    server.repl_backlog_histlen = 0;
+    server.repl_backlog_idx = 0;
+
+    /* We don't have any data inside our buffer, but virtually the first
+     * byte we have is the next byte that will be generated for the
+     * replication stream. */
+    server.repl_backlog_off = server.master_repl_offset+1;
+}
+
+void syncCommand(client *c) {
+    ...
+    /* Create the replication backlog if needed. */
+    if (listLength(server.slaves) == 1 && server.repl_backlog == NULL) {
+        ...
+        createReplicationBacklog();
+    }
+    ...
+}
+```
+循环缓存的写操作由`feedReplicationBacklog`函数实现，主要分以下几部分：
++ 更新全局范围内的复制偏移量`master_repl_offset`值（主库接收的命令总长度）：
+  ```c
+  void feedReplicationBacklog(void *ptr, size_t len) {
+      unsigned char *p = ptr;
+      server.master_repl_offset += len;
+      ...
+  }
+  ```
++ 通过循环，将数据写入到循环缓存区：
+  ```c
+  void feedReplicationBacklog(void *ptr, size_t len) {
+      ...
+      while(len) {
+          // 计算本轮循环能写入的数据长度 thislen
+          size_t thislen = server.repl_backlog_size - server.repl_backlog_idx;
+          if (thislen > len) thislen = len;
+          // 将数据写入到循环缓存中，写入的起始位置是 repl_backlog_idx
+          memcpy(server.repl_backlog+server.repl_backlog_idx,p,thislen);
+          // 更新写指针
+          server.repl_backlog_idx += thislen;
+          // 如果写指针指向循环缓存末尾，说明缓存区已满，将写指针指向缓存区起始位置，从头开始写
+          if (server.repl_backlog_idx == server.repl_backlog_size)
+              server.repl_backlog_idx = 0;
+          // 更新剩余待写数据大小
+          len -= thislen;
+          // 更新要写入循环缓冲区的数据指针位置
+          p += thislen;
+          // 更新缓冲区已写数据大小
+          server.repl_backlog_histlen += thislen;
+      }
+      ...
+  }
+  ```
++ 循环写结束后，检查并更新`repl_backlog_histlen`和`repl_backlog_off`属性值：
+  ```c
+  void feedReplicationBacklog(void *ptr, size_t len) {
+      ...
+      if (server.repl_backlog_histlen > server.repl_backlog_size)
+          server.repl_backlog_histlen = server.repl_backlog_size;
+      /* Set the offset of the first byte we have in the backlog. */
+      server.repl_backlog_off = server.master_repl_offset -
+                                server.repl_backlog_histlen + 1;
+  }
+  ```
+  如果`repl_backlog_histlen`大小超过缓存区总大小`repl_backlog_size`，则更新`repl_backlog_histlen`为缓冲区总长度。
+  即，一旦缓冲区写满后，就维持`repl_backlog_histlen`为缓冲区总长度。`repl_backlog_off`值会被更新为全局复制偏移量减去`repl_backlog_histlen`值再加`1`。
+
+循环缓存的读操作由`addReplyReplicationBacklog`函数实现。当从库发送`psync <runid> <offset>`时，主库处理`psync`命令会先尝试调用`masterTryPartialResynchronization`执行部分同步，
+若可以执行部分同步，在`masterTryPartialResynchronization`中会调用`addReplyReplicationBacklog`执行实际的部分同步操作。
+
+`addReplyReplicationBacklog`执行逻辑主要分为以下几部分：
++ 用从节点发送的全局读取位置`offset`减去`repl_backlog_off`的值，从而得到从节点读数据时要跳过的数据长度`skip`：
+  ```c
+  long long addReplyReplicationBacklog(client *c, long long offset) {
+      ...
+      /* Compute the amount of bytes we need to discard. */
+      skip = offset - server.repl_backlog_off;
+  }
+  ```
+  `repl_backlog_off`表示仍在缓冲区中的最早保存的数据的首字节在全局范围内的偏移量。
++ 计算缓冲区中，最早保存的数据的首字节对应在缓冲区中的位置：
+  ```c
+  long long addReplyReplicationBacklog(client *c, long long offset) {
+      ...
+      j = (server.repl_backlog_idx +
+        (server.repl_backlog_size-server.repl_backlog_histlen)) %
+        server.repl_backlog_size;
+      ...
+  }
+  ```
+  如果缓存区没有写满，则`repl_backlog_histlen = repl_backlog_idx`，所以计算结果`j = 0`，即最早保存数据的首字节在缓冲区起始位置。
+  如果缓存区写满，则`repl_backlog_histlen = repl_backlog_size`，所以计算结果`j = repl_backlog_idx`，即最早保存数据的首字节在缓冲区的`repl_backlog_idx`位置。
++ 计算从节点的全局读取位置在缓冲区中的对应位置：
+  ```c
+  long long addReplyReplicationBacklog(client *c, long long offset) {
+      ...
+      /* Discard the amount of data to seek to the specified 'offset'. */
+      j = (j + skip) % server.repl_backlog_size;
+      ...
+  }
+  ```
+  此时，可知从节点要在缓冲区的哪个位置开始读取数据。
++ 计算实际要读取的数据长度`len`，最终是要将缓存区中所有的数据都发送给从库：
+  ```c
+  long long addReplyReplicationBacklog(client *c, long long offset) {
+      ...
+      len = server.repl_backlog_histlen - skip;
+      ...
+  }
+  ```
++ 将缓存中的数据发送给从库：
+  ```c
+  long long addReplyReplicationBacklog(client *c, long long offset) {
+      ...
+      while(len) {
+          long long thislen =
+              ((server.repl_backlog_size - j) < len) ?
+              (server.repl_backlog_size - j) : len;
+  
+          serverLog(LL_DEBUG, "[PSYNC] addReply() length: %lld", thislen);
+          addReplySds(c,sdsnewlen(server.repl_backlog + j, thislen));
+          len -= thislen;
+          j = 0;
+      }
+      return server.repl_backlog_histlen - skip;
+  }
+  ```
+  需要考虑在循环缓冲区中，从节点可能从读取起始位置一直读到缓冲区尾后，还没有读完，还要再从缓冲区头继续读取。
+
+继续看下可以执行部分同步的条件，在`masterTryPartialResynchronization`中：
+```c
+int masterTryPartialResynchronization(client *c) {
+    ...
+    if (!server.repl_backlog ||
+        psync_offset < server.repl_backlog_off ||
+        psync_offset > (server.repl_backlog_off + server.repl_backlog_histlen))
+    {
+        ...
+        goto need_full_resync;
+    }
+}
+```
+需要同时满足下面三个条件：
++ 循环缓存存在；
++ 从节点发送的全局读位置大于主节点循环缓存中最早保存数据的位置；
++ 从节点发送的全局读位置和主节点循环缓存中最早保存数据位置差值要小于`repl_backlog_histlen`值；
