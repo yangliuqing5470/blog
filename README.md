@@ -48,6 +48,7 @@
 - [redis发布-订阅](./programming/redis/pubsub.md)
 - [redis事务](./programming/redis/transaction.md)
 - [redis高可用-主从复制](./programming/redis/masterslave.md)
+- [redis连接管理](./programming/redis/connection.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
