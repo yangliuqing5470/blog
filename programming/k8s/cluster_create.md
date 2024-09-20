@@ -190,6 +190,12 @@ sudo chown $(id -u):$(id -g) $HOME/.kube/config
 因为`k8s`集群默认需要以加密方式访问，所以需要将部署生成的`k8s`集群安全配置文件`admin.conf`保存到当前用户的`.kube`目录下，
 `kubectl`默认使用此目录下的授权信息访问`k8s`集群。
 
+执行如下命令开启`kubectl`命令行补全：
+```bash
+echo 'source <(kubectl completion bash)' >>~/.bashrc
+source ~/.bashrc
+```
+
 # 容器网络插件部署
 部署`flannel`容器网络插件。
 
