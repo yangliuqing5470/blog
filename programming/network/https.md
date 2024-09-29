@@ -113,7 +113,6 @@
   + `Country Name`：缩写为`C`，证书持有者所在国家，要求填写国家代码，用2个字母表示。
   + `State or Province Name`：缩写为`ST`，证书持有者所在州或省份，填写全称，可省略不填。
   + `Locality Name`：缩写为`L`，证书持有者所在城市，可省略不填。
-  + `Ori`
   + `Organization Name`：缩写为`O`，证书持有者所属组织或公司，可省略不填，建议填。
   + `Organizational Unit Name`：缩写为`OU`，证书持有者所属部门，可省略不填。
   + `Common Name`：缩写为`CN`，证书持有者的通用名，必填，如果是服务器证书一般填域名地址或者 ip 地址。
