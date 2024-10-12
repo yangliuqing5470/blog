@@ -17,7 +17,7 @@ $ sudo docker run -d -p 5000:5000 --restart always --name registry -v /home/ylq/
 ```bash
 $ sudo docker build -f serve_hostname.dockerfile -t my.registry.io/serve_hostname:0.0.1 .
 ```
-其中由于构建镜像的`serve_hostname.dockerfile`内容如下：
+其中用于构建镜像的`serve_hostname.dockerfile`内容如下：
 ```dockerfile
 FROM python:3.12.5-slim
 
@@ -143,3 +143,57 @@ Status: Downloaded newer image for my.registry.io/serve_hostname:0.0.1
 my.registry.io/serve_hostname:0.0.1
 ```
 至此，完成基础的基于`https`访问的私有镜像仓库搭建。后续可以添加登录认证。
+
+# k8s 使用私有镜像仓库
+## 信任自签名证书
+在每个节点上，将私有镜像仓库服务的自签名证书拷贝到`/etc/containerd/certs.d/`目录下：
+```bash
+$ sudo mkdir -p /etc/containerd/certs.d/my.registry.io
+$ sudo cp /etc/docker/certs.d/my.registry.io/registry.crt /etc/containerd/certs.d/my.registry.io/ca.crt
+```
+每个节点上，在`/etc/containerd/config.toml`配置文件中显示指定证书的位置：
+```bash
+[plugins."io.containerd.grpc.v1.cri".registry.configs."my.registry.io".tls]
+  ca_file = "/etc/containerd/certs.d/my.registry.io/ca.crt"
+```
+在每个节点上重启`containerd.service`服务：
+```bash
+$ sudo systemctl restart containerd.service
+```
+## 创建Secret
+从命令行提供凭据创建`Secret`（[从私有仓库拉取镜像](https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/pull-image-private-registry/)）：
+```bash
+$ kubectl create secret docker-registry my-registry --docker-server=my.registry.io --docker-username="ylq" --docker-password="123456"
+```
+查看凭据：
+```bash
+$ kubectl get secrets
+NAME          TYPE                             DATA   AGE
+my-registry   kubernetes.io/dockerconfigjson   1      17h
+```
+## 创建使用上述 Secret 的 Pod
+创建`pod`模版使用`imagePullSecrets`字段，并指定上述`my-registry`的`Secret`：
+```bash
+$ cat private-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: private-reg
+  namespace: default
+spec:
+  containers:
+  - name: private-reg-container
+    image: my.registry.io/serve_hostname:0.0.1
+    imagePullPolicy: Always
+  imagePullSecrets:
+  - name: my-registry
+```
+部署`pod`并检查状态：
+```bash
+$ kubectl apply -f private-pod.yaml
+pod/private-reg created
+
+$ kubectl get pods
+NAME          READY   STATUS    RESTARTS   AGE
+private-reg   1/1     Running   0          8s
+```
