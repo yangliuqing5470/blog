@@ -31,6 +31,7 @@
 - [k8s集群网络原理](./programming/k8s/cluster_network.md)
 - [私有镜像仓库搭建](./programming/k8s/images_registry.md)
 - [Service详解](./programming/k8s/cluster_service.md)
+- [Ingress详解](./programming/k8s/cluster_ingress.md)
 
 ## Docker
 - [docker使用教程](./programming/docker/tutorial.md)
