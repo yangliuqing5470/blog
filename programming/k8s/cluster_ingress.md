@@ -133,7 +133,7 @@ Events:
 
 **总结**：集群中运行的`Ingress-Controller`其实就是一个负载均衡服务，例如`nginx`。用户创建的`Ingress`资源，会被`ingress-nginx-controller`生成一份`nginx`的配置，
 存放在`/etc/nginx/nginx.conf`中。然后使用该配置启动一个`nginx`服务。
-+ 如果`Ingress`资源更新，则对应生成的`/etc/nginx/nginx.conf`配置也会更新。
++ 如果`Ingress`资源更新（包括创建新的`Ingress`或者删除旧的`Ingress`），则对应生成的`/etc/nginx/nginx.conf`配置也会更新。
 + 如果只是被代理的`Service`对象更新，则配置不用更新，`nginx`服务不需重新加载配置。
 + 可以通过`ConfigMap`定制`/etc/nginx/nginx.conf`配置，`ConfigMap`里面的字段会被合并到配置中。
 
