@@ -255,7 +255,7 @@ sudo snap install helm --classic
 开始安装`dashboard`：
 ```bash
 helm repo add kubernetes-dashboard https://kubernetes.github.io/dashboard/
-helm upgrade --install kubernetes-dashboard kubernetes-dashboard/kubernetes-dashboard --create-namespace --namespace kubernetes-dashboard
+helm upgrade --install kubernetes-dashboard kubernetes-dashboard/kubernetes-dashboard --create-namespace --namespace kubernetes-dashboard --set kong.proxy.http.enabled=true
 ```
 安装成功后会输出如下日志：
 ```bash
@@ -282,5 +282,158 @@ NOTE: In case port-forward command does not work, make sure that kong service na
 Dashboard will be available at:
   https://localhost:8443
 ```
+接下来创建一个`ServiceAccount`并添加权限用以登录`dashboard`。`ServiceAccount`和`ClusterRoleBinding`定义如下：
+```yml
+# 文件名是 dashboard-adminuser.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+```
+上面定义配置创建了一个名为`admin-user`的`ServiceAccount`，且使用`ClusterRoleBinding`将`cluster-admin`的`ClusterRole`绑定到创建的名为`admin-user`的`ServiceAccount`。
+
+将上述定义部署到集群：
+```bash
+$ kubectl apply -f dashboard-adminuser.yaml
+serviceaccount/admin-user created
+clusterrolebinding.rbac.authorization.k8s.io/admin-user created
+
+# 查看 ServiceAccount
+$ kubectl -n kubernetes-dashboard get serviceaccounts admin-user
+NAME         SECRETS   AGE
+admin-user   0         20s
+
+# 查案 admin-user ClusterRoleBinding
+$ kubectl -n kubernetes-dashboard describe clusterrolebindings.rbac.authorization.k8s.io admin-user
+Name:         admin-user
+Labels:       <none>
+Annotations:  <none>
+Role:
+  Kind:  ClusterRole
+  Name:  cluster-admin
+Subjects:
+  Kind            Name        Namespace
+  ----            ----        ---------
+  ServiceAccount  admin-user  kubernetes-dashboard
+```
+集群外访问`dashboard`需要使用`https`方式，所以需要为自己的域名申请一个证书：
+```bash
+$ mkdir dashboard_tls & cd dashboard_tls
+
+$ openssl genrsa -out tls.key 2048
+
+$ openssl req -new -x509 -key tls.key -out tls.cert -days 360 -subj /CN=my.dashboard.com
+
+# 查看文件信息如下
+$ tree
+.
+├── tls.cert
+└── tls.key
+```
+基于上述生成的证书和私钥，创建一个`tls`类的`Secret`对象（统一放在命名空间`kubernetes-dashboard`）：
+```bash
+$ kubectl -n kubernetes-dashboard create secret tls dashboard-tls-secret-ingress --cert=tls.cert --key=tls.key
+secret/dashboard-tls-secret-ingress created
+
+# 查看 Secret 对象
+$ kubectl -n kubernetes-dashboard get secrets dashboard-tls-secret-ingress
+NAME                           TYPE                DATA   AGE
+dashboard-tls-secret-ingress   kubernetes.io/tls   2      13s
+```
+创建一个`Ingress`对象，用于在集群外访问对象：
+```yml
+# 文件名是 dashboard_ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dashboard-ingress
+  namespace: kubernetes-dashboard
+spec:
+  tls:
+  - hosts:
+    - my.dashboard.com
+    secretName: dashboard-tls-secret-ingress  # 指定证书的 Secret，因为 Ingress 和客户端之间是加密通信
+  ingressClassName: nginx
+  rules:
+  - host: my.dashboard.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kubernetes-dashboard-kong-proxy
+            port:
+              number: 80  # 配置为 http 端口，因为 ingress 和后端服务之间是明文通信
+```
+将上述`dashboard-ingress`部署到集群：
+```bash
+$ kubectl -n kubernetes-dashboard apply -f dashboard_ingress.yaml
+ingress.networking.k8s.io/dashboard-ingress configured
+```
+将`10.211.55.10  my.dashboard.com`添加到集群外机器的`/etc/hosts`文件中。**关闭客户端机器上的代理**，
+此时在客户端机器的浏览器输入`https://my.dashboard.com:31258`即可以访问`dashboard`。
+> 客户端如果配置了代理，客户端不会直接解析自定义域名，而是将请求发送给代理服务器。代理服务器会根据请求中的自定义域名（如`my.dashboard.com`），查询`DNS`服务器获取域名的`IP`地址。
+此时代理服务器解析域名会失败。
+
+![dashboard登录界面](./images/dashboard_login.png)
+
+> 查看`Ingress`控制器`Service`信息：
+> ```bash
+> $ kubectl -n ingress-nginx get services ingress-nginx-controller
+> NAME                       TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+> ingress-nginx-controller   NodePort   10.102.150.75   <none>        80:32136/TCP,443:31258/TCP   7d1h
+> ```
+> 发现此`Service`是`NodePort`类型，暴露节点端口是`32136`（`http`）和`31258`（`https`）。
+
+最后一步，需要根据上面创建的名为`admin-user`的`ServiceAccount`创建一个长期的`Token`。创建一个`Secret`资源对象，
+其绑定`admin-user`的`ServiceAccount`。`Token`值会被保存在此`Secret`中。
+```yml
+# 名为 dashboard_token.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+  annotations:
+    kubernetes.io/service-account.name: "admin-user"
+type: kubernetes.io/service-account-token
+```
+将上述定义的`Secret`部署到集群：
+```bash
+$ kubectl -n kubernetes-dashboard apply -f dashboard_token.yaml
+secret/admin-user created
+
+# 查看 Secret 对象
+$ kubectl -n kubernetes-dashboard get secrets
+NAME                                         TYPE                                  DATA   AGE
+admin-user                                   kubernetes.io/service-account-token   3      3s
+dashboard-tls-secret-ingress                 kubernetes.io/tls                     2      178m
+kubernetes-dashboard-csrf                    Opaque                                1      39d
+sh.helm.release.v1.kubernetes-dashboard.v1   helm.sh/release.v1                    1      39d
+sh.helm.release.v1.kubernetes-dashboard.v2   helm.sh/release.v1                    1      85m
+```
+获取`Token`值：
+```bash
+$ kubectl get secret admin-user -n kubernetes-dashboard -o jsonpath={".data.token"} | base64 -d
+eyJhbGciOiJSUzI1NiIsImtpZCI6ImRPYjdUR0pVemdSWFZ1Y3M4Z1JsYkpHcTRPRXhuSjVOa3hwMmFOZEtjOFUifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlcm5ldGVzLWRhc2hib2FyZCIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJhZG1pbi11c2VyIiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZXJ2aWNlLWFjY291bnQubmFtZSI6ImFkbWluLXVzZXIiLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC51aWQiOiI3NzBlOGEwYy1lODQ2LTQ4NDUtYmZlYy01NjIyZDJjNTE1NjciLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6a3ViZXJuZXRlcy1kYXNoYm9hcmQ6YWRtaW4tdXNlciJ9.com1Z03WNwYYhQMEpUWPB-jJXi_CCdgh0iZrM_6wNKUrgyKZ2BmshTKhxpO_ZdeIvxzgakpExhPyCOvoAXs1cRutySCPwpLcZspYIqbRNZXNDOQQjb_zJQSHRLQvFi4CkS13OnBdEny7dIfN2I4i37sZguHw9i7LOjodf6KhdpKl4Yud1V_az7IT2Y1m83JZflb-hfhLQNpGN5TQ7wuzBByhht5Ws3pWs3hnP7EVBpTSD7swxr6WlgVBXcLFOn1t68CrbhqaOo5pzi-YnN7dRB-AdPBGk_vv-XJxt61XYEeRCNkpbj7P98tKPo-PKY25-tYjas7PRd6OZvjyxSqWxQ
+```
+登录后的`dashboard`界面如下：
+
+![登录后的ui](./images/dashboard_ui.png)
 
 # 容器存储插件部署
