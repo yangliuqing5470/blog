@@ -1,19 +1,24 @@
-[nginx官方文档](https://nginx.org/en/docs/)
-# 配置文件格式
-`nginx`默认配置文件名是`nginx.conf`，存放的位置默认是`/etc/nginx`目录下。配置文件由一系列指令组成，格式如下：
+# 服务部署与配置
+`nginx`服务采用`docker`容器部署。配置文件默认名为`nginx.conf`，存放路径是`/etc/nginx/nginx.conf`。部署命令样例如下：
 ```bash
-# 每个指令以 ; 结尾
-<directives> <parameters>;
-# 样例
-worker_processes 1;
+sudo docker run -d --rm -p 80:80 --name my-nginx -v /home/ylq/workspace/nginx/nginx.conf:/etc/nginx/nginx.conf nginx:latest
 ```
-指令分为**全局指令**，**模块配置指令**（在`{}`中）。根据不同的流量类型，有下面四种模块：
-+ `events`：通用的连接处理，例如设置最大连接数`worker_connections 1024;`；
-+ `http`：`http`相关配置；
-+ `mail`：`mail`相关配置；
-+ `stream`：`TCP/UDP`相关配置；
+配置文件`nginx.conf`由一系列的**指令**和**参数**组成。指令的样例如下：
+```bash
+# 一个简单的指令：指令名和参数之间以空格分割，结尾以;结尾
+worker_processes 1;
+# 一个块指令：在 {} 中可以包含其他的块指令和简单指令
+http {...}
+```
+`nginx`中主要的**块指令**（以`{}`结束）如下：
++ `events`：包含通用的网络连接相关指令，例如`multi_accept`、`worker_connections`，`use`等指令。
++ `http`：包含处理`http/https`请求的各种配置指令，例如反向代理，缓存等。
++ `stream`：包含处理四层`TCP/UDP`流量的配置指令。
++ `server`：**定义在`http`或`stream`块中**，用于配置具体的虚拟主机。
++ `location`：**定义在`server`块中**，定义路径的匹配规则及其对应的处理方式。
++ `upstream`：**定义在`http`或`stream`块中**，用于配置后端服务器组，实现负载均衡、健康检查等。
 
-虚拟服务`server`块在上面四种流量类型模块中，`location`块在`server`块中，下面给出样例配置，说明了各个块的层级关系：
+下面给出`nginx.conf`配置文件样例：
 ```bash
 user nobody; # a directive in the 'main' context
 
@@ -23,7 +28,6 @@ events {
 
 http {
     # Configuration specific to HTTP and affecting all virtual servers
-
     server {
         # configuration of HTTP virtual server 1
         location /one {
@@ -46,43 +50,9 @@ stream {
     }
 }
 ```
-**子模块可以继承父模块的指令（例如`server`子模块可以继承父模块`http`中的指令），可以在子模块中重写指令，实现覆盖从父模块继承的指令**。
-# 静态站点
-[Serving Static Content](https://docs.nginx.com/nginx/admin-guide/web-server/serving-static-content/)
-
-提供访问静态资源的`http`服务，`nginx`的配置样例如下：
+可以通过如下命令检测配置文件`nginx.conf`的语法：
 ```bash
-# 设置 worker 进程个数，一般情况设置和 cpu 核心数相同
-worker_processes 1;
+nginx -t -c <path>/nginx.conf
 
-events {
-    # 单个 worker 进程的最大并发连接数
-    worker_connections 1024;
-    use epoll;
-}
-
-http {
-    server {
-        # 用于搜索请求文件的根目录，最终搜索路径是 root/<uri>
-        # 例如：请求 uri 是 /images/，则最终搜索路径是 /usr/data/resources/images/
-        root /usr/data/resources;
-        listen 8080 backlog=128;
-        location / {
-            tcp_nodelay on;
-            keepalive_timeout 65;
-            # 如果请求是一个目录，自动返回目录列表
-            autoindex on;
-            sendfile on;
-            sendfile_max_chunk 1m;
-            tcp_nopush on;
-        }
-    }
-}
 ```
-如果请求的`URI`以`/`结尾，则`nginx`认为当前请求是个目录，`nginx`会在请求目录下找 index 文件（默认名是`index.html`），
-可以使用`index`指令指定 index 文件名。例如，如果请求`URI`是`/images/path/`，则`nginx`会找文件`/usr/data/images/path/index.html`。
-如果文件不存在，返回`403`错误。可以配置`autoindex`指令，返回目录列表。
-
-指令`sendfile`、`tcp_nopush`和`tcp_nodelay`用于性能优化，这里不做详细解释，之后的原理分析会说。
-
-# 反向代理
+# Web 服务器
