@@ -105,6 +105,7 @@ spec:
             emptyDir: {}
   ```
   和`Init`容器定义类似，只是**需要声明`restartPolicy: Always`字段**。
+  > `Sidecar`容器也可以是普通的容器，不一定是`initContainer`类型的容器。`initContainer`类型的`Sidecar`在`V1.29`版本才支持。
 
 下面介绍`Pod`定义相关的几个字段。
 + `nodeSelector`：节点选择器，只有匹配`nodeSelector`指定标签的节点才会部署`Pod`。
@@ -649,3 +650,904 @@ Events:
 
 # StatefulSet
 对于有状态应用，也就是各个实例之间不是对等关系以及实例对外部数据有依赖关系。例如主从关系，主备关系等。不适合使用`Deployment`管理。
+有状态的应用大概分两种情况：
++ **拓扑状态**：应用的多个实例之间不是对等关系，实例需要按特定顺序启动。例如实例之间有主从关系，主节点先于从节点启动。
+如果实例被重启，则需按照之前的启动顺序启动，且新创建的的实例和原来的实例有相同的网络标识，这样原先的访问者可以通过相同的标识访问新创建的实例。
++ **存储状态**：多个实例分别绑定不同的存储数据。`PodA`第一次读取的数据和之后一段时间读取的数据应该是同一份，即使在此期间，`PodA`被重新创建过。
+例如数据库的多个存储实例。
+
+对于**拓扑状态**的用于，`StatefulSet`利用`Headless Services`来维持`Pod`间的拓扑状态。因为`Headless Services`为`Pod`提供唯一的网络标识。
+一个`Headless Services`的样例如下：
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  ports:
+  - port: 80
+    name: web
+  clusterIP: None
+  selector:
+    app: nginx
+```
+其中`clusterIP`必须设置为`None`以表示一个`Headless Services`。此`Services`创建后没有分配一个`Services IP`，
+而是以`DNS`记录的方式暴露其代理的所有`Pod`的`IP`地址，每一个被代理的`Pod`的`DNS`记录如下：
+```bash
+<pod-name>.<svc-name>.<namespace>.svc.cluster.local
+```
+一个`StatefulSet`对象的定义如下：
+```yml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  serviceName: "nginx"
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.16.1
+        ports:
+        - containerPort: 80
+          name: web
+```
+其中`serviceName: nginx`指示`StatefulSet`控制器使用`nginx`这个`Headless Services`来保证`Pod`的网络标识。
+将上述`Headless Services`和`StatefulSet`部署到集群（先部署`Headless Services`然后部署`StatefulSet`）：
+```bash
+# 查看 Headless Services 的信息
+$ kubectl get  services
+NAME         TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+nginx        ClusterIP   None         <none>        80/TCP    3s
+# 查看 StatefulSet 信息
+$ kubectl get statefulsets.apps web
+NAME   READY   AGE
+web    2/2     63s
+# 查看 pod 的信息
+$ kubectl get pods -o wide
+NAME       READY   STATUS    RESTARTS        AGE     IP              NODE                      NOMINATED NODE   READINESS GATES
+web-0      1/1     Running   0               15m     192.168.1.195   ylq-ubuntu-server-node1   <none>           <none>
+web-1      1/1     Running   0               15m     192.168.1.196   ylq-ubuntu-server-node1   <none>           <none>
+# 查看 statefulsets 事件信息
+$ kubectl describe statefulsets.apps web
+...
+Events:
+  Type    Reason            Age    From                    Message
+  ----    ------            ----   ----                    -------
+  Normal  SuccessfulCreate  2m31s  statefulset-controller  create Pod web-0 in StatefulSet web successful
+  Normal  SuccessfulCreate  2m30s  statefulset-controller  create Pod web-1 in StatefulSet web successful
+```
+可以看到`StatefulSet`给其管理的所有`Pod`名字进行了编号，编号规则是`-`，且从`0`开始。`Pod`创建严格按照编号进行，
+`web-0`进入`Running`状态之前，`web-1`会一直处于`Pending`状态。
+
+在`Pod`内通过`DNS`来访问`StatefulSet`管理的`Pod`：
+```bash
+# 访问 web-0 
+$ kubectl exec dnsutils -- nslookup web-0.nginx.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-0.nginx.default.svc.cluster.local
+Address: 192.168.1.195
+# 访问 web-1
+$ kubectl exec dnsutils -- nslookup web-1.nginx.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-1.nginx.default.svc.cluster.local
+Address: 192.168.1.196
+```
+如果将`StatefulSet`管理的`Pod`删除，则会按照之前的编号顺序，重新创建两个`Pod`，且两个新创建的`Pod`的`DNS`记录保存不变。
+> 实验发现，如果只是删除一个`Pod`，例如删除`web-0`或者`web-1`，则只会创建被删除的`Pod`。
+
+对于**存储状态**的应用，`StatefulSet`管理的`Pod`可以通过`volumeClaimTemplates`声明挂载`Volume`的模版来挂载一个`Volume`。样例如下：
+```yml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  serviceName: "nginx"
+  replicas: 2
+  minReadySeconds: 10
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: nginx
+        image: nginx:1.16.1
+        ports:
+        - containerPort: 80
+          name: web
+        volumeMounts:  # 挂载 Volume
+        - name: www
+          mountPath: /usr/share/nginx/html
+  volumeClaimTemplates: # 挂载 Volume 模版
+  - metadata:
+      name: www
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "my-storage-class"
+      resources:
+        requests:
+          storage: 1Gi
+```
+当`StatefulSet`管理的`Pod`被删除后，例如`web-0`被删除，则`web-0`对应的`PVC`和`PV`并不会删除，数据依然存在。
+`StatefulSet`控制器发现`web-0`的`Pod`消失，会重新创建一个名为`web-0`的新`Pod`。新创建名为`web-0`的`Pod`声明使用的`PVC`还是名为`www-web-0`（因为创建`Pod`的模版定义没变），
+所以就会查找到同名的`PVC`，进而找到对应的`PV`和新创建的`Pod`绑定。进而新创建的`Pod`还可以继续访问之前的数据。
+
+**最后使用`StatefulSet`部署一个`mysql`集群**，`mysql`集群有以下特点：
++ 主从复制功能，一个主节点，多个从节点。
++ 所有写操作在主节点，读操作在所有节点。
++ 从节点可以水平拓展。
+
+> 裸机部署`mysql`集群，从节点同步主节点数据需要做有以下操作：
+> + 安装好`mysql`主节点之后，需要通过`XtraBackup`工具将主节点数据备份到指定目录，同时会生成一个备份信息文件`xtrabackup_binlog_info`文件；
+>   ```sql
+>   # xtrabackup_binlog_info 文件内容如下
+>   mysql-bin.000123   45678
+>   ```
+> + 配置从节点，在从节点第一次启动前，需要将主节点的备份数据及备份信息文件`xtrabackup_binlog_info`一起复制到自己的`/var/lib/mysql`下，
+> 然后执行下面的`SQL`语句：
+>   ```sql
+>   CHANGE MASTER TO
+>     MASTER_HOST='主节点IP',
+>     MASTER_USER='replica_user',
+>     MASTER_PASSWORD='password',
+>     MASTER_LOG_FILE='mysql-bin.000123',
+>     MASTER_LOG_POS=45678;
+>   ```
+> + 启动从节点。后续启动更多的从节点，可以从已经完成数据备份的从节点备份数据即可。
+>   ```sql
+>   START SLAVE;
+>   ```
+
+部署`mysql`集群需要解决如下三个问题：
++ 主节点和从节点需要有不同的配置文件。
++ 主节点和从节点需要传输备份信息文件，备份信息文件给从节点从主节点备份数据使用。
++ 从节点第一次启动之前需要做一些`SQL`初始化工作。
+
+首先看下问题一：主节点和从节点需要有不同的配置文件。定义如下的`ConfigMap`文件：
+```yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+data:
+  primary.cnf: |
+    # 仅在主服务器上应用此配置
+    [mysqld]
+    log-bin # 启动二进制文件形式的主从复制 
+  replica.cnf: |
+    # 仅在副本服务器上应用此配置
+    [mysqld]
+    super-read-only # 从节点会拒绝除主节点同步写之外的所有写操作，对用户是只读    
+```
+上述定义了`primary.cnf`和`replica.cnf`两个`mysql`配置文件。其中`data`部分是`key-value`格式，`primary.cnf`和`replica.cnf`就是`key`，
+`|`后面的对应的内容就是`value`。此`ConfigMap`被挂载进`Pod`后，会在挂载目录下生成名为`primary.cnf`或者`replica.cnf`的文件。
+
+继续创建两个`Service`，定义如下：
+```yml
+# 为 StatefulSet 成员提供稳定的 DNS 表项的无头服务（Headless Service）
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  clusterIP: None
+  selector:
+    app: mysql
+---
+# 用于连接到任一 MySQL 实例执行读操作的客户端服务
+# 对于写操作，你必须连接到主服务器：mysql-0.mysql
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+    readonly: "true"
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  selector:
+    app: mysql
+```
+其中`Headless Service`用于给`StatefulSet`管理的`Pod`提供稳定唯一的网络标示，例如`mysql-0.mysql`表示主节点，`mysql-1.mysql`表示从节点。
+名为`mysql-read`的普通`Service`用于用户的读请求。
+
+然后看下问题二：主从节点需要传输备份数据。这部分涉及问题较多，分几个步骤完成：
++ 需要做初始化工作，根据`mysql`节点的角色为`Pod`挂载不同的配置文件。同时`mysql`集群中的每个节点都要有唯一的`ID`文件`server-id.conf`。
+此部分工作可以用`initContainers`实现：
+  ```yml
+  # template.spec 部分内容
+  spec:
+    initContainers:
+    - name: init-mysql
+      image: mysql:5.7
+      command:
+      - bash
+      - "-c"
+      - |
+        set -ex
+        # 基于 Pod 序号生成 MySQL 服务器的 ID。
+        [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
+        ordinal=${BASH_REMATCH[1]}
+        echo [mysqld] > /mnt/conf.d/server-id.cnf
+        # 添加偏移量以避免使用 server-id=0 这一保留值。
+        echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+        # 将合适的 conf.d 文件从 config-map 复制到 emptyDir。
+        if [[ $ordinal -eq 0 ]]; then
+          cp /mnt/config-map/primary.cnf /mnt/conf.d/
+        else
+          cp /mnt/config-map/replica.cnf /mnt/conf.d/
+        fi          
+      volumeMounts:
+      - name: conf
+        mountPath: /mnt/conf.d
+      - name: config-map
+        mountPath: /mnt/config-map
+  ```
+  上述初始化容器`init-mysql`首先根据`Pod`的编号生成一个`/mnt/conf.d/server-id.cnf`文件，然后根据`Pod`编号为`0`时认为是主节点，
+  进而拷贝`primary.cnf`的`ConfigMap`配置，否则拷贝从节点的`replica.cnf`的`ConfigMap`配置。
+  > 同一个`Pod`中的所有容器共享网络空间，所以拿到的都是同一个`hostname`。
+
++ 从节点启动前将要同步的数据（来自主节点或者其他从节点）拷贝到自己的`/var/lib/mysql/mysql`目录下。
+这部分工作也通过一个`initContainer`容器完成：
+  ```yml
+  # template.spec 部分内容
+  initContainers:
+  - name: init-mysql
+    ...
+  - name: clone-mysql
+    image: gcr.io/google-samples/xtrabackup:1.0
+    command:
+    - bash
+    - "-c"
+    - |
+      set -ex
+      # 如果已有数据，则跳过克隆。
+      [[ -d /var/lib/mysql/mysql ]] && exit 0
+      # 跳过主实例（序号索引 0）的克隆。
+      [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+      ordinal=${BASH_REMATCH[1]}
+      [[ $ordinal -eq 0 ]] && exit 0
+      # 从原来的对等节点克隆数据。
+      ncat --recv-only mysql-$(($ordinal-1)).mysql 3307 | xbstream -x -C /var/lib/mysql
+      # 准备备份。
+      xtrabackup --prepare --target-dir=/var/lib/mysql          
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/mysql
+      subPath: mysql
+    - name: conf
+      mountPath: /etc/mysql/conf.d
+  ```
+  上述名为`clone-mysql`的`initContainer`容器在判断需要同步数据的时候，直接使用`ncat`命令向`DNS`记录为`mysql-<当前pod编号-1>.mysql`的`Pod`，
+  即当前`Pod`的前一个`Pod`发起数据传输请求，使用`xbstream`命令将收到的备份数据保存在`/var/lib/mysql`目录下。
+  其中`/var/lib/mysql`挂载的是个`PVC`，数据持久存储，即使`Pod`重启也可以继续访问原始数据。
+
+最后看下第三个问题：从节点启动之前，需要执行初始化的`SQL`语句以使用之前同步的备份的数据对从节点初始化（主节点没有这个问题，主节点直接启动即可）。
+可以使用`Sidecar`容器完成这个工作：
+```yml
+# template.spec 部分
+containers:
+...
+- name: xtrabackup
+  image: gcr.io/google-samples/xtrabackup:1.0
+  ports:
+  - name: xtrabackup
+    containerPort: 3307
+  command:
+  - bash
+  - "-c"
+  - |
+    set -ex
+    cd /var/lib/mysql
+
+    # 确定克隆数据的 binlog 位置（如果有的话）。
+    if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
+      # XtraBackup 已经生成了部分的 “CHANGE MASTER TO” 查询
+      # 因为我们从一个现有副本进行克隆。(需要删除末尾的分号!)
+      cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
+      # 在这里要忽略 xtrabackup_binlog_info （它是没用的）。
+      rm -f xtrabackup_slave_info xtrabackup_binlog_info
+    elif [[ -f xtrabackup_binlog_info ]]; then
+      # 我们直接从主实例进行克隆。解析 binlog 位置。
+      [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
+      rm -f xtrabackup_binlog_info xtrabackup_slave_info
+      echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
+            MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
+    fi
+
+    # 检查我们是否需要通过启动复制来完成克隆。
+    if [[ -f change_master_to.sql.in ]]; then
+      echo "Waiting for mysqld to be ready (accepting connections)"
+      until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
+
+      echo "Initializing replication from clone position"
+      mysql -h 127.0.0.1 \
+            -e "$(<change_master_to.sql.in), \
+                    MASTER_HOST='mysql-0.mysql', \
+                    MASTER_USER='root', \
+                          MASTER_PASSWORD='', \
+                          MASTER_CONNECT_RETRY=10; \
+                        START SLAVE;" || exit 1
+            # 如果容器重新启动，最多尝试一次。
+            mv change_master_to.sql.in change_master_to.sql.orig
+          fi
+
+          # 当对等点请求时，启动服务器发送备份。
+          exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
+            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root"          
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+```
+上述的`xtrabackup`的`Sidecar`容器主要完成以下工作：
++ 如果有`xtrabackup_slave_info`文件且不为空，则说明备份数据是从一个从节点生成，在这种情况下`XtraBackup`工具在备份的时候，
+已经在`xtrabackup_slave_info`里面生成了`CHANGE MASTER TO`的`SQL`语句。直接将`xtrabackup_slave_info`命名为`change_master_to.sql.in`文件，直接使用即可。
++ 如何`xtrabackup_slave_info`文件不存在，但`xtrabackup_binlog_info`文件存在，说明备份信息来自主节点。这时候需要解析`xtrabackup_binlog_info`文件，
+读取`MASTER_LOG_POS`和`MASTER_LOG_FILE`两个字段值，构造`SQL`初始化语句。并将信息写到`change_master_to.sql.in`文件中。
++ 利用上述的`change_master_to.sql.in`文件进行从节点的初始化工作。首先因为`Pod`里面的常规容器启动没有先后顺序（`mysql`容器和`xtrabackup`辅助容器启动没有顺序），
+所以会等待`mysqld`服务启动，通过执行`SELECT 1`语句检查。之后会开始执行`change_master_to.sql.in`文件中的`CHANGE MASTER TO`语句和`SLAVE START`语句完成从节点的初始化。
+最后需要将`change_master_to.sql.in`文件重命名，避免`Pod`重启时，再次执行初始化工作。
++ 启动一个数据传输服务，利用`ncat`工具监听`3307`端口，一旦收到数据传输请求，就执行`xtrabackup --backup`命令。
+
+解决了上述三个问题后，接下来可以定义主角`mysql`容器，定义如下：
+```yml
+# template.spec 部分
+containers:
+- name: mysql
+  image: mysql:5.7
+  env:
+  - name: MYSQL_ALLOW_EMPTY_PASSWORD
+    value: "1"
+  ports:
+  - name: mysql
+    containerPort: 3306
+  volumeMounts:
+  - name: data
+    mountPath: /var/lib/mysql
+    subPath: mysql
+  - name: conf
+    mountPath: /etc/mysql/conf.d
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+  livenessProbe:
+    exec:
+      command: ["mysqladmin", "ping"]
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    exec:
+      # 检查我们是否可以通过 TCP 执行查询（skip-networking 是关闭的）。
+      command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
+    initialDelaySeconds: 5
+    periodSeconds: 2
+    timeoutSeconds: 1
+```
+上述`mysql`容器定义了存活探针`livenessProbe`和就绪探针`readinessProbe`。至此，完整的`mysql`集群定义完成。
+
+下面给出`mysql`集群完整定义`StatefulSet`如下：
+```yml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+      app.kubernetes.io/name: mysql
+  serviceName: mysql
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: mysql
+        app.kubernetes.io/name: mysql
+    spec:
+      initContainers:
+      - name: init-mysql
+        image: mysql:5.7
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # 基于 Pod 序号生成 MySQL 服务器的 ID。
+          [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          echo [mysqld] > /mnt/conf.d/server-id.cnf
+          # 添加偏移量以避免使用 server-id=0 这一保留值。
+          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          # 将合适的 conf.d 文件从 config-map 复制到 emptyDir。
+          if [[ $ordinal -eq 0 ]]; then
+            cp /mnt/config-map/primary.cnf /mnt/conf.d/
+          else
+            cp /mnt/config-map/replica.cnf /mnt/conf.d/
+          fi          
+        volumeMounts:
+        - name: conf
+          mountPath: /mnt/conf.d
+        - name: config-map
+          mountPath: /mnt/config-map
+      - name: clone-mysql
+        image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/gcr.io/google-samples/xtrabackup:1.0
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # 如果已有数据，则跳过克隆。
+          [[ -d /var/lib/mysql/mysql ]] && exit 0
+          # 跳过主实例（序号索引 0）的克隆。
+          [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          [[ $ordinal -eq 0 ]] && exit 0
+          # 从原来的对等节点克隆数据。
+          ncat --recv-only mysql-$(($ordinal-1)).mysql 3307 | xbstream -x -C /var/lib/mysql
+          # 准备备份。
+          xtrabackup --prepare --target-dir=/var/lib/mysql          
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "1"
+        ports:
+        - name: mysql
+          containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "ping"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            # 检查我们是否可以通过 TCP 执行查询（skip-networking 是关闭的）。
+            command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+      - name: xtrabackup
+        image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/gcr.io/google-samples/xtrabackup:1.0
+        ports:
+        - name: xtrabackup
+          containerPort: 3307
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          cd /var/lib/mysql
+
+          # 确定克隆数据的 binlog 位置（如果有的话）。
+          if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
+            # XtraBackup 已经生成了部分的 “CHANGE MASTER TO” 查询
+            # 因为我们从一个现有副本进行克隆。(需要删除末尾的分号!)
+            cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
+            # 在这里要忽略 xtrabackup_binlog_info （它是没用的）。
+            rm -f xtrabackup_slave_info xtrabackup_binlog_info
+          elif [[ -f xtrabackup_binlog_info ]]; then
+            # 我们直接从主实例进行克隆。解析 binlog 位置。
+            [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
+            rm -f xtrabackup_binlog_info xtrabackup_slave_info
+            echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
+                  MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
+          fi
+
+          # 检查我们是否需要通过启动复制来完成克隆。
+          if [[ -f change_master_to.sql.in ]]; then
+            echo "Waiting for mysqld to be ready (accepting connections)"
+            until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
+
+            echo "Initializing replication from clone position"
+            mysql -h 127.0.0.1 \
+                  -e "$(<change_master_to.sql.in), \
+                          MASTER_HOST='mysql-0.mysql', \
+                          MASTER_USER='root', \
+                          MASTER_PASSWORD='', \
+                          MASTER_CONNECT_RETRY=10; \
+                        START SLAVE;" || exit 1
+            # 如果容器重新启动，最多尝试一次。
+            mv change_master_to.sql.in change_master_to.sql.orig
+          fi
+
+          # 当对等点请求时，启动服务器发送备份。
+          exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
+            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root"          
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+      volumes:
+      - name: conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Mi
+      storageClassName: local-storage
+```
+`mysql`集群**部署流程总结**如下：
++ `StatefulSet`控制器给管理的`Pod`分配唯一稳定的名字，序号从`0`开始，例如`mysql-0`、`mysql-1`等。
+`StatefulSet`控制器严格按序号顺序启动`Pod`，等到当前`Pod`启动就绪才会启动下一个`Pod`。以此执行`mysql`副本的有序启动。
++ 每一个`Pod`启动的时候，首先执行`initContainers`容器。`init-mysql`容器完成生成特殊`mysql`配置文件`server-id.cnf`以及根据是主节点还是从节点选择挂载`primary.cnf`或者`replica.cnf`的`ConfigMap`文件。
+序号为`0`的`Pod`（`mysql-0`）认为是主节点，其他是从节点。`clone-mysql`的`initContainer`完成要备份数据的同步工作（**主节点跳过**），
+可能从主节点同步备份数据也可能从从节点同步备份数据。因为`StatefulSet`保证`Pod`的启动顺序，所以选择从前一个`Pod`同步备份数据，
+因为前一个`Pod`一定是启动成功的。
++ 在一个`Pod`中，`initContainers`容器完成后，开始运行常规的容器。这里要完成两部分工作，正常的`mysql`服务以及当前节点数据初始化。
+数据初始化以及提供数据备份能力在`xtrabackup`的`Sidecar`容器中完成（**主节点跳过数据初始化步骤**）。
+
+挂载用到了`PV`和`PVC`，所以先创建三个基于本地存储的`PV`，每个`mysql`节点对于一个：
+```yml
+# 文件名 mysql-pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-pv-0
+spec:
+  capacity:
+    storage: 1Gi                                                  # PV 提供的存储容量
+  accessModes:
+    - ReadWriteOnce                                               # 访问模式
+  persistentVolumeReclaimPolicy: Retain                           # 回收策略 (Retain, Recycle, Delete)
+  storageClassName: local-storage                                 # 存储类名称
+  hostPath:                                                       # 本地路径（物理存储路径）
+    path: /home/ylq/workspace/k8s/applications/mysql-0-storage      # 在宿主机上的目录
+    type: DirectoryOrCreate                                       # 如果目录不存在则创建
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-pv-1
+spec:
+  capacity:
+    storage: 1Gi                                                  # PV 提供的存储容量
+  accessModes:
+    - ReadWriteOnce                                               # 访问模式
+  persistentVolumeReclaimPolicy: Retain                           # 回收策略 (Retain, Recycle, Delete)
+  storageClassName: local-storage                                 # 存储类名称
+  hostPath:                                                       # 本地路径（物理存储路径）
+    path: /home/ylq/workspace/k8s/applications/mysql-1-storage      # 在宿主机上的目录
+    type: DirectoryOrCreate                                       # 如果目录不存在则创建
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-pv-2
+spec:
+  capacity:
+    storage: 1Gi                                                  # PV 提供的存储容量
+  accessModes:
+    - ReadWriteOnce                                               # 访问模式
+  persistentVolumeReclaimPolicy: Retain                           # 回收策略 (Retain, Recycle, Delete)
+  storageClassName: local-storage                                 # 存储类名称
+  hostPath:                                                       # 本地路径（物理存储路径）
+    path: /home/ylq/workspace/k8s/applications/mysql-2-storage      # 在宿主机上的目录
+    type: DirectoryOrCreate                                       # 如果目录不存在则创建
+```
+将`mysql-pv`部署到集群，检查`PV`的状态：
+```bash
+# PV 状态
+$ kubectl get pv
+NAME         CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS    VOLUMEATTRIBUTESCLASS   REASON   AGE
+mysql-pv-0   1Gi        RWO            Retain           Available           local-storage   <unset>                          111s
+mysql-pv-1   1Gi        RWO            Retain           Available           local-storage   <unset>                          111s
+mysql-pv-2   1Gi        RWO            Retain           Available           local-storage   <unset>                          111s
+```
+最后将上述的`ConfigMap`、`Service`和`StatefulSet`定义部署到集群。观察`Pod`的启动进度：
+```bash
+$ kubectl get pods -l app=mysql -w
+NAME      READY   STATUS    RESTARTS   AGE
+mysql-0   1/2     Running   0          6s
+mysql-0   2/2     Running   0          7s
+mysql-1   0/2     Pending   0          0s
+mysql-1   0/2     Pending   0          0s
+mysql-1   0/2     Init:0/2   0          0s
+mysql-1   0/2     Init:1/2   0          1s
+mysql-1   0/2     PodInitializing   0          2s
+mysql-1   1/2     Running           0          3s
+mysql-1   2/2     Running           0          8s
+mysql-2   0/2     Pending           0          0s
+mysql-2   0/2     Pending           0          0s
+mysql-2   0/2     Init:0/2          0          0s
+mysql-2   0/2     Init:1/2          0          1s
+mysql-2   0/2     Init:1/2          0          2s
+mysql-2   0/2     PodInitializing   0          7s
+mysql-2   1/2     Running           0          8s
+mysql-2   2/2     Running           0          12s
+# 最终Pod 的状态
+$ kubectl get pods -l app=mysql
+NAME      READY   STATUS    RESTARTS   AGE
+mysql-0   2/2     Running   0          64s
+mysql-1   2/2     Running   0          57s
+mysql-2   2/2     Running   0          49s
+```
+上述`mysql-0`是主节点，`mysql-1`和`mysql-2`是从节点。查看`PVC`绑定情况如下：
+```bash
+$ kubectl get pvc
+NAME           STATUS   VOLUME       CAPACITY   ACCESS MODES   STORAGECLASS    VOLUMEATTRIBUTESCLASS   AGE
+data-mysql-0   Bound    mysql-pv-0   1Gi        RWO            local-storage   <unset>                 13m
+data-mysql-1   Bound    mysql-pv-1   1Gi        RWO            local-storage   <unset>                 13m
+data-mysql-2   Bound    mysql-pv-2   1Gi        RWO            local-storage   <unset>                 13m
+```
+下面验证部署的`mysql`集群工作状态。首先用`mysql`客户端连接主节点`mysql-0.mysql`，创建一张表并插入一条记录：
+```bash
+kubectl run mysql-client --image=mysql:5.7 -i --rm --restart=Never --\
+  mysql -h mysql-0.mysql <<EOF
+CREATE DATABASE test;
+CREATE TABLE test.messages (message VARCHAR(250));
+INSERT INTO test.messages VALUES ('hello');
+EOF
+```
+访问创建的名为`mysql-read`的`Service`查询插入的记录：
+```bash
+$ kubectl run mysql-client --image=mysql:5.7 -i -t --rm --restart=Never --\
+  mysql -h mysql-read -e "SELECT * FROM test.messages"
++---------+
+| message |
++---------+
+| hello   |
++---------+
+pod "mysql-client" deleted
+```
+因为名为`mysql-read`的`Service`后端`Pod`涉及所有的节点，包括主节点和从节点，每次访问`mysql-read`都可能选择不同的节点：
+```bash
+$ kubectl run mysql-client-loop --image=mysql:5.7 -i -t --rm --restart=Never --\
+  bash -ic "while sleep 1; do mysql -h mysql-read -e 'SELECT @@server_id,NOW()'; done"
+If you don't see a command prompt, try pressing enter.
++-------------+---------------------+
+| @@server_id | NOW()               |
++-------------+---------------------+
+|         100 | 2024-11-22 02:28:49 |
++-------------+---------------------+
++-------------+---------------------+
+| @@server_id | NOW()               |
++-------------+---------------------+
+|         101 | 2024-11-22 02:28:50 |
++-------------+---------------------+
++-------------+---------------------+
+| @@server_id | NOW()               |
++-------------+---------------------+
+|         102 | 2024-11-22 02:28:54 |
++-------------+---------------------+
+```
+因为每个`mysql`节点都配置了就绪探针，所以一旦检测某个节点未就绪，则`mysql-read`的`Service`后端就会删除此`Pod`，
+直到`Pod`重新就绪才会重新加入`mysql-read`的后端`Pod`。
+
+可以通过命令方便地扩容从节点数量：
+```bash
+kubectl scale statefulset mysql --replicas=<nums>
+```
+`StatefulSet`可以使用`spec.updateStrategy.rollingUpdate.partition`字段进行金丝雀发布，例如将`partition`设置为`2`，
+则只有序号大于等于`2`的`Pod`才会更新，序号小于`2`的`Pod`不会更新，即使序号小于`2`的`Pod`重新，也会保持原来更新前的状态。
+
+# DaemonSet
+`DaemonSet`确保全部（或者某些）节点上**运行一个`Pod`的副本**。当有节点加入集群时，也会为他们新增一个`Pod`。
+当有节点从集群移除时，这些`Pod`也会被回收。删除`DaemonSet`将会删除它创建的所有`Pod`。
+
+`DaemonSet`适合使用的场景样例如下：
++ 在每个节点上运行集群守护进程。
++ 在每个节点上运行日志收集守护进程。
++ 在每个节点上运行监控守护进程。
+
+下面给出一个`DaemonSet`的配置样例：
+```yml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-elasticsearch
+  namespace: default
+  labels:
+    k8s-app: fluentd-logging
+spec:
+  selector:
+    matchLabels:
+      name: fluentd-elasticsearch
+  template:
+    metadata:
+      labels:
+        name: fluentd-elasticsearch
+    spec:
+      tolerations:
+      # 这些容忍度设置是为了让该守护进程集在控制平面节点上运行
+      # 如果你不希望自己的控制平面节点运行 Pod，可以删除它们
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: fluentd-elasticsearch
+        image: quay.io/fluentd_elasticsearch/fluentd:v2.5.2
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      # 可能需要设置较高的优先级类以确保 DaemonSet Pod 可以抢占正在运行的 Pod
+      # priorityClassName: important
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+```
+上述`DaemonSet`管理的是`fluentd-elasticsearch`的`Pod`，用于收集容器日志到`elasticsearch`。`DaemonSet`定义不需要`replicas`字段。
+`DaemonSet`控制器会遍历存放在`etcd`里面的节点列表，会检测节点是否有携带有标签`name: fluentd-elasticsearch`的`Pod`。
++ 如果没有就在该节点创建一个此`Pod`。
++ 如果这种`Pod`数量大于`1`，则删除多余的`Pod`。
++ 如果`Pod`数为`1`，什么都不需要做。
+
+**`DaemonSet`控制器如何将`Pod`部署到指定的节点呢？**`DaemonSet`控制器在向`k8s`发起创建`Pod`请求之前，
+会直接修改根据模版生成的`Pod`对象（不会更改`DaemonSet`的`spec.template`定义），在`Pod`的`API`对象上添加`nodeAffinity`字段：
+```yml
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+    - matchFields:
+      - key: metadata.name
+        operator: In
+        values:
+        - target-host-name
+```
+其中`requiredDuringSchedulingIgnoredDuringExecution`表示`nodeAffinity`只在每次调度时候考虑。且这个`Pod`只允许在`metadata.name`是`target-host-name`的节点上运行。
+
+同时`DaemonSet`控制器会在`Pod`的定义中添加`spec.template.spec.tolerations`字段（[自动添加的`tolerations`](https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/daemonset/)），
+也可以自己定义`tolerations`。表示允许在有“污点”的节点上调度。
+
+如果节点的标签被修改，`DaemonSet`将立刻向新匹配上的节点添加`Pod`，同时删除不匹配的节点上的`Pod`。
+
+将上述`DaemonSet`定义的对象部署到集群：
+```bash
+# 部署
+$ kubectl apply -f daemonset.yml
+daemonset.apps/fluentd-elasticsearch created
+# 查看 Pod 状态
+$ kubectl get pods -l name=fluentd-elasticsearch -o wide
+NAME                          READY   STATUS    RESTARTS   AGE     IP              NODE                      NOMINATED NODE   READINESS GATES
+fluentd-elasticsearch-d7m2s   1/1     Running   0          2m38s   192.168.0.82    ylq-ubuntu-server         <none>           <none>
+fluentd-elasticsearch-ns978   1/1     Running   0          2m38s   192.168.1.247   ylq-ubuntu-server-node1   <none>           <none>
+```
+可以看到`fluentd-elasticsearch`的`Pod`在集群的两个节点上都成功部署。查看`Pod`的定义：
+```bash
+$ kubectl get pods fluentd-elasticsearch-d7m2s -o yaml
+...
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchFields:
+          - key: metadata.name
+            operator: In
+            values:
+            - ylq-ubuntu-server
+...
+tolerations:
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/control-plane
+    operator: Exists
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/master
+    operator: Exists
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    operator: Exists
+  - effect: NoSchedule
+    key: node.kubernetes.io/disk-pressure
+    operator: Exists
+  - effect: NoSchedule
+    key: node.kubernetes.io/memory-pressure
+    operator: Exists
+  - effect: NoSchedule
+    key: node.kubernetes.io/pid-pressure
+    operator: Exists
+  - effect: NoSchedule
+    key: node.kubernetes.io/unschedulable
+    operator: Exists
+```
+发现`DaemonSet`控制器自动在`Pod`定义添加`nodeAffinity`和`tolerations`字段定义。另一个`Pod`也类似。
+
+# Job 和 CronJob
+对于执行完一次就退出的离线业务，需要使用`Job`对象进行管理。下面是一个`Job`对象的定义：
+```yml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi
+spec:
+  template:
+    spec:
+      containers:
+      - name: pi
+        image: perl:5.34.0
+        command: ["perl",  "-Mbignum=bpi", "-wle", "print bpi(2000)"]
+      restartPolicy: Never
+  backoffLimit: 4
+```
+上述定义的`Job`会计算 $\pi$ 小数点后`2000`位。
