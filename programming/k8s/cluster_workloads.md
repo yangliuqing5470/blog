@@ -1550,4 +1550,176 @@ spec:
       restartPolicy: Never
   backoffLimit: 4
 ```
-上述定义的`Job`会计算 $\pi$ 小数点后`2000`位。
+上述定义的`Job`会计算 $\pi$ 小数点后`2000`位。`Job`中`restartPolicy`只能设置为`Never`或者`OnFailure`。
++ `.spec.template.spec.restartPolicy=OnFailure`：`Pod`则继续留在当前节点，不会创建新的`Pod`，但容器会被重新启动。
++ `.spec.template.spec.restartPolicy=Never`：当`Pod`失败时，`Job`控制器会启动一个新的`Pod`。
+
+将上述定义的`Job`部署到集群，并观察`Job`和`Pod`相关属性：
+```bash
+# 创建 Job 对象
+$ kubectl apply -f job.yaml
+job.batch/pi created
+# 查看 Job 对象属性
+ kubectl describe jobs.batch pi
+Name:             pi
+Namespace:        default
+Selector:         batch.kubernetes.io/controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+Labels:           batch.kubernetes.io/controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+                  batch.kubernetes.io/job-name=pi
+                  controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+                  job-name=pi
+Annotations:      <none>
+Parallelism:      1
+Completions:      1
+Completion Mode:  NonIndexed
+Suspend:          false
+Backoff Limit:    4
+Start Time:       Tue, 26 Nov 2024 07:06:09 +0000
+Pods Statuses:    1 Active (0 Ready) / 0 Succeeded / 0 Failed
+Pod Template:
+  Labels:  batch.kubernetes.io/controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+           batch.kubernetes.io/job-name=pi
+           controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+           job-name=pi
+  ...
+# 查看管理的 Pod 属性
+$ kubectl describe pods pi-mbdjx
+Name:             pi-mbdjx
+Namespace:        default
+Priority:         0
+Service Account:  default
+Node:             ylq-ubuntu-server-node1/10.211.55.10
+Start Time:       Tue, 26 Nov 2024 07:06:09 +0000
+Labels:           batch.kubernetes.io/controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+                  batch.kubernetes.io/job-name=pi
+                  controller-uid=b6ff9770-661a-43fa-a0c2-26f86b912bc9
+                  job-name=pi
+...
+```
+当`Job`被创建后，会在其`Pod Template`上自动添加`controller-uid`这个`Label`。这样可以避免不同的`Job`对象管理的`Pod`发生重合。
+这也是为什么不需要在`Job`定义中显示指定`.spec.selector`字段的原因。
+
+等一会后查看`Pod`的状态及查看`Pod`的执行结果：
+```bash
+# 查看 Pod 的状态
+$ kubectl get pods pi-mbdjx
+NAME       READY   STATUS      RESTARTS   AGE
+pi-mbdjx   0/1     Completed   0          9m18s
+# 查看 Pod 的执行结果
+$ kubectl logs jobs/pi
+3.141592653589793238462643383279502884197169...
+```
+`Job`对象定义中的`.spec.backoffLimit`字段定义了`Pod`失败时候重试次数，重试时间按指数增加（从`10s`、`20s`到`40s`等，最大`6min`）。
+也可以通过设置`.spec.activeDeadlineSeconds`字段指定一个秒数值以限制整个`Job`的运行时长。
+```yml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi-with-timeout
+spec:
+  backoffLimit: 5
+  # 限制 Job 运行时间
+  activeDeadlineSeconds: 100
+  template:
+    spec:
+      containers:
+      - name: pi`
+        image: perl:5.34.0
+        command: ["perl", "-Mbignum=bpi", "-wle", "print bpi(2000)"]
+      restartPolicy: Never
+`````
+一旦`Job`的运行时间达到`100s`，整个`Job`运行的所有`Pod`都会终止，且`Job`状态更新为`type: Failed`及`reason: DeadlineExceeded`。
+注意`.spec.activeDeadlineSeconds`优先级要高于`.spec.backoffLimit`。
+```bash
+$ kubectl get jobs.batch
+NAME   STATUS   COMPLETIONS   DURATION   AGE
+pi     Failed   0/1           3m2s       3m2s
+```
+`Job`对象一个重要的特点是可以并行执行任务，也就是批处理。**并行控制**的参数主要有两个：
++ `.spec.parallelism`：一个`Job`任意时间最多可以启动多少个`Pod`同时运行。
++ `.spec.completions`：`Job`至少要完成的`Pod`数，当成功的`Pod`个数达到`.spec.completions`时，`Job`被视为完成。
+
+`Job`控制器控制的对象直接就是`Pod`，在每个周期根据`Running`状态的`Pod`数，已经成功退出的`Pod`数，`.spec.parallelism`和`.spec.completions`值计算当前周期应该创建或者删除的`Pod`数。
+```bash
+当前创建 Pod 数 = min((.spec.completions - 已完成 - Running), .spec.parallelism)
+```
+> 例如`.spec.parallelism=2`、`.spec.completions=4`。第一次`Running`状态和已完成状态`Pod`个数为`0`，
+所以最多创建`.spec.parallelism=2`个`Pod`。如果在`Running`状态的`Pod`大于`2`，则`Job`控制器会删除多余的`Pod`。
+
+关于`.spec.parallelism`和`.spec.completions`两个参数默认值说明如下：
++ `spec.completions`和`spec.parallelism`这两个属性都不设置时，默认值都是`1`。
++ 设置`.spec.completions`但不设置`.spec.parallelism`，`.spec.parallelism`默认值是`1`。
++ 不设置`.spec.completions`，设置`.spec.parallelism`时，`.spec.completions`没有默认值。
+
+可以指定`.spec.ttlSecondsAfterFinished`值指示`TTL`控制器自动清理已结束的资源，单位是`s`。
+
+**下面介绍下`CronJob`**。`CronJob`是用于定时任务，下面是一个`CronJob`定义样例：
+```yml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hello
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: hello
+            image: busybox:1.28
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - date; echo Hello from the Kubernetes cluster
+          restartPolicy: OnFailure
+```
+定义中`.spec.schedule`字段是必须的，其遵守`Cron`语法：
+```bash
+# 5 个字段
+* * * * * 命令
+- - - - -
+| | | | |
+| | | | +---- 一周中的某一天 (0 - 7) (0 和 7 都代表周日)
+| | | +------ 月份 (1 - 12)
+| | +-------- 一个月中的某一天 (1 - 31)
+| +---------- 小时 (0 - 23)
++------------ 分钟 (0 - 59)
+```
+每一个字段也支持特殊符合：
++ `*`: 任意值。例如`*`在分钟字段表示每分钟。
++ `,`: 列表分隔符。例如`1,15`表示第`1`分钟和第`15`分钟。
++ `-`: 范围。例如`1-5`表示从`1`到`5`的范围。
++ `/`: 步长。例如`*/5`表示每隔`5`单位触发一次。
++ `?`: 仅用于“天”和“星期”字段，表示不指定具体值。
++ `L`: 仅用于“天”和“星期”字段，表示最后一个。例如`L`在天字段表示月末，`5L`在星期字段表示最后一个周五。
++ `W`: 工作日。仅用于“天”字段，例如`15W`表示最接近`15`日的工作日。
++ `#`: 第几个。仅用于“星期”字段，例如`3#2`表示每月的第二个星期三。
+
+```bash
+* * * * * 命令：表示每分钟执行一次。
+0 8 * * * 命令：每天早上8点。
+*/5 * * * * 命令：每5min执行一次。
+0 9-17 * * 1-5 命令：每周一到周五的上午 9 点到下午 5 点，每小时的第 0 分钟执行。
+30 23 L * * 命令：每月最后一天晚上 11:30 执行。
+```
+由于定时任务的特点，可能出现某个`Job`还没执行完，新的`Job`会产生。`.spec.concurrencyPolicy`控制处理策略：
++ `Allow`（默认）：`CronJob`允许并发`Job`执行。
++ `Forbid`：`CronJob`不允许并发执行；如果新`Job`的执行时间到了而老`Job`没有执行完，`CronJob`会忽略新`Job`的执行。
+另请注意，当老`Job`执行完成时，仍然会考虑`.spec.startingDeadlineSeconds`，可能会导致新的`Job`执行。
++ `Replace`：如果新`Job`的执行时间到了而老`Job`没有执行完，`CronJob`会用新`Job`替换当前正在运行的`Job`。
+
+将上述定义的`CronJob`部署到集群，并观察其工作状态：
+```bash
+# 部署 cronjob 对象
+$ kubectl get cronjobs.batch
+NAME    SCHEDULE    TIMEZONE   SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+hello   * * * * *   <none>     False     0        <none>          19s
+# 查看 job 对象，每分钟会有一个新的 job 被调度
+$ kubectl get jobs.batch
+NAME             STATUS     COMPLETIONS   DURATION   AGE
+hello-28876894   Complete   1/1           3s         2m21s
+hello-28876895   Complete   1/1           2s         81s
+hello-28876896   Complete   1/1           3s         21s
+```
