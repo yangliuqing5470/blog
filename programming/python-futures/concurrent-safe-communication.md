@@ -239,3 +239,149 @@ def release(self):
         self._cond.notify()
 ```
 信号量的释放只是简单将计数值加一，并唤醒一个等待的线程。这里没有限制计数值上限，如果需要限制可以使用`BoundedSemaphore`对象。
+
+# 管道
+管道用于多进程/多线程间的一种通信方式。在`Python`中实现了两种用途的管道，分别是全双工通信管道和半双工通信管道。
++ **全双工通信**：管道的每一端既可以读也可以写。
++ **半双工通信**：管道的每一端要么是读，要么是写。
+
+管道的实现如下：
+```python
+def Pipe(duplex=True):
+    '''
+    Returns pair of connection objects at either end of a pipe
+    '''
+    if duplex:
+        # 全双工
+        s1, s2 = socket.socketpair()
+        s1.setblocking(True)
+        s2.setblocking(True)
+        c1 = Connection(s1.detach())
+        c2 = Connection(s2.detach())
+    else:
+        # 半双工
+        fd1, fd2 = os.pipe()
+        c1 = Connection(fd1, writable=False)
+        c2 = Connection(fd2, readable=False)
+
+    return c1, c2
+```
+这里只关注半双工通信的实现，也就是利用`os.pipe()`实现的管道通信。其中返回的读端`c1`和写端`c2`都是`Connection`类型对象。
+将管道用于消息队列**需要解决如何区分管道中的多个消息**，也就是发送的消息，可以正确的读出来。解决方式就是：发送的每一个消息都会增加一个消息头，
+记录当前消息字节数。`Connection`类发送和接收消息的实现如下：
+```python
+# 发送消息
+def _send_bytes(self, buf):
+    n = len(buf)
+    if n > 0x7fffffff:
+        # 消息太大，使用8个字节的无符号整数表示消息大小，也就是 !Q
+        pre_header = struct.pack("!i", -1)
+        header = struct.pack("!Q", n)
+        self._send(pre_header)
+        self._send(header)
+        self._send(buf)
+    else:
+        # For wire compatibility with 3.7 and lower
+        header = struct.pack("!i", n)
+        if n > 16384:
+            # The payload is large so Nagle's algorithm won't be triggered
+            # and we'd better avoid the cost of concatenation.
+            self._send(header)
+            self._send(buf)
+        else:
+            # Issue #20540: concatenate before sending, to avoid delays due
+            # to Nagle's algorithm on a TCP socket.
+            # Also note we want to avoid sending a 0-length buffer separately,
+            # to avoid "broken pipe" errors if the other end closed the pipe.
+            self._send(header + buf)
+# 接收消息
+def _recv_bytes(self, maxsize=None):
+    buf = self._recv(4)
+    size, = struct.unpack("!i", buf.getvalue())
+    if size == -1:
+        buf = self._recv(8)
+        size, = struct.unpack("!Q", buf.getvalue())
+    if maxsize is not None and size > maxsize:
+        return None
+    return self._recv(size)
+```
+
+# 多进程共享安全队列
+`multiprocessing.queues`类提供类`Queue`用于多进程间共享安全队列。核心是使用管道实现跨进程间通信。具体的实现方式总结如下：
++ **管道**：用于跨进程共享数据。管道存储数据受操作系统限制，如果管道满了，则对管道写操作会阻塞。
++ **有界信号量**：用于表示队列数据个数最大值。防止队列数据太多。
++ **普通队列**：每一个子进程私有的队列`collections.deque()`。用作每一个子进程的缓存，这样子进程写数据时可以快速完成，
+不需要等到数据完全写到管道中。
++ **条件变量**：用于后台线程和子进程写数据间同步。每次子进程写数据时，都会通过条件变量通知后台线程消费子进程缓存队列数据，
+将数据写到管道中。
++ **后台线程**：用于将每一个子进程缓存队列数据发送到管道中。每一个子进程都会有一个后台线程。
++ **锁**：保证多进程间数据安全。
+
+下面总结了`multiprocessing.queues.Queue`工作原理：
+
+![queue_work](./images/queue.png)
+
+在多进程编程下，需要关注下序列化与反序列化。序列化的目地是将数据转为子节流，便于通过管道等机制在不同进程间传递数据。
+> 序列化的时候方法`__getstate__`被调用(可以记录哪些信息需要序列化，把不能序列化的属性排除掉)，反序列化的时候`__setstate__`被调用(参数是`__getstate__`方法的返回值)。
+> 
+> ```python
+> import multiprocessing as mp
+> import threading
+> import time
+> import os
+> 
+> 
+> class MyQueue():
+>     def __init__(self):
+>         self.queue = []
+>         self.lock = threading.Lock() # 不可序列化
+>         self.test = 2
+> 
+>     def put(self, obj):
+>         self.queue.append(obj)
+> 
+>     def get(self):
+>         return self.queue.pop(0)
+> 
+>     def __getstate__(self):
+>         return self.queue, self.test
+> 
+>     def __setstate__(self, state):
+>         self.queue, self.test = state
+> 
+> 
+> def child_fun(arg):
+>     print("Child process get attribute {0} with pid {1}".format(arg.__dict__, os.getpid()))
+>     arg.put("Value from child process")
+>     print("Child put value success with queue len ", len(arg.queue))
+> 
+> def main():
+>     my_queue = MyQueue()
+>     p = mp.Process(target=child_fun, args=(my_queue,))
+>     p.start()
+>     my_queue.put("Value2 from parent process.")
+>     time.sleep(1)
+>     print("Parent process get value: {0}".format(my_queue.get()))
+> 
+> if __name__ == "__main__":
+>     main()
+>     
+> -------------------------------------------------------------------------------
+> # 参数通过序列化传给子进程，由于重写了序列化的两个方法，所以拿到的参数对象属性只有两个，没有lock对象.
+> Child process get attribute {'queue': [], 'test': 2} with pid 42099
+> Child put value success with queue len  1
+> # 因为 MyQueue 不能跨进程访问，所以在父进程空间里看不到子进程放的数据
+> Parent process get value: Value2 from parent process.
+> ```
+> 
+> 默认对象不实现`__setstate__`和`__getstate__`方法的时候，序列化的时候，自动保存和加载对象的`__dict__`属性字典。在上面的例子中，也就是
+> 
+> ```python
+> my_queue = MyQueue()
+> print(my_queue.__dict__)
+> ----------------------------------------------------------------------------------
+> {'queue': [], 'lock': <unlocked _thread.lock object at 0x7fc871bca150>, 'test': 2}
+> ```
+> 
+> 由于有lock属性存在，默认情况 MyQueue 是不可序列化的；如果需要对象 MyQueue 可序列化，需要重写`__setstate__`和`__getstate__`方法，排出掉不可序列化的 lock 属性。
+

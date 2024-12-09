@@ -25,7 +25,6 @@
 - [进程池](./programming/python-futures/process-pool.md)
 - [future对象](./programming/python-futures/futures.md)
 - [并发编程安全及通信机制](./programming/python-futures/concurrent-safe-communication.md)
-- [相关拓展](./programming/python-futures/reference.md)
 
 ## Kubernetes
 - [k8s集群搭建](./programming/k8s/cluster_create.md)
