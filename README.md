@@ -34,6 +34,7 @@
 - [Ingress详解](./programming/k8s/cluster_ingress.md)
 - [ServiceAccount详解](./programming/k8s/cluster_serviceaccount.md)
 - [工作负载详解](./programming/k8s/cluster_workloads.md)
+- [持久化存储详解](./programming/k8s/cluster_storage.md)
 
 ## Docker
 - [docker使用教程](./programming/docker/tutorial.md)
