@@ -477,7 +477,7 @@ StopIteration
 ```
 **目前介绍的协程相关都是基于生成器实现。`send`, `yield from`用来增强生成器，便于更好实现协程。**
 
-# async & await
+## async & await
 `async`代替`@asyncio.coroutine`，`await`代替`yield from`。从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分。
 `await`后面对象可以是一个**协程**或者实现`__await__`方法的**可等待对象**。例如`asyncio`库实现的`Future`就是一个可等待对象，
 其实现的`__await__`源码如下：
