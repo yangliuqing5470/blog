@@ -1,10 +1,8 @@
-# yield & send & throw & close
+# 协程语法
 ## yield
-`yield`用来制造生成器，包含`yield`的函数是生成器；<br>
-`yield`语法规则:
+`yield`用来制造生成器，包含`yield`的函数是生成器；`yield`语法规则:
 - 在`yield`处暂停函数执行；
-- 当`next`函数被调用时候，`next`函数返回值是`yield`后面表达式值(默认None)，并
-从上次暂停处的`yield`处开始执行，直到遇到下一个`yield`；
+- 当`next`函数被调用时候，`next`函数返回值是`yield`后面表达式值（默认`None`），并从上次暂停处的`yield`处开始执行，直到遇到下一个`yield`；
 - 当不能继续`next`时候，会抛出异常；
 
 ```python
@@ -33,11 +31,11 @@ Traceback (most recent call last):
 StopIteration
 ```
 ## send
-生成器可以调用`send`方法，为内部的`yield`语句发送数据；此时的`yield`语句可以是`var = yield <expression>`形式，
+生成器可以调用`send`方法，为内部的`yield`语句发送数据；`yield`语句可以是`var = yield <expression>`形式，
 该形式具有如下两个功能:
 - 暂停函数执行；
 - `send`函数返回值是`yield`后面表达式的值；
-- 接收外部`send`方法发送的值，重新激活函数，并将发送的值赋值给 var 变量；
+- 接收外部`send`方法发送的值，重新激活函数，并将发送的值赋值给`var`变量；
 
 ```python
 >>> def simple_coroutine():
@@ -59,7 +57,7 @@ Traceback (most recent call last):
   File "<stdin>", line 1, in <module>
 StopIteration
 ```
-生成器有四个状态，当前状态可以使用`inspect.getgeneratorstate`函数查看
+生成器有四个状态。生成器的当前状态可以使用`inspect.getgeneratorstate`函数查看
 - `GEN_CREATED`: 等待开始执行；
 - `GEN_RUNNING`: 正在执行；
 - `GEN_SUSPENDED`: 在`yield`处暂停；
@@ -89,8 +87,7 @@ StopIteration
 >>> inspect.getgeneratorstate(my_coro)
 'GEN_CLOSED'
 ```
-`send`函数方法参数会成为暂停`yield`表达式的值，只有当协程处于暂停状态才可以调用`send`函数；
-如果生成器还未被激活(状态是`GEN_CREATED`)，把`None`之外的值发给它，会抛出异常。
+只有当生成器处于暂停状态才可以调用`send`函数；如果生成器还未被激活(状态是`GEN_CREATED`)，把`None`之外的值发给它，会抛出异常。
 ```python
 >>> def simple_coroutine():
 ...     print("Start coroutine ---")
@@ -108,12 +105,12 @@ Traceback (most recent call last):
   File "<stdin>", line 1, in <module>
 TypeError: can't send non-None value to a just-started generator
 ```
-使用生成器之前需要先激活协程，使用`next(my_coro)`或者`my_coro.send(None)`。
+使用生成器之前需要先激活，使用`next(my_coro)`或者`my_coro.send(None)`。
 
 ## throw
-使生成器在暂停的`yield`表达式处抛出指定的异常
-- 如果生成器处理了异常，代码会向前执行到下一个`yield`表达式，`yield`后面表达式值为`throw`函数的返回值
-- 如果生成器没有处理异常，异常会传递到调用方
+使生成器在暂停的`yield`表达式处抛出指定的异常。
+- 生成器处理了异常，代码会继续执行到下一个`yield`表达式，`yield`后面表达式值为`throw`函数的返回值；
+- 生成器没有处理异常，异常会传递到调用方；
 
 ```python
 # 生成器没有捕获异常
@@ -160,12 +157,11 @@ StopIteration
 ```
 
 ## close
-使生成器在暂停的`yield`处抛出`GeneratorExit`异常
-- 如果生成器不捕获此异常或者捕获异常但后面生成器抛出`StopIteration`异常，`close`方法不传递该异常(调用方不会报错)
-- `GeneratorExit`异常说明生成器对象生命周期已经结束，因此生成器函数后面语句不能在有`yield`，否则
-会产生`RuntimeError`(和throw函数行为不同)
-- 对于已经退出的生成器，`close`函数不进行任何操作
-- `GeneratorExit`异常只有在生成器对象被激活后才会产生，没有激活的生成器调`close`函数不会触发`GeneratorExit`
+使生成器在暂停的`yield`处抛出`GeneratorExit`异常。
+- 如果生成器不捕获此异常或者捕获异常但后面生成器抛出`StopIteration`异常，则`close`方法不传递该异常，也就是调用方不会报错；
+- `GeneratorExit`异常说明生成器对象生命周期已经结束，因此捕获`GeneratorExit`异常后，生成器函数后面语句不能在有`yield`，否则会产生`RuntimeError`（和`throw`函数行为不同）；
+- 对于已经退出的生成器，`close`函数不进行任何操作；
+- `GeneratorExit`异常只有在生成器对象被激活后才会产生，没有激活的生成器调`close`函数不会触发`GeneratorExit`；
 
 ```python
 # 生成器不捕获异常
@@ -179,11 +175,11 @@ StopIteration
 >>> g = my_gen()
 >>> g
 <generator object my_gen at 0x7f7c6565e900>
->>> next(g) # 对已经关闭的生成器调用 next 会抛出 StopIteration
+>>> next(g)
 Start generator ---
 1
 >>> g.close()
->>> next(g)
+>>> next(g)  # 对已经关闭的生成器调用 next 会抛出 StopIteration
 Traceback (most recent call last):
   File "<stdin>", line 1, in <module>
 StopIteration
@@ -256,19 +252,17 @@ Start ---
 Get GeneratorExit
 ```
 
-# yield from & @asyncio.coroutine
 ## yield from
-`yield from x`对 x 对象做的第一件事是调用`iter(x)`获取迭代器，因此 x 可以是任何可迭代对象；<br>
-`yield from`的主要功能是打开双向通道，把最外层的调用方与最内层的子生成器连接起来，二者可以直接发送和
-产出值，还可以直接传入异常；相关术语如下：
-- 委派生成器：包含`yield from <iterable>`表达式的**生成器函数**
-- 子生成器：从表达式`<iterable>`获取的生成器
+`yield from x`对`x`做的第一件事是调用`iter(x)`获取迭代器。因此`x`可以是任何可迭代对象；`yield from`的主要功能是打开双向通道，
+把最外层的调用方与最内层的子生成器连接起来，二者可以直接发送和产出值，还可以直接传入异常。相关术语如下：
+- 委派生成器：包含`yield from <iterable>`表达式的**生成器函数**；
+- 子生成器：从表达式`<iterable>`获取的生成器；
 
 `yield from`语法功能：
-- `yield from <iterable>`会等子生成器(<iterable>)结束，如果子生成器不终止，则`yield from`会永远暂停；
+- `yield from <iterable>`会等子生成器`<iterable>`结束。若子生成器不终止，则`yield from`会永远暂停；
 - `yield from`表达式的值是子生成器终止时传给`StopIteration`异常的第一个参数；
 
-**生成器退出时，会触发`StopIteration`异常** <br>
+**生成器退出时，会触发`StopIteration`异常**。
 ```python
 from collections import namedtuple
 Result = namedtuple("Result", "count average")
@@ -298,7 +292,7 @@ def main(data):
     result = {}
     for key, values in data.items():
         group = grouper(result, key)
-        next(group)
+        next(group)       # 激活生成器
         for value in values:
             group.send(value)
         group.send(None)  # 重要
@@ -318,19 +312,22 @@ Start one grouper
 Start one grouper
 Start one grouper
 Start one grouper
-{'boys;kg': Result(count=3, average=36.0), 'girls:kg': Result(count=3, average=28.133333333333336)}
-# 注释调 main 函数中 group.send(None)
+{'boys;kg': Result(count=3, average=36.0), 'girls:kg': Result(count=3, average=28.1333333336)}
+
+# 注释掉 main 函数中 group.send(None)
 ➜  Workspace python3 test_run.py
 Start one grouper
 Start one grouper
 {}
 ```
+> **生成器暂停是说生成器本身暂停，会将程序的控制权返回给调用方**。
 
-`yield from`与异常和终止有关的行为
-- 传入委派生成器的异常，除了`GeneratorExit`异常(close函数抛出)，其他都传给子生成器的`throw`函数；如果子生成器调用`throw`抛出`StopIteration`异常(生成器正常退出)，委派生成器
-恢复运行，`StopIteration`之外的其它异常会传给委派生成器
-- 如果将`GeneratorExit`异常传入委派生成器，或者在委派生成器中调用`close`函数，那么在子生成器上调用`close`函数(如果有的话)，若`close`函数导致异常抛出，则会传给委派生成器；
-若子生成器调用`close`函数不抛出异常(被捕获)，那么委派生成器抛出`GeneratorExit`异常
+`yield from`与异常和终止有关的行为：
+- 传入委派生成器的异常，除了`GeneratorExit`异常（`close`函数抛出），其他都传给子生成器的`throw`函数；
+如果子生成器调用`throw`抛出`StopIteration`异常，委派生成器恢复运行，`StopIteration`之外的其它异常会传给委派生成器；
+- 如果将`GeneratorExit`异常传入委派生成器，或者在委派生成器中调用`close`函数：
+  + 若子生成器调用`close`函数导致异常抛出，则会传给委派生成器；
+  + 若子生成器调用`close`函数不抛出异常（被捕获），那么委派生成器抛出`GeneratorExit`异常；
 
 ```python
 # 子生成器捕获异常并正常退出(抛出 StopIteration 异常) -- 委托生成器恢复运行
@@ -462,8 +459,7 @@ main end
 ```
 
 ## @asyncio.coroutine
-`@asyncio.coroutine`装饰的函数显示被声明是一个协程(本质上是一个生成器对象) <br>
-直接调用协程不会执行，而是返回一个协程对象，需要通过外部`send`函数驱动执行 <br>
+`@asyncio.coroutine`装饰的函数显示被声明是一个协程（本质上是一个生成器对象），直接调用协程不会执行，而是返回一个协程对象，需要通过外部`send`函数驱动执行。
 ```python
 >>> @asyncio.coroutine
 ... def fun():
@@ -479,11 +475,11 @@ Traceback (most recent call last):
   File "<stdin>", line 1, in <module>
 StopIteration
 ```
-**目前介绍的协程相关都是基于生成器实现(`send`, `yield from`用来增强生成器，便于更好实现协程)**
+**目前介绍的协程相关都是基于生成器实现。`send`, `yield from`用来增强生成器，便于更好实现协程。**
 
 # async & await
-`async`代替`@asyncio.coroutine`，`await`代替`yield from`，从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分。
-`await`后面对象可以是一个**协程**或者实现`__await__`方法的**可等待对象**。例如 asyncio 库实现的 Future 就是一个可等待对象，
+`async`代替`@asyncio.coroutine`，`await`代替`yield from`。从语法上与生成器的 `yield` 语法彻底区分开来，从各个方面将协程与生成器进行了区分。
+`await`后面对象可以是一个**协程**或者实现`__await__`方法的**可等待对象**。例如`asyncio`库实现的`Future`就是一个可等待对象，
 其实现的`__await__`源码如下：
 ```python
 def __await__(self):
