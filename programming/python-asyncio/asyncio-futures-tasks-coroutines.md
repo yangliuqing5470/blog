@@ -1,14 +1,12 @@
 # 引言
-在 [协程&生成器基础语法](./asyncio-syntax.md) 中我们介绍了生成器和协程的语法原理，
-本章我们开始介绍 asyncio 库`Tasks`、`Futures`和`Coroutines`相关原理。
+在 [协程语法](./asyncio-syntax.md) 中我们介绍了生成器和协程的语法原理。本章开始介绍`Tasks`、`Futures`和`Coroutines`相关原理。
 
 ![asyncio基本框架](./images/asyncio抽象框架.png)
-Asyncio 库的核心是事件循环，调度的基本单位是`Task`，`Task` 是一个`Future` 的
-子类；在异步编程中，`Future` 一般用来表示未来结果对象 (可以理解为表示未来结果
-的当前占位符)。**协程**是用户编写的具体业务程序，`asyncio` 运行一个协程会首先将其包装为一个 `Task`
-给事件循环调度。<br>
 
-本篇将主要介绍协程，Future, Task等概念。
+`asyncio`库的核心是事件循环，调度的基本单位是`Task`，`Task` 是`Future` 的子类。
+异步编程中，`Future`用来表示未来的结果（[Future对象](../python-futures/futures.md)）。**协程**是用户编写的具体业务程序。
+`asyncio` 运行一个协程会首先将其包装为一个 `Task`给事件循环调度。
+> 事件循环类比为操作系统，协程（内部其实被包装为`Task`）类比为线程或进程。
 
 # Coroutines
 协程建议使用 `async/await` 语法声明。下面是一个简单的协程样例：
@@ -22,310 +20,19 @@ async def main():
 
 asyncio.run(main())
 ```
-协程不能通过调用单独运行，asyncio 提供了 asyncio.run 入口来运行协程，asyncio.run 的
-源码如下：
-```python
-def run(main, *, debug=None):
-    ...
-    loop = events.new_event_loop()
-    try:
-        events.set_event_loop(loop)
-        if debug is not None:
-            loop.set_debug(debug)
-        # 核心是这行代码
-        return loop.run_until_complete(main)
-    finally:
-        ...
-```
-可以发现，asyncio.run 内部通过调用 loop.run_until_complete 来运行一个协程，继续看
-loop.run_until_complete 的源码：
-```python
-# loop.run_until_complete
-def run_until_complete(self, future):
-    """Run until the Future is done.
-
-    If the argument is a coroutine, it is wrapped in a Task.
-
-    WARNING: It would be disastrous to call run_until_complete()
-    with the same coroutine twice -- it would wrap it in two
-    different Tasks and that can't be good.
-
-    Return the Future's result, or raise its exception.
-    """
-    ...
-    new_task = not futures.isfuture(future)
-    # 将协程包装为Task
-    future = tasks.ensure_future(future, loop=self)
-    if new_task:
-        # An exception is raised if the future didn't complete, so there
-        # is no need to log the "destroy pending task" message
-        future._log_destroy_pending = False
-
-    future.add_done_callback(_run_until_complete_cb)
-    try:
-        self.run_forever()
-    except:
-        if new_task and future.done() and not future.cancelled():
-            # The coroutine raised a BaseException. Consume the exception
-            # to not log a warning, the caller doesn't have access to the
-            # local task.
-            future.exception()
-        raise
-    finally:
-        future.remove_done_callback(_run_until_complete_cb)
-    if not future.done():
-        raise RuntimeError('Event loop stopped before Future completed.')
-
-    return future.result()
-
-# tasks.ensure_future
-def ensure_future(coro_or_future, *, loop=None):
-    """Wrap a coroutine or an awaitable in a future.
-
-    If the argument is a Future, it is returned directly.
-    """
-    if coroutines.iscoroutine(coro_or_future):
-        if loop is None:
-            loop = events.get_event_loop()
-        # 这里将一个协程包装为一个Task
-        task = loop.create_task(coro_or_future)
-        ...
-        return task
-    elif futures.isfuture(coro_or_future):
-        if loop is not None and loop is not futures._get_loop(coro_or_future):
-            raise ValueError('The future belongs to a different loop than '
-                             'the one specified as the loop argument')
-        return coro_or_future
-    elif inspect.isawaitable(coro_or_future):
-        return ensure_future(_wrap_awaitable(coro_or_future), loop=loop)
-    else:
-        raise TypeError('An asyncio.Future, a coroutine or an awaitable is '
-                        'required')
-# loop.create_task
-def create_task(self, coro, *, name=None):
-    """Schedule a coroutine object.
-
-    Return a task object.
-    """
-    self._check_closed()
-    if self._task_factory is None:
-        task = tasks.Task(coro, loop=self, name=name)
-        ...
-    else:
-        task = self._task_factory(self, coro)
-        tasks._set_task_name(task, name)
-
-    return task
-```
-在 run_until_complete 内部，首先将一个协程通过 task.ensure_future 包装为一个 `Task`，然后
-调用 run_forever 方法开始任务的执行，run_forever 方法的源码如下：
-```python
-# loop.run_forever
-def run_forever(self):
-    """Run until stop() is called."""
-    ...
-    self._thread_id = threading.get_ident()
-    ...
-    try:
-        events._set_running_loop(self)
-        while True:
-            self._run_once()
-            if self._stopping:
-                break
-    finally:
-        self._stopping = False
-        self._thread_id = None
-        events._set_running_loop(None)
-        self._set_coroutine_origin_tracking(False)
-        sys.set_asyncgen_hooks(*old_agen_hooks)
-```
-在 run_forever 方法内，核心逻辑是调用 _run_once 方法来执行任务，我们接着看 _run_once 方法的
-源码：
-```python
-def _run_once(self):
-    """Run one full iteration of the event loop.
-
-    This calls all currently ready callbacks, polls for I/O,
-    schedules the resulting callbacks, and finally schedules
-    'call_later' callbacks.
-    """
-    ...
-    # This is the only place where callbacks are actually *called*.
-    # All other places just add them to ready.
-    # Note: We run all currently scheduled callbacks, but not any
-    # callbacks scheduled by callbacks run this time around --
-    # they will be run the next time (after another I/O poll).
-    # Use an idiom that is thread-safe without using locks.
-    ntodo = len(self._ready)
-    for i in range(ntodo):
-        # 从就绪队列取出一个可运行的 Handle
-        handle = self._ready.popleft()
-        if handle._cancelled:
-            continue
-        if self._debug:
-            ...
-        else:
-            # 开始执行，例如运行Task的 __step 方法
-            handle._run()
-    handle = None  # Needed to break cycles when an exception occurs.
-```
-至此，我们梳理完了一个协程通过 asyncio.run 运行的全链路：
-1. 调用 loop.run_until_complete
-2. 将协程包装为 Task，然后调用 loop.run_forever
-3. 不断调用 loop._run_once 直到任务完成
-
-回到开头的一句话：`Task` 是调度的基本单位。`Task` 可以认为是协程运行的驱动器，因为
-`Task` 中会有一些和事件循环交互的方法。由于 `Task` 是`Future` 的子类，了解`Task`之前
-先了解下`Future`的实现原理。
+协程不能通过调用而单独运行。协程必须交给事件循环调度运行，就好比线程或进程必须交给操作系统调度运行一样。`asyncio`提供了`asyncio.run`入口来运行协程。
+`asyncio.run`的工作原理会在[调度原理](./asyncio-scheduling.md)中详细说明。
 
 # Futures
-`Future`是一个占位符，表示一个任务执行的未来结果。它也是一个有状态的容器，初始
-状态是`PENDING`，终态是`CANCELLED`/`FINISHED`。其实现源码如下：
+`Future`是一个占位符，表示一个任务执行的未来结果，通常用于异步编程中。它也是一个有状态的容器，初始状态是`PENDING`，终态是`CANCELLED`/`FINISHED`。
+[Future对象](../python-futures/futures.md)详细介绍了`Future`的实现理念。
+
+因为在编程逻辑中，其它执行体如线程、进程、协程等需要等待某一个任务的执行结果，所以`Future`必须是一个可等待对象。
+在基于线程、进程异步编程中，`Future`通过条件变量实现可等待能力。基于协程的异步编程，由于是单线程模式，所以`Future`对象需要实现`__await__`方法以实现可等待能力。
 ```python
 class Future:
     ...
-
-    def get_loop(self):
-        """Return the event loop the Future is bound to."""
-        loop = self._loop
-        if loop is None:
-            raise RuntimeError("Future object is not initialized.")
-        return loop
-
-    def cancel(self):
-        """Cancel the future and schedule callbacks.
-
-        If the future is already done or cancelled, return False.  Otherwise,
-        change the future's state to cancelled, schedule the callbacks and
-        return True.
-        """
-        self.__log_traceback = False
-        if self._state != _PENDING:
-            return False
-        self._state = _CANCELLED
-        self.__schedule_callbacks()
-        return True
-
-    def __schedule_callbacks(self):
-        """Internal: Ask the event loop to call all callbacks.
-
-        The callbacks are scheduled to be called as soon as possible. Also
-        clears the callback list.
-        """
-        callbacks = self._callbacks[:]
-        if not callbacks:
-            return
-
-        self._callbacks[:] = []
-        for callback, ctx in callbacks:
-            self._loop.call_soon(callback, self, context=ctx)
-
-    def cancelled(self):
-        """Return True if the future was cancelled."""
-        return self._state == _CANCELLED
-
-    # Don't implement running(); see http://bugs.python.org/issue18699
-
-    def done(self):
-        """Return True if the future is done.
-
-        Done means either that a result / exception are available, or that the
-        future was cancelled.
-        """
-        return self._state != _PENDING
-
-    def result(self):
-        """Return the result this future represents.
-
-        If the future has been cancelled, raises CancelledError.  If the
-        future's result isn't yet available, raises InvalidStateError.  If
-        the future is done and has an exception set, this exception is raised.
-        """
-        if self._state == _CANCELLED:
-            raise exceptions.CancelledError
-        if self._state != _FINISHED:
-            raise exceptions.InvalidStateError('Result is not ready.')
-        self.__log_traceback = False
-        if self._exception is not None:
-            raise self._exception
-        return self._result
-
-    def exception(self):
-        """Return the exception that was set on this future.
-
-        The exception (or None if no exception was set) is returned only if
-        the future is done.  If the future has been cancelled, raises
-        CancelledError.  If the future isn't done yet, raises
-        InvalidStateError.
-        """
-        if self._state == _CANCELLED:
-            raise exceptions.CancelledError
-        if self._state != _FINISHED:
-            raise exceptions.InvalidStateError('Exception is not set.')
-        self.__log_traceback = False
-        return self._exception
-
-    def add_done_callback(self, fn, *, context=None):
-        """Add a callback to be run when the future becomes done.
-
-        The callback is called with a single argument - the future object. If
-        the future is already done when this is called, the callback is
-        scheduled with call_soon.
-        """
-        if self._state != _PENDING:
-            self._loop.call_soon(fn, self, context=context)
-        else:
-            if context is None:
-                context = contextvars.copy_context()
-            self._callbacks.append((fn, context))
-
-    # New method not in PEP 3148.
-
-    def remove_done_callback(self, fn):
-        """Remove all instances of a callback from the "call when done" list.
-
-        Returns the number of callbacks removed.
-        """
-        filtered_callbacks = [(f, ctx)
-                              for (f, ctx) in self._callbacks
-                              if f != fn]
-        removed_count = len(self._callbacks) - len(filtered_callbacks)
-        if removed_count:
-            self._callbacks[:] = filtered_callbacks
-        return removed_count
-
-    # So-called internal methods (note: no set_running_or_notify_cancel()).
-
-    def set_result(self, result):
-        """Mark the future done and set its result.
-
-        If the future is already done when this method is called, raises
-        InvalidStateError.
-        """
-        if self._state != _PENDING:
-            raise exceptions.InvalidStateError(f'{self._state}: {self!r}')
-        self._result = result
-        self._state = _FINISHED
-        self.__schedule_callbacks()
-
-    def set_exception(self, exception):
-        """Mark the future done and set an exception.
-
-        If the future is already done when this method is called, raises
-        InvalidStateError.
-        """
-        if self._state != _PENDING:
-            raise exceptions.InvalidStateError(f'{self._state}: {self!r}')
-        if isinstance(exception, type):
-            exception = exception()
-        if type(exception) is StopIteration:
-            raise TypeError("StopIteration interacts badly with generators "
-                            "and cannot be raised into a Future")
-        self._exception = exception
-        self._state = _FINISHED
-        self.__schedule_callbacks()
-        self.__log_traceback = True
-
+    _asyncio_future_blocking = False
     def __await__(self):
         if not self.done():
             self._asyncio_future_blocking = True
@@ -335,114 +42,81 @@ class Future:
         return self.result()  # May raise too.
 
     __iter__ = __await__  # make compatible with 'yield from'.
-
 ```
-`Future`可以被取消，设置执行结果或者异常，可以添加完成回调函数 (通过调用`loop.call_soon`
-注册到事件循环的就绪队列)。
+变量`_asyncio_future_blocking`有两个作用：
++ 值取`bool`值，表示对象是`asyncio`实现的`Future`对象。
++ 值取`True`，表示`Future`对象还未完成，在阻塞中，也就是暂停在`yield`处。
+
+同时考虑到一个协程在某处被暂停后，例如暂停在`await <exp>`处，当等待的对象（一般都是`Future`对象）完成后，此协程应该有机会恢复接着运行。
+所以`Future`对象应该支持完成回调。而且回调方法的执行应该在协程对应在`Task`的上下文。同时为统一所有的`Task`都被事件循环调度。
+因此`Future`需要将回调方法注册到事件循环中。
+```python
+def __schedule_callbacks(self):
+    """Internal: Ask the event loop to call all callbacks.
+
+    The callbacks are scheduled to be called as soon as possible. Also
+    clears the callback list.
+    """
+    callbacks = self._callbacks[:]
+    if not callbacks:
+        return
+
+    self._callbacks[:] = []
+    for callback, ctx in callbacks:
+        # 往事件循环注册回调
+        self._loop.call_soon(callback, self, context=ctx)
+```
 
 # Tasks
-`Task`增加`__step`和`__wakeup`方法，通过这两个方法使得`Task`具有驱动协程运行的能力，
-其源码如下：
+协程不能单独被调用执行，也就是说不能将协程直接给事件循环调度。协程只能通过调用方执行`send`进行驱动执行。为此有`Task`这么一个概念。
+协程在`asyncio`内部会被包装为一个`Task`，进而将`Task`交给事件循环调度执行。所以说，`Task`是协程的驱动器。又因每一个`Task`都应该有对应的执行结果，
+所以`Task`是`Future`的子类。
+
+`Task`的核心方法是`__step`，其是被包装协程的驱动器。`__step`的工作流程总结如下：
+
+![__step工作流程](./images/__step.png)
+
+可以看到，协程的内部等待对象`Future`会注册一个完成回调方法`__wakeup`。`__wakeup`的目的是当此协程等待的`Future`完成后，
+会将此协程对应的`Task`继续添加到事件循环中等待被事件循环调度，也就是恢复`Task`的继续执行。`__wakeup`实现如下：
 ```python
-class Task(futures._PyFuture):  # Inherit Python Task implementation
-                                # from a Python Future implementation.
-    ...
-    def __step(self, exc=None):
-        ...
-        coro = self._coro
-        self._fut_waiter = None
-
-        _enter_task(self._loop, self)
-        # Call either coro.throw(exc) or coro.send(None).
-        try:
-            if exc is None:
-                # We use the `send` method directly, because coroutines
-                # don't have `__iter__` and `__next__` methods.
-                result = coro.send(None)
-            else:
-                result = coro.throw(exc)
-        except StopIteration as exc:
-            if self._must_cancel:
-                # Task is cancelled right before coro stops.
-                self._must_cancel = False
-                super().cancel()
-            else:
-                super().set_result(exc.value)
-        ...
-        else:
-            blocking = getattr(result, '_asyncio_future_blocking', None)
-            if blocking is not None:
-                # Yielded Future must come from Future.__iter__().
-                if futures._get_loop(result) is not self._loop:
-                    new_exc = RuntimeError(
-                        f'Task {self!r} got Future '
-                        f'{result!r} attached to a different loop')
-                    self._loop.call_soon(
-                        self.__step, new_exc, context=self._context)
-                elif blocking:
-                    if result is self:
-                        new_exc = RuntimeError(
-                            f'Task cannot await on itself: {self!r}')
-                        self._loop.call_soon(
-                            self.__step, new_exc, context=self._context)
-                    else:
-                        # 是一个 Future 对象，添加完成回调__wakeup以唤醒当前Task继续运行
-                        result._asyncio_future_blocking = False
-                        result.add_done_callback(
-                            self.__wakeup, context=self._context)
-                        self._fut_waiter = result
-                        if self._must_cancel:
-                            if self._fut_waiter.cancel():
-                                self._must_cancel = False
-                else:
-                    new_exc = RuntimeError(
-                        f'yield was used instead of yield from '
-                        f'in task {self!r} with {result!r}')
-                    self._loop.call_soon(
-                        self.__step, new_exc, context=self._context)
-
-            elif result is None:
-                # Bare yield relinquishes control for one event loop iteration.
-                self._loop.call_soon(self.__step, context=self._context)
-            elif inspect.isgenerator(result):
-                # Yielding a generator is just wrong.
-                new_exc = RuntimeError(
-                    f'yield was used instead of yield from for '
-                    f'generator in task {self!r} with {result!r}')
-                self._loop.call_soon(
-                    self.__step, new_exc, context=self._context)
-            else:
-                # Yielding something else is an error.
-                new_exc = RuntimeError(f'Task got bad yield: {result!r}')
-                self._loop.call_soon(
-                    self.__step, new_exc, context=self._context)
-        finally:
-            _leave_task(self._loop, self)
-            self = None  # Needed to break cycles when an exception occurs.
-
-    def __wakeup(self, future):
-        try:
-            future.result()
-        except BaseException as exc:
-            # This may also be a cancellation.
-            self.__step(exc)
-        else:
-            # Don't pass the value of `future.result()` explicitly,
-            # as `Future.__iter__` and `Future.__await__` don't need it.
-            # If we call `_step(value, None)` instead of `_step()`,
-            # Python eval loop would use `.send(value)` method call,
-            # instead of `__next__()`, which is slower for futures
-            # that return non-generator iterators from their `__iter__`.
-            self.__step()
-        self = None  # Needed to break cycles when an exception occurs.
+def __wakeup(self, future):
+    try:
+        future.result()
+    except BaseException as exc:
+        # This may also be a cancellation.
+        self.__step(exc)
+    else:
+        # Don't pass the value of `future.result()` explicitly,
+        # as `Future.__iter__` and `Future.__await__` don't need it.
+        # If we call `_step(value, None)` instead of `_step()`,
+        # Python eval loop would use `.send(value)` method call,
+        # instead of `__next__()`, which is slower for futures
+        # that return non-generator iterators from their `__iter__`.
+        self.__step()
+    self = None  # Needed to break cycles when an exception occurs.
 ```
-`__step`主要完成以下三个事情：
-1. 通过`send`或`throw`来驱动协程的运行
-2. 给自己等待的`Future`对象设置完成回调`__wakeup`，当等待的`Future`完成后以唤醒自己继续执行
-3. 调用`loop.call_soon`给事件循环就绪队列注册运行的命令，自己让步，将控制权交给
-事件循环
+> 协程内部等待对象其实就是协程内`await future`表达式中的`future`。
 
-为了加深理解，下面看一个样例：
+在`python3.12`中，`Task`增加了`eager_start`参数。当`eager_start`设置为`True`且事件循环正在运行时，
+**任务会在创建时立即开始执行其协程**，直至协程首次遇到阻塞操作。如果协程在首次阻塞前就返回或引发异常，任务将直接完成，
+并且不会被添加到事件循环的调度队列中。
+
+每一个任务`Task`在**创建的时候都会往事件循环添加`__step`方法**，以使得任务自身可以被事件循环调度。
+```python
+class Task(futures._PyFuture):
+    def __init__(self, coro, *, loop=None, name=None, context=None,
+                 eager_start=False):
+        super().__init__(loop=loop)
+        ...
+        if eager_start and self._loop.is_running():
+            # 事件循环在运行，且设置eager_start
+            self.__eager_start()
+        else:
+            # 往事件循环注册__step
+            self._loop.call_soon(self.__step, context=self._context)
+            _register_task(self)
+```
+为了对 **`Task`是事件循环调度的基本单位**加深理解，下面看一个样例：
 ```python
 import asyncio
 import time
@@ -458,9 +132,7 @@ async def main_task():
     for n in range(4):
         tasks.append(asyncio.create_task(counter("task{0}".format(n))))
     for task in tasks:
-        print(task)
         res = await task
-        print("Task res: ", res)
     print("main_task cost {0}s".format(time.time() - start_time))
 
 
@@ -476,11 +148,10 @@ asyncio.run(main_task())
 print("Start run coro...")
 asyncio.run(main_coro())
 ```
-main_coro 是直接运行协程，main_task 是先将协程转为任务，然后运行。运行结果如下：
+`main_coro`方法是直接运行协程。`main_task`方法是先将协程转为任务，然后运行。运行结果如下：
 ```bash
 code $ (master) python3 coro_and_task.py
 Start run task...
-<Task pending name='Task-2' coro=<counter() running at D:\WorkSpace\blog\programming\python-asyncio\code\coro_and_task.py:4>>
 task0: 0
 task1: 0
 task2: 0
@@ -489,13 +160,6 @@ task0: 1
 task2: 1
 task1: 1
 task3: 1
-Task res:  None
-<Task finished name='Task-3' coro=<counter() done, defined at D:\WorkSpace\blog\programming\python-asyncio\code\coro_and_task.py:4> result=None>
-Task res:  None
-<Task finished name='Task-4' coro=<counter() done, defined at D:\WorkSpace\blog\programming\python-asyncio\code\coro_and_task.py:4> result=None>
-Task res:  None
-<Task finished name='Task-5' coro=<counter() done, defined at D:\WorkSpace\blog\programming\python-asyncio\code\coro_and_task.py:4> result=None>
-Task res:  None
 main_task cost 2.0148472785949707s
 Start run coro...
 coro0: 0
@@ -508,33 +172,28 @@ coro3: 0
 coro3: 1
 main_coro cost 8.061261653900146s
 ```
-main_task 4个任务是并行运行，耗时2s，而 main_coro 4个协程是串行运行，耗时8s。<br>
+`main_task`中`4`个任务是并发调度运行，耗时`2s`，而`main_coro`中`4`个协程是串行运行，耗时`8s`。
+
 **main_coro 的执行流程如下：**
-+ `aysncio.run(main_coro())` 首先将协程 `main_coro` 包装为一个`Task`给事件循环调度，
-此时事件循环就绪队列只有 `main_coro_task.__step` 一个 `handle`。
-+ 事件循环从就绪队列取出`main_coro_task.__step`开始执行，直到第一次遇到`asyncio.sleep(1)`，
-`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 `handle`，
-并返回一个`Future`，此时当前任务 (`main_coro_task`) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
-把控制权从新交给事件循环，但由于此时就绪队列为空 (1s 时间还没到)，事件循环会等待。
-+ 1s 时间到后，事件循环就绪队列会有`futures._set_result_unless_cancelled`的可执行 `handle`，
-方法`futures._set_result_unless_cancelled` 会被调用，将第 2 步返回的`Future` 设置
-结果，根据`Future.set_result`源码可知，此时注册的回调函数`Tasks.__wakeup`会被调用，
-继续下个 for 循环。
++ `aysncio.run(main_coro())`首先将协程`main_coro`包装创建一个`Task`给事件循环调度，此时事件循环就绪队列只有一个`main_coro_task.__step`。
++ 事件循环从就绪队列取出`main_coro_task.__step`开始执行。当遇到`await asyncio.sleep(1)`，获取的协程内部等待对象`Future`会添加当前`Task`的`__wakeup`方法，
+当等待的`Future`完成，此`Task`可恢复运行。同时`asyncio.sleep(1)`内部会往事件循环中注册一个`1s`后执行`futures._set_result_unless_cancelled`方法的`handle`。
+然后把控制权从新交给事件循环，但由于此时就绪队列为空（`1s`时间还没到），事件循环会等待。
++ `1s`时间到后，事件循环就绪队列会有`futures._set_result_unless_cancelled`方法的可执行`handle`，方法`futures._set_result_unless_cancelled` 会被调用，
+将第`2`步获取的协程内部等待对象`Future` 设置结果，此时注册的回调函数`main_coro_task.__wakeup`会被调用，恢复`Task`执行，继续下个`for`循环。
+
+在`main_coro`方法内，每次只有一个`Task`在事件循环中，所以`4`个协程是串行执行。
 
 **main_task 的执行流程如下：**
-+ `aysncio.run(main_task())` 首先将协程 `main_task` 包装为一个`Task`给事件循环调度，
-此时事件循环就绪队列只有 `main_task_task.__step` 一个 `handle`。
-+ 事件循环从就绪队列取出 `main_task_task.__step` 开始执行，`asyncio.create_task(counter)`
-会将协程 `counter` 包装为`Task`，此时有事件循环中有 5 个`Task` (一个 `main_task`，4个 `counter`)，事件循环就绪队列有 4 个
-`Task(counter("task{}")).__step` 的 `handle`。直到第一次遇到 `await task`，`await task` 会返回一个`Future`
-类，此时当前任务 (`main_task_task`) 会将返回的`Future`注册一个完成回调`__wakeup`，
-然后 把控制权从新交给事件循环。
-+ 事件循环继续从就绪队列取出第一个 `Task(counter("task{}")).__step` 开始执行，直到第一次遇到`asyncio.sleep(1)`，
-`asyncio.sleep(1)`会往事件循环中注册一个 1s 后执行`futures._set_result_unless_cancelled`的 `handle`，
-并返回一个`Future`，此时当前任务 (`Task(counter("task{}"))`) 会将返回的`Future`注册一个完成回调`__wakeup`，然后
-把控制权从新交给事件循环。事件循环继续处理后面的三个 `Task(counter("task{}")).__step`，此步可以认为
-4 个任务同时运行。
-+ 1s 时间到后，事件循环就绪队列会有 4 个`futures._set_result_unless_cancelled`的可执行`handle`，
-方法`futures._set_result_unless_cancelled` 会被调用，将第 3 步返回的`Future` 设置
-结果，根据`Future.set_result`源码可知，此时注册的回调函数`Tasks.__wakeup`会被调用，
-继续程序往下执行。
++ `aysncio.run(main_task())`首先将协程`main_task`包装创建一个`Task`给事件循环调度，此时事件循环就绪队列只有一个`main_task_task.__step`。
++ 事件循环从就绪队列取出`main_task_task.__step`开始执行。`asyncio.create_task`会将协程`counter`包装创建`Task`。
+此时有事件循环中有`5`个`Task` (一个 `main_task`，四个 `counter`)，事件循环就绪队列有`4`个 `Task(counter("task{}")).__step`的`handle`。
+当遇到`await task`，获取的协程内部等待对象`Future`会添加当前`Task`的`__wakeup`方法，当等待的`Future`完成，此`Task`可恢复运行。
+然后把控制权从新交给事件循环。
++ 事件循环从就绪队列取出一个`Task(counter("task{}")).__step`执行。当遇到`asyncio.sleep(1)`，获取的协程内部等待对象`Future`会添加当前`Task`的`__wakeup`方法， 
+当此`Future`完成，此`Task`可恢复运行。同时`asyncio.sleep(1)`内部会往事件循环中注册一个`1s`后执行`futures._set_result_unless_cancelled`方法的`handle`。
+然后把控制权交给事件循环，继续处理后面`3`个`Task(counter("task{}")).__step`。此步可以认为`4`个任务同时运行。
++ `1s`时间到后，事件循环就绪队列会有`4`个`futures._set_result_unless_cancelled`的可执行`handle`，方法`futures._set_result_unless_cancelled` 会被调用，
+将第`3`步获取的协程内部等待对象`Future`设置结果，此时注册的回调函数`Tasks.__wakeup`会被调用，继续程序往下执行。
+
+在`main_task`方法内，同时有`4`个`Task`在事件循环中，所以`4`个协程是并发执行。
