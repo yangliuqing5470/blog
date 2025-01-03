@@ -1,497 +1,150 @@
 # 引言
-在 [futures&tasks&coroutines原理](./asyncio-futures-tasks-coroutines.md) 我们了解
-了`Futures`、`Tasks`和`Coroutines`的实现原理，本章我们将了解 asyncio 的调度原理。
+在[核心概念](./asyncio-futures-tasks-coroutines.md)我们了解了`Futures`、`Tasks`和`Coroutines`的实现原理。本章我们将了解`asyncio`的调度原理。
 
-![调度框架](./images/asyncio调度框架.png)
-asyncio 库调度核心可以分为**任务执行**与**任务添加**，这里的任务不是`Task`，而是一个就绪
-队列中可执行 handle。二者相互合作，使得 asyncio 调度可以模拟并行运行多个`Task`。接下来
-将分别介绍**任务执行**和**任务添加**。
+![调度框架](./images/eventloop.png)
+
+`asyncio`的核心是事件循环。上图是事件循环中调度相关部分的工作原理。可将调度逻辑分为**任务添加**和**任务执行**两大块。
+其中一个任务`Task`在**调度内部**会被包装为`Handle`实体。
+
+# Handle
+`Handle`本身是对回调方法的进一步封装。增加了如下能力：
++ 取消能力：在`Handle`被执行之前可以被取消。
++ 提供异步环境下每一个`Handle`的上下文安全：每一个`Handle`通过`contextvars.copy_context()`实现自己独立上下文环境，
+解决共享变量安全问题。
++ 异常处理能力：捕获并处理每一个`Handle`执行过程中可能抛出的异常。
+
+`asyncio`提供了两种类型的`Handle`实体：
++ `Handle`：需要立刻执行；
++ `TimerHandle`：在将来的某一时刻执行；
+
+`Handle`的构建样例如下：
+```python
+# 构建一个 TimerHandle
+timer = events.TimerHandle(when, callback, args, self, context)
+# 构建一个 Handle
+handle = events.Handle(callback, args, self, context)
+```
 
 # 任务执行
-任务执行逻辑比较简单，就是通过执行体`run_until_compelte`或`run_forever`最终调用
-`_run_once`不断从就绪队列取出一个 handle 然后运行。在介绍执行体`run_until_compelte`、
-`run_forever`和`_run_once`之前，我们先弄明白什么是 handle。
-## Handle
-源码有两种 Handle 实现，分别是不带时间的普通 Handle 和带时间的TimerHandle，
-先看和时间无关的 Handle，源码如下：
-```python
-class Handle:
-    ...
-    def __init__(self, callback, args, loop, context=None):
-        if context is None:
-            context = contextvars.copy_context()
-        self._context = context
-        self._loop = loop
-        self._callback = callback
-        self._args = args
-        self._cancelled = False
-        self._repr = None
-        if self._loop.get_debug():
-            self._source_traceback = format_helpers.extract_stack(
-                sys._getframe(1))
-        else:
-            self._source_traceback = None
-
-    ...
-
-    def cancel(self):
-        if not self._cancelled:
-            self._cancelled = True
-            if self._loop.get_debug():
-                # Keep a representation in debug mode to keep callback and
-                # parameters. For example, to log the warning
-                # "Executing <Handle...> took 2.5 second"
-                self._repr = repr(self)
-            self._callback = None
-            self._args = None
-
-    def cancelled(self):
-        return self._cancelled
-
-    def _run(self):
-        try:
-            self._context.run(self._callback, *self._args)
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            cb = format_helpers._format_callback_source(
-                self._callback, self._args)
-            msg = f'Exception in callback {cb}'
-            context = {
-                'message': msg,
-                'exception': exc,
-                'handle': self,
-            }
-            if self._source_traceback:
-                context['source_traceback'] = self._source_traceback
-            self._loop.call_exception_handler(context)
-        self = None  # Needed to break cycles when an exception occurs.
+协程被执行的入口函数是`asyncio.run`方法。`asyncio.run`的工作大体流程如下：
+```bash
++-------------+    +---------------+    +-------------------------------------+
+|创建事件循环对象|--->|将协程封装为 Task|--->|调用事件循环的 run_until_complete(task)|
++-------------+    +---------------+    +-------------------------------------+
 ```
-可以看到，Handle 可以看成是事件循环中要执行方法 (callback) 的封装，增加的取消
-和异常处理的能力。TimerHandle 是 Handle 的子类，额外增加了和事件有关的属性以及
-排序相关的方法，其源码如下：
+在事件循环调度内部，`Handle`被执行的详细流程如下：
+
+![时间循环执行流程](./images/asyncio_run.png)
+
+在`asyncio`调度内部，事件循环有两个核心的队列：
++ **就绪队列**：一个`FIFO`队列，里面的`Handle`会尽可能快地执行。
++ **最小堆**：按时间指标构建，存放所有的`TimerHandle`实体。
+
+如果调用`run_until_complete`方法，会注册一个任务完成回调`_run_until_complete_cb`方法。做的唯一工作就是停止当前的事件循环。
 ```python
-class TimerHandle(Handle):
-    """Object returned by timed callback registration methods."""
-
-    __slots__ = ['_scheduled', '_when']
-
-    def __init__(self, when, callback, args, loop, context=None):
-        assert when is not None
-        super().__init__(callback, args, loop, context)
-        if self._source_traceback:
-            del self._source_traceback[-1]
-        # 表示可以被执行的时间点，当前时间大于等于 when 时候，此 handle 可以被执行
-        self._when = when
-        # 表示是否等待被调度
-        self._scheduled = False
-
-    ...
-
-    def __hash__(self):
-        return hash(self._when)
-
-    def __lt__(self, other):
-        return self._when < other._when
-
-    def __le__(self, other):
-        if self._when < other._when:
-            return True
-        return self.__eq__(other)
-
-    def __gt__(self, other):
-        return self._when > other._when
-
-    def __ge__(self, other):
-        if self._when > other._when:
-            return True
-        return self.__eq__(other)
-
-    def __eq__(self, other):
-        if isinstance(other, TimerHandle):
-            return (self._when == other._when and
-                    self._callback == other._callback and
-                    self._args == other._args and
-                    self._cancelled == other._cancelled)
-        return NotImplemented
-
-    def __ne__(self, other):
-        equal = self.__eq__(other)
-        return NotImplemented if equal is NotImplemented else not equal
-
-    def cancel(self):
-        if not self._cancelled:
-            self._loop._timer_handle_cancelled(self)
-        super().cancel()
-
-    def when(self):
-        """Return a scheduled callback time.
-
-        The time is an absolute timestamp, using the same time
-        reference as loop.time().
-        """
-        return self._when
+def _run_until_complete_cb(fut):
+    if not fut.cancelled():
+        exc = fut.exception()
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            # Issue #22429: run_forever() already finished, no need to
+            # stop it.
+            return
+    # 停止事件循环
+    futures._get_loop(fut).stop()
 ```
-知道了什么是 handle，接下来看看执行体的实现原理。
-## 执行体
-`run_until_compelte`、`run_forever`和`_run_once`驱动着事件循环不断的运行，
-其源码如下：
-```python
-def run_until_complete(self, future):
-    """Run until the Future is done.
-
-    If the argument is a coroutine, it is wrapped in a Task.
-
-    WARNING: It would be disastrous to call run_until_complete()
-    with the same coroutine twice -- it would wrap it in two
-    different Tasks and that can't be good.
-
-    Return the Future's result, or raise its exception.
-    """
-    self._check_closed()
-    self._check_running()
-
-    new_task = not futures.isfuture(future)
-    # 将一个协程转为一个Task
-    future = tasks.ensure_future(future, loop=self)
-    if new_task:
-        # An exception is raised if the future didn't complete, so there
-        # is no need to log the "destroy pending task" message
-        future._log_destroy_pending = False
-    # 将这个任务添加完成回调，任务完成后会通知事件循环退出
-    future.add_done_callback(_run_until_complete_cb)
-    try:
-        # 委托 run_forever
-        self.run_forever()
-    except:
-        if new_task and future.done() and not future.cancelled():
-            # The coroutine raised a BaseException. Consume the exception
-            # to not log a warning, the caller doesn't have access to the
-            # local task.
-            future.exception()
-        raise
-    finally:
-        future.remove_done_callback(_run_until_complete_cb)
-    if not future.done():
-        raise RuntimeError('Event loop stopped before Future completed.')
-
-    return future.result()
-```
-`run_until_compelte`内部委托 `run_forever`调用，`run_forever`的源码如下：
-```python
-def run_forever(self):
-    """Run until stop() is called."""
-    self._check_closed()
-    self._check_running()
-    self._set_coroutine_origin_tracking(self._debug)
-    self._thread_id = threading.get_ident()
-
-    old_agen_hooks = sys.get_asyncgen_hooks()
-    sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook,
-                           finalizer=self._asyncgen_finalizer_hook)
-    try:
-        events._set_running_loop(self)
-        while True:
-            self._run_once()
-            if self._stopping:
-                break
-    finally:
-        self._stopping = False
-        self._thread_id = None
-        events._set_running_loop(None)
-        self._set_coroutine_origin_tracking(False)
-        sys.set_asyncgen_hooks(*old_agen_hooks)
-```
-`run_forever`内部会不断调用`_run_once`，直到事件循环停止，`_run_once`的源码如下：
-```python
-def _run_once(self):
-    """Run one full iteration of the event loop.
-
-    This calls all currently ready callbacks, polls for I/O,
-    schedules the resulting callbacks, and finally schedules
-    'call_later' callbacks.
-    """
-
-    sched_count = len(self._scheduled)
-    # 判断当前等待被调度的 TimerHandle 数是否超过100且取消的比例超过0.5
-    if (sched_count > _MIN_SCHEDULED_TIMER_HANDLES and
-        self._timer_cancelled_count / sched_count >
-            _MIN_CANCELLED_TIMER_HANDLES_FRACTION):
-        # Remove delayed calls that were cancelled if their number
-        # is too high
-        new_scheduled = []
-        for handle in self._scheduled:
-            if handle._cancelled:
-                handle._scheduled = False
-            else:
-                new_scheduled.append(handle)
-        # 对堆重新排序
-        heapq.heapify(new_scheduled)
-        self._scheduled = new_scheduled
-        self._timer_cancelled_count = 0
-    else:
-        # Remove delayed calls that were cancelled from head of queue.
-        while self._scheduled and self._scheduled[0]._cancelled:
-            self._timer_cancelled_count -= 1
-            handle = heapq.heappop(self._scheduled)
-            handle._scheduled = False
-
-    timeout = None
-    # 如果就绪队列有任务，等待超时时间设置为0，不等待，尽快调度
-    if self._ready or self._stopping:
-        timeout = 0
-    elif self._scheduled:
-        # 否则拿到堆顶的 TimerHandle 计算最小的超时时间
-        # Compute the desired timeout.
-        when = self._scheduled[0]._when
-        timeout = min(max(0, when - self.time()), MAXIMUM_SELECT_TIMEOUT)
-
-    # 从 epoll/iocp/select 等获取就绪事件
-    event_list = self._selector.select(timeout)
-    # 处理就绪事件并将其添加到事件循环的就绪队列
-    self._process_events(event_list)
-
-    # Handle 'later' callbacks that are ready.
-    end_time = self.time() + self._clock_resolution
-    while self._scheduled:
-        handle = self._scheduled[0]
-        if handle._when >= end_time:
-            break
-        handle = heapq.heappop(self._scheduled)
-        handle._scheduled = False
-        self._ready.append(handle)
-
-    # This is the only place where callbacks are actually *called*.
-    # All other places just add them to ready.
-    # Note: We run all currently scheduled callbacks, but not any
-    # callbacks scheduled by callbacks run this time around --
-    # they will be run the next time (after another I/O poll).
-    # Use an idiom that is thread-safe without using locks.
-    ntodo = len(self._ready)
-    for i in range(ntodo):
-        handle = self._ready.popleft()
-        if handle._cancelled:
-            continue
-        if self._debug:
-            try:
-                self._current_handle = handle
-                t0 = self.time()
-                handle._run()
-                dt = self.time() - t0
-                if dt >= self.slow_callback_duration:
-                    logger.warning('Executing %s took %.3f seconds',
-                                   _format_handle(handle), dt)
-            finally:
-                self._current_handle = None
-        else:
-            handle._run()
-    handle = None  # Needed to break cycles when an exception occurs.
-```
-至此理解了调度中**任务执行**的相关原理，接下来介绍调度中**任务是如何添加**到就绪队列的。
+在调度的内部使用了`epoll`或者`iocp`模型以处理高效的网络`IO`。所以`asyncio`特别适合网络编程，实现单线程高效率的`IO`处理。
 
 # 任务添加
-任务(就绪队列中的一个任务，不是`Task`)的添加有三种来源，普通的协程通过直接
-调用`call_xx`方法，网络IO通过回调注册的方式，信号处理添加方式，
-我们先看下直接调用`call_xx`等方法添加任务的原理：
-## 调用`call_xx`
-asyncio 库提供了`call_soon`、`call_later`、`call_at`和`call_soon_threadsafe`直接
-调用方法往事件循环的队列 (就绪队列或者 TimerHandle 堆) 添加 handler，源码如下：
+任务添加是指将要执行的任务添加到事件循环的调度队列中。类比将多线程或多进程任务提交到操作系统调度执行。在`asyncio`中，
+事件循环中任务的添加方式有三种：
++ 调用`loop.call_xxx`方法直接添加到调度的就绪队列或者最小堆中。
++ 利用`IO`多路复用模型`epoll`或`iocp`将注册的`socket`事件处理函数，在事件发生时，添加到事件循环的就绪队列中。
++ 利用`socketpair`将信号处理函数，在信号发生时，添加到事件循环的就绪队列中。
+
+## 直接添加任务
+`asyncio`的事件循环类提供了`call_soon`、`call_at`、`call_later`和`call_soon_threadsafe`四个方法用于将执行的任务直接添加到事件循环调度的最小堆或就绪队列中。
+四个方法的定义如下：
 ```python
-def call_soon(self, callback, *args, context=None):
-    """Arrange for a callback to be called as soon as possible.
-
-    This operates as a FIFO queue: callbacks are called in the
-    order in which they are registered.  Each callback will be
-    called exactly once.
-
-    Any positional arguments after the callback will be passed to
-    the callback when it is called.
-    """
-    self._check_closed()
-    if self._debug:
-        self._check_thread()
-        self._check_callback(callback, 'call_soon')
-    handle = self._call_soon(callback, args, context)
-    if handle._source_traceback:
-        del handle._source_traceback[-1]
-    return handle
-
-def _call_soon(self, callback, args, context):
-    handle = events.Handle(callback, args, self, context)
-    if handle._source_traceback:
-        del handle._source_traceback[-1]
-    self._ready.append(handle)
-    return handle
-```
-`call_soon`源码可知，其会将可执行回调方法`callback`包装为一个 handler，直接
-添加到事件循环的就绪队列，使其尽快执行。
-```python
+# 相对当前时刻往后 delay 时间后执行
 def call_later(self, delay, callback, *args, context=None):
-    """Arrange for a callback to be called at a given time.
-
-    Return a Handle: an opaque object with a cancel() method that
-    can be used to cancel the call.
-
-    The delay can be an int or float, expressed in seconds.  It is
-    always relative to the current time.
-
-    Each callback will be called exactly once.  If two callbacks
-    are scheduled for exactly the same time, it undefined which
-    will be called first.
-
-    Any positional arguments after the callback will be passed to
-    the callback when it is called.
-    """
-    timer = self.call_at(self.time() + delay, callback, *args,
-                         context=context)
-    if timer._source_traceback:
-        del timer._source_traceback[-1]
-    return timer
-
+    pass
+# 将来时刻 when 执行
 def call_at(self, when, callback, *args, context=None):
-    """Like call_later(), but uses an absolute time.
-
-    Absolute time corresponds to the event loop's time() method.
-    """
-    self._check_closed()
-    if self._debug:
-        self._check_thread()
-        self._check_callback(callback, 'call_at')
-    timer = events.TimerHandle(when, callback, args, self, context)
-    if timer._source_traceback:
-        del timer._source_traceback[-1]
-    heapq.heappush(self._scheduled, timer)
-    timer._scheduled = True
-    return timer
-```
-`call_at`和`call_later`是和 TimerHandle 有关，将 TimerHandle 添加到堆上，使其
-在某个时间点之后执行。
-```python
+    pass
+# 尽可能快地执行
+def call_soon(self, callback, *args, context=None):
+    pass
+# 也是尽可能快地执行，线程安全的调用方式
 def call_soon_threadsafe(self, callback, *args, context=None):
-    """Like call_soon(), but thread-safe."""
-    self._check_closed()
-    if self._debug:
-        self._check_callback(callback, 'call_soon_threadsafe')
-    handle = self._call_soon(callback, args, context)
-    if handle._source_traceback:
-        del handle._source_traceback[-1]
-    self._write_to_self()
-    return handle
+    pass
 ```
-`call_soon_threadsafe`是`call_soon`线程安全的版本。一般情况下，`call_soon`、
-`call_at`和`call_later`都是在事件循环的线程中调用，如果想在非事件循环的线程
-调用 (其他线程调用)，应该使用`call_soon_threadsafe`版本。下面解释下`call_soon_threadsafe`
-中`safe`到底指什么。
-+ 唤醒事件循环线程。根据`_run_once`源码可知，当事件循环没有可执行的任务时，
-事件循环线程可能阻塞在`event_list = self._selector.select(timeout)`。事件
-循环内部会有一个 socketpair，此时通过`_write_to_self`发送一个字节，可以唤醒
-事件循环处理就绪队列中的任务
-+ 事件循环被唤醒后，在事件循环线程上下文中执行添加的方法，可以安全的访问事件
-循环的所有对象
+上述四个方法的工作流程总结如下：
 
-以上就是直接调用`call_xx`的方式往事件循环添加 handle 的原理介绍，接下来介绍
-网络IO通过回调注册方式实现原理。
+![call_xx流程](./images/call_xx工作流程.png)
 
-## 网络IO的回调注册
-asyncio 库借助 epoll/iocp/select 实现对网络IO事件处理的注册。相关方法源码如下：
+其中`call_at`、`call_later`和`call_soon`三个方法是在事件循环的线程中调用。但`call_soon_threadsafe`方法是在其它线程中调用，
+也就是调用线程和事件循环线程不是同一个。所谓的线程安全主要体现在如下两个方面：
++ 唤醒事件循环调度。为了处理网络`IO`，事件循环使用了高效的`epoll`或`IOCP`模型。如果没有相关`IO`事件发生，
+事件循环调度可能会阻塞在`self._selector.select(timeout)`处。所以在其它线程添加任务，需要唤醒事件循环。
++ 事件循环调度被唤醒后，在事件循环线程上下文中执行添加的方法，可以安全的访问事件循环的所有对象。
+
+唤醒事件循环调度的方法`self._write_to_self`实现如下：
 ```python
-def _add_reader(self, fd, callback, *args):
-    self._check_closed()
-    handle = events.Handle(callback, args, self, None)
+def _write_to_self(self):
+    # This may be called from a different thread, possibly after
+    # _close_self_pipe() has been called or even while it is
+    # running.  Guard for self._csock being None or closed.  When
+    # a socket is closed, send() raises OSError (with errno set to
+    # EBADF, but let's not rely on the exact error code).
+    csock = self._csock
+    if csock is None:
+        return
     try:
-        key = self._selector.get_key(fd)
-    except KeyError:
-        self._selector.register(fd, selectors.EVENT_READ,
-                                (handle, None))
-    else:
-        mask, (reader, writer) = key.events, key.data
-        self._selector.modify(fd, mask | selectors.EVENT_READ,
-                              (handle, writer))
-        if reader is not None:
-            reader.cancel()
+        csock.send(b'\0')
+    except OSError:
+        if self._debug:
+            logger.debug("Fail to write a null byte into the "
+                         "self-pipe socket",
+                         exc_info=True)
+```
+因为在事件循环初始化阶段会创建一个`socketpair`用于事件循环内部通信。
+```python
+def _make_self_pipe(self):
+    # A self-socket, really. :-)
+    self._ssock, self._csock = socket.socketpair()
+    self._ssock.setblocking(False)
+    self._csock.setblocking(False)
+    self._internal_fds += 1
+    self._add_reader(self._ssock.fileno(), self._read_from_self)
+```
+至此，`self._write_to_self`唤醒工作原理总结如下：
++ `socketpair`的服务端`self._ssock`往`epoll`或`iocp`注册了`socket`读事件。
++ `self._write_to_self`往`socketpair`的客户端`self._csock`写一个空字符。
++ `socketpair`服务端`self._ssock`产生可读事件。
++ 唤醒`self._selector.select(timeout)`，使得事件循环开始运行。
 
-def _remove_reader(self, fd):
-    if self.is_closed():
-        return False
-    try:
-        key = self._selector.get_key(fd)
-    except KeyError:
-        return False
-    else:
-        mask, (reader, writer) = key.events, key.data
-        mask &= ~selectors.EVENT_READ
-        if not mask:
-            self._selector.unregister(fd)
-        else:
-            self._selector.modify(fd, mask, (None, writer))
-
-        if reader is not None:
-            reader.cancel()
-            return True
-        else:
-            return False
-
-def _add_writer(self, fd, callback, *args):
-    self._check_closed()
-    handle = events.Handle(callback, args, self, None)
-    try:
-        key = self._selector.get_key(fd)
-    except KeyError:
-        self._selector.register(fd, selectors.EVENT_WRITE,
-                                (None, handle))
-    else:
-        mask, (reader, writer) = key.events, key.data
-        self._selector.modify(fd, mask | selectors.EVENT_WRITE,
-                              (reader, handle))
-        if writer is not None:
-            writer.cancel()
-
-def _remove_writer(self, fd):
-    """Remove a writer callback."""
-    if self.is_closed():
-        return False
-    try:
-        key = self._selector.get_key(fd)
-    except KeyError:
-        return False
-    else:
-        mask, (reader, writer) = key.events, key.data
-        # Remove both writer and connector.
-        mask &= ~selectors.EVENT_WRITE
-        if not mask:
-            self._selector.unregister(fd)
-        else:
-            self._selector.modify(fd, mask, (reader, None))
-
-        if writer is not None:
-            writer.cancel()
-            return True
-        else:
-            return False
-
+## 网络IO任务
+`asyncio`使用了常用的`epoll`或者`IOCP`网络`IO`模型来高效处理网络`IO`事件。提供了四个接口用于注册或删除事件处理函数，
+分别是`add_reader`、`remove_reader`、`add_writer`和`remove_writer`。
+```python
 def add_reader(self, fd, callback, *args):
-    """Add a reader callback."""
-    self._ensure_fd_no_transport(fd)
-    return self._add_reader(fd, callback, *args)
+    pass
 
 def remove_reader(self, fd):
-    """Remove a reader callback."""
-    self._ensure_fd_no_transport(fd)
-    return self._remove_reader(fd)
+    pass
 
 def add_writer(self, fd, callback, *args):
-    """Add a writer callback.."""
-    self._ensure_fd_no_transport(fd)
-    return self._add_writer(fd, callback, *args)
+    pass
 
 def remove_writer(self, fd):
-    """Remove a writer callback."""
-    self._ensure_fd_no_transport(fd)
-    return self._remove_writer(fd)
+    pass
 ```
-`add_writer`、`add_reader`、`remove_writer`和`remove_reader`四个方法借助 selectors
-模块实现对 socket 的监听。对于发生的 socket 事件，通过 `_process_events` 方法处理，
-其源码如下：
+上面四个方法的工作流程可简化如下：
+
+![网络IO任务](./images/asyncio网络事件添加.png)
+
+如果某个`socket`注册事件发生时，在事件循环调度`self._selector.select(timeout)`会返回相关`socket`及事件处理`Handle`。
+接着通过`self._process_events`方法处理相关的`Handle`。
 ```python
 def _process_events(self, event_list):
     for key, mask in event_list:
@@ -507,24 +160,10 @@ def _process_events(self, event_list):
             else:
                 self._add_callback(writer)
 ```
-从源码可知，对于就绪的网络IO事件，通过调用`_add_callback`方法将具体事件处理函数
-添加到事件循环就绪队列中，`_add_callback`源码如下：
-```python
-def _add_callback(self, handle):
-    """Add a Handle to _scheduled (TimerHandle) or _ready."""
-    assert isinstance(handle, events.Handle), 'A Handle is required here'
-    if handle._cancelled:
-        return
-    assert not isinstance(handle, events.TimerHandle)
-    # 添加到事件循环的就绪队列
-    self._ready.append(handle)
-```
-以上就是网络 IO 通过回调注册方式实现往事件循环添加 handle 的原理。接下来介绍
-信号处理添加的方式。
+`self._process_events`做的事件就是将相关`Handle`添加到事件循环的**就绪队列**中等待被执行。
 
-## 信号处理
-信号处理 handle 的添加本质上也是网络IO的方式，内部通过 socketpair 实现。
-我们首先看下准备阶段 socketpair 初始化：
+## 信号处理任务
+在事件循环初始化时会创建一个`socketpair`对象。
 ```python
 def _make_self_pipe(self):
     # A self-socket, really. :-)
@@ -534,87 +173,33 @@ def _make_self_pipe(self):
     self._internal_fds += 1
     self._add_reader(self._ssock.fileno(), self._read_from_self)
 ```
-源码可知，首先创建一个互相已连接的 socket 对：`_ssock`和`_csock`，然后将`_ssock`
-添加可读事件监听。做完准备工作，接下来看下信号处理函数是如何被添加到事件循环中
+> `socketpair`的特点就是：在一端写数据，在另一端可以读相关数据。常用于进程间通信。
+
+创建`socketpair`后，会将一端`self._ssock`可读事件及处理函数`self._read_from_self`注册到`epoll/IOCP`。
+
+`asyncio`提供了`add_signal_handler`方法用于往事件循环中添加信号处理函数。`add_signal_handler`的核心逻辑如下：
 ```python
 def add_signal_handler(self, sig, callback, *args):
-    """Add a handler for a signal.  UNIX only.
-
-    Raise ValueError if the signal number is invalid or uncatchable.
-    Raise RuntimeError if there is a problem setting up the handler.
-    """
     ...
     try:
         # set_wakeup_fd() raises ValueError if this is not the
         # main thread.  By calling it early we ensure that an
         # event loop running in another thread cannot add a signal
         # handler.
-        # 信号发生时候，会往 _csock 写入信号值，进而触发 _ssock 读事件
         signal.set_wakeup_fd(self._csock.fileno())
     except (ValueError, OSError) as exc:
         raise RuntimeError(str(exc))
 
     handle = events.Handle(callback, args, self, None)
     self._signal_handlers[sig] = handle
-
-    try:
-        # Register a dummy signal handler to ask Python to write the signal
-        # number in the wakeup file descriptor. _process_self_data() will
-        # read signal numbers from this file descriptor to handle signals.
-        # 信号发生时候，这里不做处理，快速返回，处理方法会统一放到事件循环中
-        signal.signal(sig, _sighandler_noop)
-
-        # Set SA_RESTART to limit EINTR occurrences.
-        signal.siginterrupt(sig, False)
-    except OSError as exc:
-        ...
+    ...
 ```
-`add_signal_handler`逻辑简单，注册 socketpair 的写端，下面看下 socketpair 的读端
-逻辑：
-```python
-def _read_from_self(self):
-    while True:
-        try:
-            data = self._ssock.recv(4096)
-            if not data:
-                break
-            self._process_self_data(data)
-        except InterruptedError:
-            continue
-        except BlockingIOError:
-            break
-
-def _process_self_data(self, data):
-    for signum in data:
-        if not signum:
-            # ignore null bytes written by _write_to_self()
-            continue
-        self._handle_signal(signum)
-
-def _handle_signal(self, sig):
-    """Internal helper that is the actual signal handler."""
-    handle = self._signal_handlers.get(sig)
-    if handle is None:
-        return  # Assume it's some race condition.
-    if handle._cancelled:
-        self.remove_signal_handler(sig)  # Remove it properly.
-    else:
-        self._add_callback_signalsafe(handle)
-
-def _add_callback(self, handle):
-    """Add a Handle to _scheduled (TimerHandle) or _ready."""
-    assert isinstance(handle, events.Handle), 'A Handle is required here'
-    if handle._cancelled:
-        return
-    assert not isinstance(handle, events.TimerHandle)
-    self._ready.append(handle)
-
-def _add_callback_signalsafe(self, handle):
-    """Like _add_callback() but called from a signal handler."""
-    self._add_callback(handle)
-    # 唤醒事件循环
-    self._write_to_self()
+其中`signal.set_wakeup_fd(self._csock.fileno)`用于在接收到信号时，将信号通知写入一个文件描述符，也就是写入`self._csock`。
+这样`socketpair`的另一端`self._ssock`就会有读事件发生。接着通过如下的事件处理调用链：
+```bash
++--------------------+    +-----------------------------+    +---------------------------+    +-------------------------------------+
+|self._read_from_self|--->|self._process_self_data(data)|--->|self._handle_signal(signum)|--->|self._add_callback_signalsafe(handle)|
++--------------------+    +-----------------------------+    +---------------------------+    +-------------------------------------+
 ```
-`_add_callback_signalsafe`原理可以参考上面介绍的`call_soon_threadsafe`的原理，
-二者实现相似。至此，我们介绍了信号往事件循环中添加的原理，同时也完成了 asyncio 
-调度原理的介绍。
+将事件处理函数添加到事件循环的调度**就绪队列中**。同时最后也会通过`self._write_to_self`唤醒事件循环调度，
+因为信号的发生也是异步的，不是在事件循环线程上下文中。
