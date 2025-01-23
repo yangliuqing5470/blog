@@ -5,13 +5,13 @@
 - [nginx新手入门](./programming/network/nginx.md)
 
 ## Python
-### asyncio
+### 异步 I/O
 - [协程语法](./programming/python-asyncio/asyncio-syntax.md)
 - [核心概念](./programming/python-asyncio/asyncio-futures-tasks-coroutines.md)
 - [调度原理](./programming/python-asyncio/asyncio-scheduling.md)
 - [网络编程](./programming/python-asyncio/asyncio-networking.md)
 
-### aiohttp
+### web 框架- aiohttp
 - [框架原理-服务端](./programming/aiohttp/framework.md)
 - [Application实现原理](./programming/aiohttp/application.md)
 - [http请求解析](./programming/aiohttp/http_request_parser.md)
@@ -20,7 +20,7 @@
 - [websocket](./programming/aiohttp/websocket.md)
 - [性能优化及压测](./programming/aiohttp/performance_benchmarks.md)
 
-### concurrent
+### 并发
 - [线程池](./programming/python-futures/thread-pool.md)
 - [进程池](./programming/python-futures/process-pool.md)
 - [Future对象](./programming/python-futures/futures.md)
