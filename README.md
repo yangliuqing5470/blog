@@ -12,12 +12,10 @@
 - [网络编程](./programming/python-asyncio/asyncio-networking.md)
 
 ### web 框架- aiohttp
-- [框架原理-服务端](./programming/aiohttp/framework.md)
-- [Application实现原理](./programming/aiohttp/application.md)
-- [http请求解析](./programming/aiohttp/http_request_parser.md)
-- [http请求对象](./programming/aiohttp/http_request_build.md)
-- [http响应](./programming/aiohttp/http_response.md)
-- [websocket](./programming/aiohttp/websocket.md)
+- [HTTP 服务端框架原理](./programming/aiohttp/framework.md)
+- [HTTP 客户端框架原理](./programming/aiohttp/framework_client.md)
+- [WebSockets 服务端框架原理](./programming/aiohttp/websockets.md)
+- [WebSockets 客户端框架原理](./programming/aiohttp/websockets_client.md)
 - [性能优化及压测](./programming/aiohttp/performance_benchmarks.md)
 
 ### 并发
