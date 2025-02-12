@@ -14,8 +14,8 @@
 ### web 框架- aiohttp
 - [HTTP 服务端框架原理](./programming/aiohttp/framework.md)
 - [HTTP 客户端框架原理](./programming/aiohttp/framework_client.md)
-- [WebSockets 服务端框架原理](./programming/aiohttp/websockets.md)
-- [WebSockets 客户端框架原理](./programming/aiohttp/websockets_client.md)
+- [WebSocket 服务端框架原理](./programming/aiohttp/websockets.md)
+- [WebSocket 客户端框架原理](./programming/aiohttp/websockets_client.md)
 - [性能优化及压测](./programming/aiohttp/performance_benchmarks.md)
 
 ### 并发
