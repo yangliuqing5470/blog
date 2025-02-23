@@ -259,7 +259,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 + 更新一些统计信息，例如内存使用，数据发送和接收字节数等等。
 + 更新`LRU`缓存淘汰使用的时钟`server.lruclock`。
 + 处理`SIGTERM`和`SIGINT`等信号。
-+ 客户端健康定时检查操作。每次调用会尝试处理`listLength(server.clients)/server.hz`个客户端，因为期望`1s`内处理完所有客户端。
++ **客户端健康定时检查操作**。每次调用会尝试处理`listLength(server.clients)/server.hz`个客户端，因为期望`1s`内处理完所有客户端。
   + 断开清理超时客户端。通过判断客户端空闲时间是否超过`server.maxidletime`指定的大小。
     ```c
     if (now - c->lastinteraction > server.maxidletime)
@@ -270,4 +270,22 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
   + 优化客户端输出缓存`c->buf`内存占用。
   + 跟踪记录客户端输入缓存`c->querybuf`和输出缓存`c->reply`峰值内存使用。累加统计总的客户端占用内存大小。
   + 如果客户端输出缓存`c->reply`链表大小超过限制，则关闭客户端（同步方式）。
-+ 数据库检查处理。
++ **数据库检查处理**。
+  + 过期键的删除。通过调用`activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW)`实现。每次调用最多遍历`16`个数据库，
+  每个数据库迭代调用`16`次会检查函数`activeExpireCycle`是否超时且每次迭代最多处理默认`20`个过期数据。
+  超时时间`timelimit`计算如下：
+    ```c
+    // config_cycle_slow_time_perc 默认是 25
+    // 结果表示 activeExpireCycle 函数执行时间占CPU时间25%
+    timelimit = config_cycle_slow_time_perc*1000000/server.hz/100;
+    ```
+  + 内存碎片整理。`rehash`数据库的`db->keys`和`db->expires`字典存储。
++ 如果`server.clients_pending_write`客户端数目小于`IO`线程数的`2`倍，则停止`IO`多线程。
+
+# IO 多线程
+在`redis 6.0`之前，`redis`是单线程模式。也就是事件循环，请求接收，请求解析，请求处理及响应回复都在主线程完成。
+在`redis 6.0`开始，引入`IO`多线程模式。也就是请求接收、请求解析及响应回复在`IO`子线程完成。其他还是在主线程完成。
+
+# 数据存储
+
+# 命令处理
