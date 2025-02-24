@@ -285,7 +285,139 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 # IO 多线程
 在`redis 6.0`之前，`redis`是单线程模式。也就是事件循环，请求接收，请求解析，请求处理及响应回复都在主线程完成。
 在`redis 6.0`开始，引入`IO`多线程模式。也就是请求接收、请求解析及响应回复在`IO`子线程完成。其他还是在主线程完成。
+和`IO`多线程相关的变量如下：
+```c
+int io_threads_num       // 默认值是1。表示 io 线程数
+int io_threads_do_reads  // 请求接收和解析是否使用 io 多线程。默认不使用
+int io_threads_active    // io 多线程是否激活使用。初始状态是不激活
+int io_threads_op        // io 多线程的操作状态，取值有如下三个。
+    // IO_THREADS_OP_IDLE: 空闲状态，表示没有 io 线程在进行响应回复或请求读和解析。
+    // IO_THREADS_OP_READ: 表示有 io 线程在进行请求读和解析操作。
+    // IO_THREADS_OP_WRITE: 表示有 io 线程在进行响应回复操作。
+pthread_t io_threads[IO_THREADS_MAX_NUM]    // 一个128大小的数组，存放 io 线程对象。
+pthread_mutex_t io_threads_mutex[IO_THREADS_MAX_NUM] // 一个128大小数组，存放每一个 io 线程使用的互斥锁
+threads_pending io_threads_pending[IO_THREADS_MAX_NUM] // 一个128大小数组，存放每一个 io 线程待处理的客户端数量
+list *io_threads_list[IO_THREADS_MAX_NUM]  // 一个128大小数组，存放每一个 io 线程需要处理的客户端对象。
+```
+`IO`多线程初始化流程总结如下：
+
+![io多线程初始化流程](./images/io多线程初始化流程.png)
+
+每一个`IO`线程初始化后，如果没有要处理的挂起客户端，则线程会处于休眠状态。下面需要解决两个问题：
++ 每一个线程对应的挂起客户端链表`io_threads_list[id]`和对应的挂起客户端数`io_threads_pending[id]`是何时添加的?
++ `IO`多线程是何时被唤醒的?
+
+在上面介绍的文件事件执行流程中可知，每次事件循环中会执行`beforesleep`函数。在`beforesleep`的流程中，
+`handleClientsWithPendingReadsUsingThreads`函数和`handleClientsWithPendingWritesUsingThreads`函数会被调用用于使用`IO`多线程处理挂起的读客户端和写客户端。
+相关的原理说明如下：
+
+![线程任务添加和唤醒流程](./images/io线程任务添加和唤醒流程.png)
+
+需要注意一点，`IO`多线程的激活只在`handleClientsWithPendingWritesUsingThreads`中实现。
 
 # 数据存储
+`redis`是`key-value`型数据库。不管是`key`还是`value`，存储都是`redisObject`对象。相关定义如下：
+```c
+struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:LRU_BITS; /* LRU time (relative to global lru_clock) or
+                            * LFU data (least significant 8 bits frequency
+                            * and most significant 16 bits access time). */
+    int refcount;
+    void *ptr;
+};
+```
+各个字段的含义说明如下：
++ `type`：表示对象的类型，取值如下：
+  ```c
+  /* The actual Redis Object */
+  #define OBJ_STRING 0    /* String object. */
+  #define OBJ_LIST 1      /* List object. */
+  #define OBJ_SET 2       /* Set object. */
+  #define OBJ_ZSET 3      /* Sorted set object. */
+  #define OBJ_HASH 4      /* Hash object. */
+  #define OBJ_MODULE 5    /* Module object. */
+  #define OBJ_STREAM 6    /* Stream object. */
+  ```
++ `encoding`：当前对象底层存储采用的数据结构；对于某种类型对象，在不同的情况下，`redis`使用不同的数据结构，下表给出了`encoding`和`type`之间的关系：
+  |encoding取值|数据结构|存储对象类型|
+  |------------|--------|------------|
+  |`OBJ_ENCODING_RAW`|简单动态字符串(`sds`)|字符串|
+  |`OBJ_ENCODING_INT`|整数|字符串|
+  |`OBJ_ENCODING_HT`|字典(`dict`)|集合、字典、有序集合|
+  |`OBJ_ENCODING_ZIPMAP`|未使用|未使用|
+  |`OBJ_ENCODING_LINKEDLIST`|废弃|废弃|
+  |`OBJ_ENCODING_ZIPLIST`|压缩列表(`ziplist`)|有序集合、字典|
+  |`OBJ_ENCODING_INTSET`|整数集合(`intset`)|集合|
+  |`OBJ_ENCODING_SKIPLIST`|跳跃表(`skiplist`)|有序集合|
+  |`OBJ_ENCODING_EMBSTR`|简单动态字符串(`sds`)|字符串|
+  |`OBJ_ENCODING_QUICKLIST`|快速链表(`quicklist`)|列表|
+  |`OBJ_ENCODING_STREAM`|`stream`|`stream`|
+
+  在对象的生命周期内，对象的编码不是固定的。例如集合对象，当集合中元素可用整数表示时，底层数据结构使用整数集合。
+  当执行`sadd`命令，会先判断添加的元素能否解析为整数，不能则底层数据结构转为字典（内部只使用字典的`key`，`value`为`NULL`）。
+
+  有些对象同时也会使用不同的数据结构存储。例如有序集合对象定义如下：
+  ```c
+  typedef struct zset {
+    dict *dict;
+    zskiplist *zsl;
+  } zset;
+  ```
+  同时使用字典和跳跃表存储，字典成员查询时间复杂度为`O(1)`，跳跃表范围查找时间复杂度为`O(logN)`。所以有序集合对象利用了字典和跳跃表的组合优势。
+  实际的数据只存储一份，字典和跳跃表存储的都是数据指针也就是多增加指针开销。
++ `lru`：占`24`位，用于实现缓存淘汰策略。在配置文件`maxmemory-policy`字段配置内存达到限制时的缓存淘汰策略，常见的策略是`LRU`和`LFU`。
+`LRU`的思想是如果数据最近被访问，则将来被访问的概率大。`lru`存储的是对象的访问时间。`LFU`的思想是如果数据过去被多次访问，
+则数据将来被访问几率更高。`lru`存储的是对象上次访问时间与访问次数。例如在执行`GET`命令会执行如下逻辑更新`lru`：
+  ```c
+  if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+      updateLFU(val);
+  } else {
+      // 更新 lru 为当前时间
+      val->lru = LRU_CLOCK();
+  }
+
+  /* Update LFU when an object is accessed.
+   * Firstly, decrement the counter if the decrement time is reached.
+   * Then logarithmically increment the counter, and update the access time. */
+  void updateLFU(robj *val) {
+      unsigned long counter = LFUDecrAndReturn(val);
+      counter = LFULogIncr(counter);
+      val->lru = (LFUGetTimeInMinutes()<<8) | counter;
+  }
+  ```
+  对于`LFU`策略，`lru`低`8`位更新为频率值，高`16`位为对象上次访问时间。通过`LFUDecrAndReturn`函数获取对象访问频率，
+  并在此基础上累积。因为越老的数据一般被访问次数越大，越新的数据被访问次数越少，即使老的数据很久没被访问，这是不公平的。所以，
+  `LFUDecrAndReturn`函数实现了访问次数随时间衰减的过程。
++ `refcount`：对象的引用次数，用于对象的共享；共享对象时`refcount`值加`1`；删除对象时`refcount`值减 `1`；当`refcount`值为`0`时，
+会释放对象。
++ `ptr`：指向对象底层存储的数据结构。当存储的数据长度小于等于`20`且可以表示为一个`long`类型的整数时或者字符串长度小于等于`44`时，数据则直接存储在`ptr`字段；
+正常情况下，为了存储一个字符串对象，需要两次内存分配，一次是`redisObject`对象分配，一次是`sds`分配。对于短字符串，`OBJ_ENCODING_EMBSTR`编码，只分配一次`redisObject`对象内存，将数据存储在`ptr`，这样`redisObject`和`sds`连续存储，
+会利用计算机的高速缓存。
+
+`redis`中实现了数据库对象`redisDb`用于存储所有的数据。对象`redisDb`的定义如下：
+```c
+typedef struct redisDb {
+    kvstore *keys;              /* The keyspace for this DB */
+    kvstore *expires;           /* Timeout of keys with a timeout set */
+    ebuckets hexpires;          /* Hash expiration DS. Single TTL per hash (of next min field to expire) */
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
+    dict *blocking_keys_unblock_on_nokey;   /* Keys with clients waiting for
+                                             * data, and should be unblocked if key is deleted (XREADEDGROUP).
+                                             * This is a subset of blocking_keys*/
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    int id;                     /* Database ID */
+    long long avg_ttl;          /* Average TTL, just for stats */
+    unsigned long expires_cursor; /* Cursor of the active expire cycle. */
+    list *defrag_later;         /* List of key names to attempt to defrag one by one, gradually. */
+} redisDb;
+```
+各个字段的含义说明如下：
++ `id`：数据库的编号，默认`redis`有`16`个数据库，取值`0-15`。
++ `keys`：存储数据库的所有键值对。`kvstore`是`redis`优化后的数据结构（替代旧版`dict`），用于高效管理键的增删改查。
++ `expires`：存储数据库所有键的过期时间（设置过期时间的键）。`key`是对应键对象的指针，`value`是过期时间值。
++ `hexpires`：
 
 # 命令处理
