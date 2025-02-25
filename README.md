@@ -41,22 +41,7 @@
 - [docker资源监控](./programming/docker/resources_monitor.md)
 
 ## Redis
-- [redis数据结构-字符串](./programming/redis/sds.md)
-- [redis数据结构-链表](./programming/redis/list.md)
-- [redis数据结构-字典](./programming/redis/dict.md)
-- [redis数据结构-跳跃表](./programming/redis/skiplist.md)
-- [redis数据结构-整数集合](./programming/redis/intset.md)
-- [redis数据结构-压缩列表](./programming/redis/ziplist.md)
-- [redis数据结构-quicklist](./programming/redis/quicklist.md)
-- [redis数据结构-listpack](./programming/redis/listpack.md)
-- [redis数据结构-rax树](./programming/redis/rax.md)
-- [redis数据结构-stream](./programming/redis/stream.md)
-- [redis服务启动](./programming/redis/server.md)
-- [redis对象-键](./programming/redis/object_key.md)
-- [redis发布-订阅](./programming/redis/pubsub.md)
-- [redis事务](./programming/redis/transaction.md)
-- [redis高可用-主从复制](./programming/redis/masterslave.md)
-- [redis连接管理](./programming/redis/connection.md)
+- [redis服务框架原理](./programming/redis/framework.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
