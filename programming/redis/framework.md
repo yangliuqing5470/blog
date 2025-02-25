@@ -396,7 +396,7 @@ struct redisObject {
 正常情况下，为了存储一个字符串对象，需要两次内存分配，一次是`redisObject`对象分配，一次是`sds`分配。对于短字符串，`OBJ_ENCODING_EMBSTR`编码，只分配一次`redisObject`对象内存，将数据存储在`ptr`，这样`redisObject`和`sds`连续存储，
 会利用计算机的高速缓存。
 
-`redis`中实现了数据库对象`redisDb`用于存储所有的数据。对象`redisDb`的定义如下：
+`redis`中实现了**数据库对象`redisDb`用于存储所有的数据**。对象`redisDb`的定义如下：
 ```c
 typedef struct redisDb {
     kvstore *keys;              /* The keyspace for this DB */
@@ -418,6 +418,143 @@ typedef struct redisDb {
 + `id`：数据库的编号，默认`redis`有`16`个数据库，取值`0-15`。
 + `keys`：存储数据库的所有键值对。`kvstore`是`redis`优化后的数据结构（替代旧版`dict`），用于高效管理键的增删改查。
 + `expires`：存储数据库所有键的过期时间（设置过期时间的键）。`key`是对应键对象的指针，`value`是过期时间值。
-+ `hexpires`：
++ `hexpires`：记录每个**哈希键**的下一个最短过期字段（`Field`）的`TTL`。在早期的版本中，只能针对`key`设置过期时间，
+不能对哈希键中的字段`Field`设置过期时间。从`7.4.0`版本，支持`HEXPIRE`命令设置哈希键中的某些字段的过期时间。当字段的过期时间达到，
+会删除对应的字段，但不影响哈希键中的其它字段。
++ `blocking_keys`：使用命令`BLPOP`阻塞获取列表元素时，如果列表为空，则会阻塞客户端。这时候会将列表键记录在`blocking_keys`字典中。
++ `blocking_keys_unblock_on_nokey`：`blocking_keys`的子集。当键被删除时（如`DEL`或过期），需立即解除客户端的阻塞（如`XREADGROUP`场景）。此结构确保特定场景下客户端的及时响应。
++ `ready_keys`：当使用`PUSH`向列表添加元素，会从`blocking_keys`字典查找列该表键，如果找到，说明有客户端正阻塞等待，此列表键会添加到`ready_keys`字典， 用于后续响应正在阻塞的客户端。
++ `watched_keys`：`redis`支持事务，`multi`命令用于开启事务，`exec`命令用于执行事务。如何保证在开启事务到执行事务期间，关注的数据不被修改？ 
+`redis`使用乐观锁实现。可以使用`watch`命令监控要关心的数据键。`watched_keys`字典存储被`watch`命令监控的所有键，其中字典`key`是监控的数据键， 
+字典的`value`是对应的客户端对象。当`redis`服务端收到写命令，会从`watched_keys`字典查找要写的键，如果找到，说明有客户端正在监控此键，
+并标记对应的客户端为`dirty`。`redis`收到客户端发送的`exec`命令时，如果客户端有`dirty`标志，则拒绝执行此事务。
++ `expires_cursor`：控制主动过期扫描的游标。`redis`定期随机抽样检查过期键（避免内存泄漏），此游标记录扫描进度，实现渐进式处理，避免长时间阻塞。
++ `defrag_later`：维护待**内存碎片整理**的键名列表。
 
 # 命令处理
+`redis`服务端支持的所有命令都存储在全局变量`redisCommandTable`数组中。为了提高命令的查询效率，在服务启动阶段，
+会将`redisCommandTable`转为字典存储在`redisServer->commands`中。`key`为命令名字，`value`为对应的`redisCommand`命令对象。
+
+命令执行的核心函数是`processCommand`。处理命令`processCommand`函数执行流程总结如下：
+
+![命令处理流程](./images/命令执行流程.png)
+
+其中命令的回复逻辑可以看上面介绍的文件事件部分。命令的回复类型有如下几种，客户端可以根据返回结果第一个字符判断响应类型。
++ 状态回复，第一个字符是`+`。
+  ```c
+  addReply(c,shared.ok);
+  shared.ok = createObject(OBJ_STRING,sdsnew("+OK\r\n"));
+  ```
++ 错误回复，第一个字符是`-`；例如当请求命令不存在，执行如下调用。
+  ```c
+  addReplyErrorFormat(c,"unknown command `%s`, with args beginning with: %s", (char*)c->argv[0]->ptr, args);
+  // 在 addReplyErrorFormat 内部会拼接回复字符串
+  if (!len || s[0] != '-') addReplyString(c,"-ERR ",5);
+  addReplyString(c,s,len);
+  addReplyString(c,"\r\n",2);
+  ```
++ 整数回复，第一个字符是`:`；例如执行`incr`命令后，成功会调用如下回复函数。
+  ```c
+  // shared.colon = createObject(OBJ_STRING,sdsnew(":"));
+  addReply(c,shared.colon);
+  // new 是更新后的 value 对象
+  addReply(c,new);
+  // createObject(OBJ_STRING,sdsnew("\r\n"));
+  addReply(c,shared.crlf);
+  ```
++ 批量回复，第一个字符是`$`；例如执行`GET`命令后，成功会调用如下函数。
+  ```c
+  /* Add a Redis Object as a bulk reply */
+  void addReplyBulk(client *c, robj *obj) {
+      // 计算返回对象 obj 的长度，拼接为字符串`${len}\r\n`
+      addReplyBulkLen(c,obj);
+      // obj 是查询的 value 值
+      addReply(c,obj);
+      // createObject(OBJ_STRING,sdsnew("\r\n"));
+      addReply(c,shared.crlf);
+  }
+  ```
++ 多批量回复，第一个字符是`*`。例如执行`LRANGE`命令，返回多个值样例`*2\r\n$6\r\nvalue1\r\n$6\r\nvalue2\r\n`。
+其中`*2`表示有两个返回值，`$6`表示当前返回值字符串长度。
+
+# 连接管理
+## 服务端连接管理
+`redis`服务端对象使用一个列表对象记录每一个连接的客户端对象：
+```c
+struct redisServer{
+    list *clients;              /* List of active clients */
+}
+```
+每次和客户端建立连接，都会调用`createClient`函数创建客户端对象`client`，并将其添加到`server.clients`链表中。
+
+`redis`服务端是根据`TCP`**长连接**设计实现的。也就是服务端每次执行完客户端的请求命令不会主动关闭`TCP`。
+通过**客户端主动断开**或者**超时配置**来关闭客户端连接。当然在某些异常情况发生服务端也会关闭客户端连接。
++ 在服务端接受客户端的请求连接，但服务端已连接客户端对象超过配置的最大连接数`server.maxclients`时，服务端会拒绝连接，释放客户端。
++ 服务端给客户端发送数据遇到错误（回复客户端），服务端会释放客户端。
++ 从客户端`socket`读数据遇到错误（例如配置了`tcp-keepalive`，遇到客户端异常断开），或者客户端对象关闭，则服务端释放客户端。
++ 客户端输入请求数据缓存满的时候（服务端处理命令太慢，导致客户端请求数据一直积压），服务端会释放客户端。
++ 客户端主动执行`CLIENT KILL`命令时，服务端会释放客户端。
++ 某些场景下，需要服务端回复完客户端后，释放客户端对象，例如客户端执行`quit`命令。
++ 服务端配置了**客户端超时时间`server.maxidletime`**（多长时间和客户端没有交互），超时发生会释放对应的客户端。此操作在`serverCron`函数中周期检查。
++ 客户端的主动断开。
+
+其中对于`tcp-keepalive`超时，是通过`socket`的`SO_KEEPALIVE`属性开启`TCP`保活探测。
++ `tcp_keepalive_time`：在发送`TCP`保活探针前，`TCP`连接空闲时间（没有数据交互），单位是秒。**默认值是`300`**。
++ `tcp_keepalive_probes`：发送`TCP`保活探针的最大次数。最大次数达到，对端依然没有响应，则关闭连接。**默认值是`3`**。
++ `tcp_keepalive_intvl`：保活探测发送的时间间隔，单位是秒。**默认值是`100`**。
+
+上述`tcp-keepalive`默认配置含义是：一个客户端如果`300s`没有和服务端交互（可能客户端异常关闭，客户端服务端网络不通），则服务端会发送一个`TCP`保活探针，
+最多发送`3`次， 每次时间间隔是`100s`。如果客户端一直不响应，则服务端调用`read`会返回错误，关闭客户端对象。
+
+## 客户端连接管理
+### 短连接
+短连接指的是客户端每进行一次操作，都会建立一次连接，操作完成后立即关闭连接。短连接适用于不频繁通信的场景，或需要保证每次操作都使用新的连接的情况。短连接步骤如下：
++ 建立连接。
++ 执行操作。
++ 关闭连接。
++ 需要再次操作时，重新建立连接。
+
+短连接实现样例如下：
+```python
+import redis
+
+def redis_operation():
+    # 每次操作都创建新的连接
+    client = redis.StrictRedis(host='localhost', port=6379, db=0)
+    
+    # 进行 Redis 操作
+    client.set('key', 'value')
+    value = client.get('key')
+    print(value)
+    
+    # 操作完成后立即关闭连接
+    client.close()
+
+# 进行多次操作时，每次都建立和关闭连接
+redis_operation()
+redis_operation()
+```
+### 长连接
+长连接指的是客户端与服务器之间建立一个连接后，在整个会话过程中持续使用该连接，直到客户端主动关闭连接或者连接因某些原因中断。
+长连接通常用于需要频繁通信的场景，减少了建立连接和断开连接的开销。长连接步骤如下：
++ 建立连接。
++ 保持连接，在需要时进行读写操作。
++ 关闭连接（当不再需要时）。
+
+长连接实现样例如下：
+```python
+import redis
+
+# 创建 Redis 连接对象
+client = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+# 进行一些 Redis 操作
+client.set('key', 'value')
+value = client.get('key')
+print(value)
+
+# 在需要时关闭连接
+client.close()
+```
+### 连接池
+连接池主要用来**管理长连接**，用于并发场景下。`redis-py`客户端默认使用连接池，每个`redis-py`实例默认有自己的连接池。
