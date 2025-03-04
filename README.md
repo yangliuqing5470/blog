@@ -42,6 +42,7 @@
 
 ## Redis
 - [redis服务框架原理](./programming/redis/framework.md)
+- [redis数据类型原理](./programming/redis/data_type.md)
 
 ## Mysql
 - [mysql索引原理](./programming/mysql/index.md)
