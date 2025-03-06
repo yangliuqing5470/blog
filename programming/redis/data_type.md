@@ -241,7 +241,7 @@ typedef struct quicklist {
 } quicklist;
 ```
 其中`bookmarks`相关成员和内存优化相关，在内存碎片整理相关。下面解释下`fill`和`compress`参数含义：
-+ `fill`为**正数**表示每个`quicklistNode`节点中`listpak`对象最大元素个数。为**负数**，取值有如下（可以通过修改配置文件中的`list-max-listpack-size`选项，配置`listpack`节点占内存大小）：
++ `fill`为**正数**表示每个`quicklistNode`节点中`listpack`对象最大元素个数。为**负数**，取值有如下（可以通过修改配置文件中的`list-max-listpack-size`选项，配置`listpack`节点占内存大小）：
   + `-1`：`listpack`节点最大为`4KB`；
   + `-2`：`listpack`节点最大为`8KB`；
   + `-3`：`listpack`节点最大为`16KB`；
@@ -408,3 +408,145 @@ typedef struct zset {
 
 有序集合`zset`数据类型使用的数据结构并不是一直不变的。每次添加元素都会判断当前有序集合使用数据结构是否满足添加当前元素。
 如果出现条件不满足情况，会将`listpack`转为有序集合`zset`。**上述数据结构过程是不可逆的，也就是只是升级不能降级**。
+
+# Stream
+## 数据结构
+### Rax 树
+`rax`树是前缀树（字典树）的一种。前缀树的特点如下：
++ 根节点不包含字符，除根节点外每一个节点都只包含一个字符。
++ 从根节点到某一节点，路径上经过的字符连接起来，为该节点对应的字符串。
++ 每个节点的所有子节点包含的字符都不相同。
+
+前缀树**适合保存具有公共前缀的数据，可以有效地节约内存**。存储`read`和`real`数据的前缀树结构如下：
+
+![前缀树样例](./images/前缀树.png)
+
+相对于哈希表保存数据，使用前缀树可以使得公共部分数据只保留一份，有效节约内存。但由于前缀树每个节点只保存一个字符，
+使得树的高度变高，查询变慢，空间存储浪费。
+
+下面是保存`redis`、`race`、`read`、`real`和`radix`的前缀树样例。
+
+![前缀树样例2](./images/前缀树2.png)
+
+从上图可以看出，有些节点**只有一个子节点**时，可以和子节点合并为一个节点存储。既可以减少节点个数节约内存，也可以降低树高度提高查询效率。
+`redis`中的`rax`树就是优化了前缀树的缺点，上面前缀树存储的数据改为**使用`rax`树存储**样例如下：
+
+![rax树样例](./images/rax树.png)
+
+在工程实现上，`rax`树的节点`raxNode`的定义如下：
+```c
+typedef struct raxNode {
+    uint32_t iskey:1;     /* Does this node contain a key? */
+    uint32_t isnull:1;    /* Associated value is NULL (don't store it). */
+    uint32_t iscompr:1;   /* Node is compressed. */
+    uint32_t size:29;     /* Number of children, or compressed string len. */
+    unsigned char data[];
+} raxNode;
+```
+其中各个字段的含义如下：
++ **`iskey`**：表示从根节点到当前节点的父节点路径包含的字符串是否是一个`key`，取值`1`表示是，`0`表示不是。
+当前节点表示的`key`不包含当前节点的内容。
++ **`isnull`**：表示当前节点表示的`key`对应的`value`是否为空，也就是有没有`value`值。如果取值`1`，表示没有`value`值，
+也就在`data`中没有指向`value`的指针。
++ **`iscompr`**：表示当前节点是压缩节点还是非压缩节点。
++ **`size`**：如果是压缩节点，表示压缩字符串长度。如果是非压缩节点，表示子节点个数（每个字符都有一个子节点）。
++ **`data`**：用于保存节点的实际数据。
+  + 如果节点是**非压缩节点**（`iscompr=0`），节点的数据结构如下：
+    ```bash
+    |---> header <---|--------------> data <---------------|
+    [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)
+    ```
+    `data`中有`3`个字符`abc`，紧跟着是`3`个指针，分别指向对应的子节点。如果`iskey=1 & isnull=0`，紧跟着是`value`指针，
+    否则没有`value`指针。
+  + 如果节点是**压缩节点**（`iscompr=1`），节点的数据结构如下：
+    ```bash
+    |---> header <---|-------> data <--------|
+    [header iscompr=1][xyz][z-ptr](value-ptr?)
+    ```
+    `data`中存储的压缩字符串`abc`长度是`3`，后面紧跟着一个指针指向下一个子节点。如果`iskey=1 & isnull=0`，紧跟着是`value`指针，
+    否则没有`value`指针。
+
+`rax`树节点`raxNode`有如下特点：
++ 节点所代表的`key`，是从根节点到当前节点路径上的字符串，但并不包含当前节点，每一个节点存放是子节点数据。
++ 对于非叶节点，如果是压缩节点则只有一个子节点。如果是非压缩节点则可以有多个子节点，每一个子节点都只能表示一个字符。
+也就是说，**非叶节点不能同时指向表示单个字符的子节点和表示合并字符串的子节点**。
++ 对于叶子节点，其没有子节点。叶子节点的`raxNode`元数据`size`为`0`，没有子节点指针。
+如果叶子节点代表了一个`key`，那么它的`raxNode`中是会保存这个`key`的`value`指针。
+
+下面给出上面样例在`redis`中实际存储的结构：
+
+![redis rax样例](./images/redis的rax树.png)
+
+`redis`提供的`rax`树定义如下：
+```c
+typedef struct rax {
+    raxNode *head;     // 指向头节点（根节点）的指针，头节点不是空节点，和正常节点一样会存储数据
+    uint64_t numele;   // 表示元素的个数（key 的数量）
+    uint64_t numnodes; // 表示节点的数量
+    void *metadata[];
+} rax;
+```
+`rax`树的查找时间复杂度为`O(K)`，其中`K`为查找`key`的长度。其适合存储具有公共前缀的数据。缺点就是插入和删除涉及节点分裂和合并。
+
+## 使用场景
+`redis`中的`Stream`主要用于消息队列。而保存的消息一般具有如下两个特征：
++ 每个消息有唯一的消息`ID`，消息`ID`严格递增。
++ 消息内容由一个/多个键值对组成。
+
+消息`ID`由两部分组成：消息**创建的时间**（从`1970-01-01`至今的毫秒数）和**序列号**组成。连续添加两个消息：
+```bash
+> XADD mystream * message "hello"
+"1741243749327-0"
+> XADD mystream * message "world"
+"1741243754886-0"
+```
+可以看到，对于`Stream`类型数据，其保存的消息具有如下特征：
++ 连续插入的消息`ID`，其具有较多的公共前缀。例如上面连续插入两条消息，消息`ID`具有相同的公共前缀`17412437`。
++ 连续插入的消息，其对应的键值对中的键通常是一样的。例如插入的消息都有相同的键`message`。
+
+针对上述的消息特征，如何选择一个数据结构保存消息？一种方式是使用哈希表，其中消息`ID`作为`key`，消息内容作为`value`。
+但由于消息`ID`和消息内容的键有很多重复，会造成存储冗余浪费内存。
+
+`redis`选择**使用`listpack`和`rax`树两种数据结构存储消息**。消息`ID`是作为`rax`树中的`key`，消息具体数据是使用`listpack`保存，并作为`value`和消息`ID`一起保存到`rax`树中。
+每一个`listpack`中**消息的个数**不能超过配置项`stream-node-max-entries`（默认值`100`）。每个`listpack`字节**大小**不能超过`stream-node-max-bytes`（默认值`4096`）。
+
+每一个`listpack`在第一次创建的时候，都会**根据第一个插入的消息**构建一个`master entry`。其内存结构如下：
+```bash
++-------+---------+------------+---------+--/--+---------+---------+-+
+| count | deleted | num-fields | field_1 | field_2 | ... | field_N |0|
++-------+---------+------------+---------+--/--+---------+---------+-+
+```
+每一项，例如`count`、`deleted`等在`listpack`数据结构中都对应一个`entry`。各个部分的含义如下：
++ `count`：当前`listpack`中所有**未删除**的消息个数（有效的消息个数）。
++ `deleted`：当前`listpack`中所有标记为**删除**的消息个数。
++ `num-fields`：接下来`field_xx`的个数。
++ `field_xx`：第一个插入消息的所有`field`，也就是所有的`key`。
++ `0`：一个标示位，用于从后往前遍历该`listpack`所有消息时使用。
+
+**可以理解`master entry`是消息的元数据，因为连续插入消息，其消息内容的键基本一样，所以为了避免每次插入消息都存储一份消息键，后续插入的消息直接引用`master entry`中的键**。
+
+当`master entry`构建完，将当前消息剩余内容，例如键对应的值。或者新的消息，追加填充到`listpack`中。
++ 若当前消息的`field`和`master entry`的`field`完全一样，则不需再次存储`field`，此时存储的消息结构：
+  ```bash
+  +-----+--------+-------+-/-+-------+--------+
+  |flags|entry-id|value-1|...|value-N|lp-count|
+  +-----+--------+-------+-/-+-------+--------+
+  ```
+  + **`flags`**：一个标志位，取值有`STREAM_ITEM_FLAG_NONE`、`STREAM_ITEM_FLAG_DELETED`（消息标志删除）和`STREAM_ITEM_FLAG_SAMEFIELDS`（消息和`master entry`有相同的`field`）。
+  + **`entry-id`**：占`listpack`两个`entry`。取值计算规则如下。
+    ```c
+    // id 表示当前消息，master_id 表示 master entry 的 ID，也就是插入第一个消息的ID
+    lp = lpAppendInteger(lp,id.ms - master_id.ms);
+    lp = lpAppendInteger(lp,id.seq - master_id.seq);
+    ```
+  + **`value-xx`**：该消息每个`field`对应的值。
+  + **`lp-count`**：该消息占`listpack`的`entry`个数，用于后序遍历。取值`3+N`。
++ 否则需要存储当前消息的`field`，此时存储消息结构：
+  ```bash
+  +-----+--------+----------+-------+-------+-/-+-------+-------+--------+
+  |flags|entry-id|num-fields|field-1|value-1|...|field-N|value-N|lp-count|
+  +-----+--------+----------+-------+-------+-/-+-------+-------+--------+
+  ```
+  其中`lp-count`的取值是`4+2N`。
+
+`Stream`是专门为消息队列场景设计。除了基本的生产者和消费者外，还支持消费者组，消息确认，消息回溯等。
