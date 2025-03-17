@@ -35,7 +35,6 @@
 - [持久化存储详解](./programming/k8s/cluster_storage.md)
 
 ## Docker
-- [docker使用教程](./programming/docker/tutorial.md)
 - [docker资源限制原理](./programming/docker/resources_limit.md)
 - [docker网络知多少](./programming/docker/network.md)
 - [docker资源监控](./programming/docker/resources_monitor.md)
