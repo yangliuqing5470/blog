@@ -50,6 +50,9 @@
 ## Windows
 - [windows服务原理](./programming/windows-service/service.md)
 
+## 问题记录
+- [线上因python进程池导致的内存泄漏](./programming/issues/ProcessPollLeak.md)
+
 # 工具篇
 ## 网络数据共享
 - [http服务配置使用](./data-sharing/http/http-server.md)
