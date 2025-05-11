@@ -144,3 +144,258 @@ message Foo {
 |`bytes`|长度不能超过`2^32`|`bytes`|`b''`|
 
 ### 枚举类型
+下面是在`.proto`文件中使用**枚举类型**的样例。枚举使用`enum`关键字。
+```proto
+enum Corpus {
+  CORPUS_UNSPECIFIED = 0;
+  CORPUS_UNIVERSAL = 1;
+  CORPUS_WEB = 2;
+  CORPUS_IMAGES = 3;
+  CORPUS_LOCAL = 4;
+  CORPUS_NEWS = 5;
+  CORPUS_PRODUCTS = 6;
+  CORPUS_VIDEO = 7;
+}
+
+message SearchRequest {
+  string query = 1;
+  int32 page_number = 2;
+  int32 results_per_page = 3;
+  Corpus corpus = 4;  // 枚举类型
+}
+```
+ 枚举类型字段`SearchRequest.corpus`的默认值是枚举变量`Corpus`的第一个值`CORPUS_UNSPECIFIED`。
+在`proto3`中**枚举定义的第一个值一定是`0`**，第一个值命名规则是`ENUM_TYPE_NAME_UNSPECIFIED`。
+需要注意的是，枚举定义后的数字是取值，而不是编号。例如`CORPUS_WEB`表示数字`2`。
+
+枚举也可以使用**别名**，也就是多个枚举成员可以使用相同的整数值，样例如下。
+```proto
+enum EnumAllowingAlias {
+  option allow_alias = true;  // 必须设置
+  EAA_UNSPECIFIED = 0;
+  EAA_STARTED = 1;
+  EAA_RUNNING = 1;  // 别名
+  EAA_FINISHED = 2;
+}
+```
+启动枚举别名必须设置`allow_alias = true`参数。主要用于兼容老接口，不同语义场景。
+
+为了**避免重用**老的枚举值，可以使用`reserved`关键字。
+```proto
+enum Foo {
+  reserved 2, 15, 9 to 11, 40 to max;
+  reserved "FOO", "BAR";
+}
+```
+### Message 类型
+在一个消息中的字段也可以是自定义的其他消息类型。
+```proto
+message SearchResponse {
+  repeated Result results = 1;  // 自定义的 Result 消息类型
+}
+
+message Result {
+  string url = 1;
+  string title = 2;
+  repeated string snippets = 3;
+}
+```
+如果定义的消息在其它`.proto`文件中，可以使用`import`关键字。
+```proto
+import "myproject/other_protos.proto";
+```
+需要**注意`import`关键字表示仅仅当前`.proto`文件能使用被导入的消息类型**。**而`import public`关键字表示不仅当前`.proto`文件能使用，
+还会传递给导入它的文件**。样例说明如下：
+```proto
+// a.proto 文件内容如下
+syntax = "proto3";
+
+message A {}
+
+// b.proto 文件内容如下
+syntax = "proto3";
+
+import "a.proto"  // 或 import public "a.proto"
+
+message B {}
+
+// c.proto 文件内容如下
+syntax = "proto3";
+
+import "b.proto"
+
+message C {
+  B b = 1;
+  A a = 2;  // 如果 b.proto 文件是 import 则会报错。如果是 import public 不会报错
+}
+```
+### 嵌套类型
+`message`类型可以嵌套，也就是一个`message`里面可以嵌套另一个`message`。
+```proto
+message SearchResponse {
+  message Result {      // 嵌套 message
+    string url = 1;
+    string title = 2;
+    repeated string snippets = 3;
+  }
+  repeated Result results = 1;  // 使用嵌套的 message
+}
+```
+可以在其他消息中引用被嵌套的消息，例如：
+```proto
+message SomeOtherMessage {
+  SearchResponse.Result result = 1;  // 引用上面被嵌套的 Result 消息
+}
+```
+### Any 类型
+`google.protobuf.Any`类型是一种**通用容器类型，可以用来封装任意消息类型**，即：
+可以在一个字段中传递任何`protobuf`消息，而无需提前在`.proto`文件中明确指定其类型。
+```proto
+syntax = "proto3";
+
+import "google/protobuf/any.proto";  // 必须有
+
+message Dog {
+  string name = 1;
+}
+
+message Zoo {
+  google.protobuf.Any animal = 1;    // 一个 Any 类型
+}
+```
+在`Python`中的使用样例如下：
+```python
+from google.protobuf.any_pb2 import Any
+from zoo_pb2 import Zoo, Dog
+
+# 创建 Dog 实例
+dog = Dog(name="Rex")
+
+# 用 Any 封装
+any_msg = Any()
+any_msg.Pack(dog)  # 自动设置 type_url 和 value
+
+# 放入 Zoo 消息
+zoo = Zoo(animal=any_msg)
+
+# 反序列化时解析回原始类型
+unpacked_dog = Dog()
+if zoo.animal.Unpack(unpacked_dog):
+    print("Unpacked dog name:", unpacked_dog.name)
+
+```
+`Any`类型的使用场景一般如下：
++ **插件系统**：某个字段可以携带任意拓展信息；
++ **多态消息传递**：某个字段可以是多种类型的一种；
+
+### Oneof 类型
+`Oneof`类似`c`语言中的`union`结构。用于在一个消息的**多个字段中同时只能设置一个字段值**。
+在`Python`中可以使用`WhichOneof`方法检查哪一个字段被设置。`Oneof`类型具有以下特点：
++ **互斥性**：`oneof`中多个字段只能设置一个，设置一个会自动清除其他的；
++ **节省空间**：多个字段复用一个存储位置，节省序列化数据大小；
++ **自动清除**：设置一个字段会清除其他字段；
+
+```proto
+syntax = "proto3";
+
+message Shape {
+  oneof shape_type {    // Oneof 类型
+    Circle circle = 1;
+    Rectangle rectangle = 2;
+    Triangle triangle = 3;
+  }
+}
+
+message Circle {
+  double radius = 1;
+}
+
+message Rectangle {
+  double width = 1;
+  double height = 2;
+}
+
+message Triangle {
+  double base = 1;
+  double height = 2;
+}
+```
+在`Python`中的使用样例如下：
+```python
+shape = Shape()
+shape.circle.radius = 5.0
+
+print(shape)  # 会打印 circle 部分
+
+# 设置 rectangle 会自动清除 circle
+shape.rectangle.width = 3.0
+shape.rectangle.height = 4.0
+
+print(shape.WhichOneof("shape_type"))  # 输出: "rectangle"
+```
+需要注意，`Oneof`中的字段不能是`map`和`repeated`类型，其他类型都可以。且`Oneof`也不能被`repeated`。
+### Map 类型
+`Map`类型在`.proto`中的语法定义如下，其表示**键值对集合**。
+```proto
+map<key_type, value_type> map_field = N;
+```
+其中`key_type`可以是整数或字符串等`scalar`类型。而`value_type`可以是任意类型，但不能是`map`。
+`N`表示字段编号，必须唯一。`Map`的底层实现如下：
+```proto
+message UserPrefs {
+  repeated MapFieldEntry feature_usage_count = 1;
+  message MapFieldEntry {
+    string key = 1;
+    int32 value = 2;
+  }
+}
+```
+下面给出在`.proto`中使用`map`的样例说明。
+```proto
+syntax = "proto3";
+
+message UserPrefs {
+  map<string, int32> feature_usage_count = 1;  // map 数据类型
+  map<string, Preference> preferences = 2;     // map 数据类型
+}
+
+message Preference {
+  bool enabled = 1;
+  string note = 2;
+}
+```
+在`Python`中使用如下：
+```python
+prefs = UserPrefs()
+
+# 设置 map<string, int32>
+prefs.feature_usage_count["dark_mode"] = 5
+prefs.feature_usage_count["notifications"] = 2
+
+# 设置 map<string, Preference>
+prefs.preferences["dark_mode"].enabled = True
+prefs.preferences["dark_mode"].note = "User prefers dark mode"
+```
+## Package 声明
+在`.proto`文件中可以添加`package`关键字声明的包名以防止不同消息间命名冲突。
+```proto
+package foo.bar;    // package 声明包名
+message Open { ... }
+```
+使用方式如下：
+```proto
+message Foo {
+  ...
+  foo.bar.Open open = 1;
+  ...
+}
+```
+## 定义 Service
+在`.proto`文件中使用`rpc`关键字定义一个`RPC`服务接口。
+```proto
+service SearchService {
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+```
+`proto`编译器会自动生成`service`代码和`stub`代码（客户端代码）。
+## Option 声明
