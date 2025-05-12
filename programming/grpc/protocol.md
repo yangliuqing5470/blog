@@ -399,3 +399,138 @@ service SearchService {
 ```
 `proto`编译器会自动生成`service`代码和`stub`代码（客户端代码）。
 ## Option 声明
+在`.proto`文件中，可以使用`options`来控制序列化行为、代码生成特性，或者为工具链（如`gRPC`或编译器插件）传递额外的信息。
+有些`options`是文件级别，有些是字段级别或者消息级别。下面给出常用`options`的样例说明。
++ `java_package`【文件级别】：针对`java/kotlin`代码，用于指定生成类的包名。
+  ```proto
+  option java_package = "com.example.foo";
+  ```
++ `java_outer_classname`【文件级别】：针对`java`代码，用于指定生成的`java`类名。
+  ```proto
+  option java_outer_classname = "Ponycopter";
+  ```
++ `java_multiple_files`【文件级别】：针对`java`代码，如果为`false`则只生成一个`.java`文件，所有的代码都嵌套在`java_outer_classname`对应的类中。
+如果为`true`，每个`message/enum/service/etc`都会生成一个独立的顶级类，分别对应一个`.java`文件。
+  ```proto
+  option java_multiple_files = true;  // 不指定，默认是 false
+  ```
++ `optimize_for`【文件级别】：针对`c++/java`代码，告诉编译器为哪种用途优化生成的代码结构，权衡代码大小、速度和功能完整性。
+  ```proto
+  option optimize_for = CODE_SIZE;
+  ```
+  `optimize_for`的取值有以下三种：
+    + `SPEED`【`default`】：代码高度优化，为运行速度优化，接口完整，用于性能敏感的服务端。
+    + `CODE_SIZE`：为减少代码体积优化，接口完整，但运行速度不如`SPEED`，用于移动端、嵌入式等场景。
+    + `LITE_RUNTIME`：使用精简版运行时，牺牲功能换体积，接口不完整。
++ `cc_enable_arenas`【文件级别】：针对`C++`代码，开启`arena`内存分配。加快消息的分配和释放速度，并减少内存碎片和分配开销，适合在性能关键场景中。
++ `objc_class_prefix`【文件级别】：针对`MacOS/IOS`设计，控制生成的`Objective-C`类名前缀，以避免类名冲突。
+  ```proto
+  option objc_class_prefix = "ABC";
+  message User {
+    string name = 1;
+  }
+  ```
+  生成的`Objective-C `类名是`ABCUser`。
++ `packed`【字段级别】：默认是`true`，用于`repeated`字段。对于数字类型，用于高效的编码。
+  ```proto
+  repeated int32 samples = 4 [packed = false];
+  ```
++ `deprecated`【字段级别】：如果设置为`true`，则表示此字段被废弃，不应该使用（语义上约定）。
+  ```proto
+  int32 old_field = 6 [deprecated = true];
+  ```
+`Options`的`targets`和`retention`选项分别用于控制自定义`option`可应用到哪些对象和控制自定义`option`是否保留在`descriptor/代码`中。
+# 编码原理
+## 可变宽度编码
+**可变宽度编码**是`protobuf`序列化的核心，允许使用`1-10`个字节编码`unsigned 64-bit`整数。数字越小，使用字节数越少。
+可变宽度编码的每一个字节都有一个最高位（`MSB`）表示是否接下来的字节是当前数据的一部分。每一个字节的低`7`位表示实际负载。
+```bash
+# 数字 1 的编码如下   0x01
+0000 0001
+^ msb
+# 数字 150 的编码如下 0x9601
+10010110 00000001
+^ msb    ^ msb
+```
+如果反序列化，首先需要去掉每个字节的`MSB`位，然后将每个字节低`7`位负载从**小端序转为大端序**，完成拼接。
+```c
+10010110 00000001        // Original inputs.
+ 0010110  0000001        // Drop continuation bits.
+ 0000001  0010110        // Convert to big-endian.
+   00000010010110        // Concatenate.
+ 128 + 16 + 4 + 2 = 150  // Interpret as an unsigned 64-bit integer.
+```
+## Message 结构
+在`.proto`中，`message`是一系列的`key-value`对。`message`的二进制版本使用**字段编号作为键**。在解码时候，通过引用`.proto`中编号对应的字段名和类型决定解码后的字段名和类型。
+当`message`被编码，每一个键值对被转为一个`record`，每一个`record`由**字段编号、编码类型、负载**三部分组成。
++ 编码类型：表示后面负载的大小。
+
+编码类型有如下几种（在用的）：
++ `VARINT`：用于`int32`、`int64`、`uint32`、`uint64`、`sint32`、`sint64`、`bool`和`enum`类型，其`ID=0`。
++ `I64`：用于`fixed64`、`sfixed64`、`double`类型，其`ID=1`。
++ `LEN`：用于`string`、`bytes`、`embedded messages`、`packed repeated fields`类型，其`ID=2`。
++ `I32`：用于`fixed32`、`sfixed32`和`float`类型，其`ID=5`。
+
+每一个`record`的`tag`由字段编号和编码类型组成。**字段编号都使用可变宽度编码**。格式是`(field_number << 3) | wire_type`。
+也就是说，一个`tag`的低`3`位表示编码类型，剩余的整数表示字段编号。
+```proto
+message Test1 {
+  int32 a = 1;
+}
+```
+假设字段`a`被设置为`150`，序列化后的结果是`08 96 01`。因为`08`对应的二进制是`000 1000`（去掉`MSB`位），低`3`位`000`表示编码类型`0`也就是`VARINT`，
+剩下的右移`3`位为`1`，得到字段编号为`1`。所以可以得到后面的字节是**可变宽度编码**。
+## 整数编码
+### 布尔和枚举
+`bool`和`enum`都被按`int32`类型编码，实际上`bool`值被编码为`00`或`01`。
+### 有符号整数
+对于负整数，`int32`和`int64`与`sint32`和`sint64`编码方式不同。
+
+`intN`类型编码负数使用**二进制补码**。意味着对于用`64-bit`表示的负数，其补码是一个`unsigned 64-bit`整数。考虑可变宽度编码（有`MSB`位）一个字节只有低`7`位是负载，
+所以需要`10`个字节表示负数（其中一个字节表示`tag`）。
+
+`sintN`使用`ZigZag`编码方式表示负数。其中正数被编码为`2 * p`，负数被编码为`2 * |n| -1`。编码负数效率比较高，使用较少字节数。
+### 非可变宽度编码
+`double`和`fixed64`类型固定使用`8`字节，编码类型是`I64`。`float`和`fixed32`类型固定使用`4`字节，编码类型是`I32`。
+### Length 前缀编码
+`LEN`编码类型有一个动态的长度值，跟在一个`record`的`tag`后。
+```proto
+message Test2 {
+  string b = 2;
+}
+```
+如果设置`b = testing`，因为`string`类型是`LEN`编码，所以编码后的结果是`120774657374696e67`。
+```bash
+12 07 [74 65 73 74 69 6e 67]
+```
+其中`12`是`tag`，`07`表示字符串长度值，后面是字符串的`ASICC`码。
+
+需要注意，`submessage`也是`LEN`编码。
+
+# 序列化为 Json
+可选的，可以将`.proto`定义的消息序列化为`json`格式。
+```proto
+syntax = "proto3";
+
+message User {
+  string name = 1;
+  int32 age = 2;
+}
+```
+将上述的`.proto`定义的消息，生成对于的`Python`代码。然后在使用的时候利用`google.protobuf.json_format`模块序列化为`json`格式。
+```python
+from user_pb2 import User
+from google.protobuf.json_format import MessageToJson
+
+user = User(name="Alice", age=30)
+json_str = MessageToJson(user)
+
+print(json_str)  # json_str 是字符串类型
+```
+执行的结果如下：
+```bash
+{
+  "name": "Alice",
+  "age": 30
+}
+```
