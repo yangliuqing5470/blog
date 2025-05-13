@@ -65,14 +65,6 @@ class RedisLockWithLease():
                 break
         print(f"[{threading.current_thread().name}] Lease thread end and cost: {time.time() - start_time}s")
 
-    def stop(self):
-        """用于停止内部用于租约的线程.
-
-        """
-        self.__stop_event.set()
-        if self.__lease_thread_object:
-            self.__lease_thread_object.join()
-
     def acquire(self):
         res = self.__lock_instance.acquire()
         if res:
