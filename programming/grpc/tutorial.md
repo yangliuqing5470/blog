@@ -88,3 +88,163 @@ message HelloResponse {
 需要注意，`gRPC`中`channel`提供了和特定的`gRPC`服务端连接，`channel`被客户端`stub`使用。
 
 # 实现原理
+## 服务端
+`gRPC`服务端工作流程框架总结如下。
+
+![gRPC服务端原理](./images/gRPC服务端原理.png)
+
+以`Python`实现为例，下面是一个简单的同步方式实现的`gRPC`服务端。
+```python
+# 定义服务
+def serve():
+    port = "50051"
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))     # 定义一个 server 对象
+    helloworld_pb2_grpc.add_GreeterServicer_to_server(Greeter(), server) # 注册路由，即将实现的服务注册进 server
+    server.add_insecure_port("[::]:" + port)                             # 绑定并监听服务地址
+    server.start()                                                       # 启动服务，接收客户端请求
+    print("Server started, listening on " + port)
+    server.wait_for_termination()
+```
+`gRPC`的`server`对象的底层由`cython`的`cygrpc`模块实现，`cygrpc`封装了`C`层的`gRPC Core`的调度和生命周期管理逻辑。
+`gRPC Core`也实现了`http2`协议。
+
+`gRPC.server`的生命周期工作原理总结如下。
+
+![gRPC服务生命周期工作原理](./images/gRPC服务生命周期原理.png)
+
+当`gRPC`的服务端成功启动后，在`cygrpc`层面和`Python`层面对于一个客户端的`RPC`调用数据交互流程如下。
+
+![gRPC服务请求流原理](./images/gRPC服务请求流原理.png)
+
+在`gRPC`服务端开始接收客户端`RPC`请求之前，服务端需要**注册等待某类请求到来**的意图（`Intent`），然后通过`Completion Queue`异步地接收和处理请求事件。
++ `request_call`:  监听**任意方法路径**的请求。
++ `request_registered_call`:  监听**预注册路径（特定路径）** 的请求。
+
+因为服务端不会自动接受请求，必须显式调用`request_call`或`request_registered_call`告诉底层**我现在准备好了，请监听某个类型的请求，到来后通过`Completion Queue`通知我**。
+
+在`gRPC`服务端，同一个客户端请求到底被哪个接口（`request_call`还是`request_registered_call`）接住，
+是由服务端注册监听的方式决定的。客户端只发出一个请求路径，比如`/helloworld.Greeter/SayHello`。
+如果服务端对某些请求路径使用`register_method`并调用`request_registered_call`，则**优先特定路径监听**，否则通过通配路径监听投递请求事件到完成队列。
+伪代码说明如下：
+```python
+if (path in registered_methods_table):
+    deliver to registered_call (request_registered_call)
+else:
+    deliver to generic_call (request_call)
+```
+在`cygrpc`层面会接收并解析客户端的`RPC`请求，匹配成功后会将请求包装为一个`event`，并携带`tag`投递到`Completion Queue`中。
+然后在`Python`层面不断检查`Completion Queue`处理其中的`event`。
+```python
+# 服务启动后，启动的后台线程用于处理客户端 RPC 请求
+def _serve(state: _ServerState) -> None:
+    while True:
+        timeout = time.time() + _DEALLOCATED_SERVER_CHECK_PERIOD_S
+        event = state.completion_queue.poll(timeout)   # 从完成队列获取 event
+        if state.server_deallocated:
+            _begin_shutdown_once(state)
+        if event.completion_type != cygrpc.CompletionType.queue_timeout:
+            # 处理 RPC 请求事件
+            if not _process_event_and_continue(state, event):
+                return
+        # We want to force the deletion of the previous event
+        # ~before~ we poll again; if the event has a reference
+        # to a shutdown Call object, this can induce spinlock.
+        event = None
+
+
+def _begin_shutdown_once(state: _ServerState) -> None:
+    with state.lock:
+        if state.stage is _ServerStage.STARTED:
+            state.server.shutdown(state.completion_queue, _SHUTDOWN_TAG)  # 投递一个 _SHUTDOWN_TAG 的 event
+            state.stage = _ServerStage.GRACE
+            state.due.add(_SHUTDOWN_TAG)
+```
+其中`event`处理函数`_process_event_and_continue`实现流程如下。
+
+![gRPC事件处理流程](./images/gRPC事件处理流程.png)
+
+需要注意`gRPC`服务端提供了**拦截器`interceptors`** 功能，其在注册的具体路由`Handler`执行之前被调用，可以理解为**中间价机制**。
+拦截器的**调用顺序和传递的顺序一致**，是**链式调用**，即第一个拦截器调第二个，最后一个拦截器调具体的`Handler`。服务端拦截器源码`Pipeline`如下。
+```python
+class _ServicePipeline(object):
+    interceptors: Tuple[grpc.ServerInterceptor]
+
+    def __init__(self, interceptors: Sequence[grpc.ServerInterceptor]):
+        self.interceptors = tuple(interceptors)
+
+    def _continuation(self, thunk: Callable, index: int) -> Callable:
+        return lambda context: self._intercept_at(thunk, index, context)
+        # 等效替换
+        # def continuation_fn(context):
+        #     return self._intercept_at(thunk, index, context)
+        # return continuation_fn
+
+    def _intercept_at(
+        self, thunk: Callable, index: int, context: grpc.HandlerCallDetails
+    ) -> grpc.RpcMethodHandler:
+        if index < len(self.interceptors):
+            interceptor = self.interceptors[index]
+            thunk = self._continuation(thunk, index + 1)
+            # 此时的 thunk 是下一个拦截器
+            return interceptor.intercept_service(thunk, context)
+        else:
+            return thunk(context)
+
+    def execute(
+        self, thunk: Callable, context: grpc.HandlerCallDetails) -> grpc.RpcMethodHandler:
+        return self._intercept_at(thunk, 0, context)
+```
+下面给出使用拦截器样例，说明拦截器的**链式调用**原理。
+```python
+# 定义如下两个拦截器
+class LoggingInterceptor(grpc.ServerInterceptor):
+    def intercept_service(self, continuation, handler_call_details):
+        print(f"[LoggingInterceptor] Received call: {handler_call_details.method}")
+        return continuation(handler_call_details)
+
+class AuthInterceptor(grpc.ServerInterceptor):
+    def intercept_service(self, continuation, handler_call_details):
+        print(f"[AuthInterceptor] Authorization passed")
+        return continuation(handler_call_details)
+
+# 模拟使用拦截器
+def create_real_handler(context):
+    def real_rpc_handler(request, context):
+        return "success"
+
+    return grpc.unary_unary_rpc_method_handler(real_rpc_handler)
+
+class DummyContext(grpc.HandlerCallDetails):
+    def __init__(self, method, metadata):
+        self.method = method
+        self.invocation_metadata = metadata
+# 拦截器列表
+interceptors = [LoggingInterceptor(), AuthInterceptor()]
+pipeline = _ServicePipeline(interceptors)
+# 拦截器调用
+handler = pipeline.execute(create_real_handler, 
+                           DummyContext("/hello.Greeter/SayHi", 
+                                        [("authorization", "Bearer secret")]
+                                        )
+                           )
+print("Handler returned:", handler)
+
+########################样例执行结果###########################################
+[LoggingInterceptor] Received call: /hello.Greeter/SayHi
+[AuthInterceptor] Authorization passed
+Handler returned: RpcMethodHandler(request_streaming=False, response_streaming=False, 
+                                   request_deserializer=None, response_serializer=None, 
+                                   unary_unary=<function create_real_handler.<locals>.real_rpc_handler at ...>,
+                                   unary_stream=None, stream_unary=None, stream_stream=None)
+```
+可以看到，拦截器调用顺序和传递顺序一致。拦截器`LoggingInterceptor`先调用，然后`AuthInterceptor`拦截器被调用，最后执行`create_real_handler`。
+
+接下来看下对于一个`RPC`请求是如何处理的。根据前面介绍可知，`gRPC`定义了四种服务类型。
++ **单次请求-单次响应**
++ **服务端流式**
++ **客户端流式**
++ **双端流式**
+
+每一种类型处理`RPC`请求的工作原理如下。
+
+## 客户端 Stub
