@@ -245,6 +245,90 @@ Handler returned: RpcMethodHandler(request_streaming=False, response_streaming=F
 + **客户端流式**
 + **双端流式**
 
-每一种类型处理`RPC`请求的工作原理如下。
+每一种类型处理`RPC`请求的工作原理如下。其中**单请求单响应**和**单请求服务端流式**流程如下。
+
+![gRPC处理请求流程1](./images/gRPC处理请求流程1.png)
+
+**客户端流式单响应**和**双端流式**流程如下。
+
+![gRPC处理请求流程2](./images/gRPC处理请求流程2.png)
+
+为了更好理解上面介绍的四种服务工作流程，下面给出四种服务类型`handler`的样例说明。
++ **单请求响应模式**
+  ```python
+  def GetFeature(self, request, context):
+      feature = get_feature(self.db, request)
+      if feature is None:
+          return route_guide_pb2.Feature(name="", location=request)
+      else:
+          return feature
+  ```
++ **服务端流式**
+  ```python
+  # 一个迭代器
+  def ListFeatures(self, request, context):
+      left = min(request.lo.longitude, request.hi.longitude)
+      right = max(request.lo.longitude, request.hi.longitude)
+      top = max(request.lo.latitude, request.hi.latitude)
+      bottom = min(request.lo.latitude, request.hi.latitude)
+      for feature in self.db:
+          if (
+              feature.location.longitude >= left
+              and feature.location.longitude <= right
+              and feature.location.latitude >= bottom
+              and feature.location.latitude <= top
+          ):
+              yield feature
+  ```
++ **客户端流式**
+  ```python
+  # 参数 request_iterator 是一个请求迭代器
+  def RecordRoute(self, request_iterator, context):
+      point_count = 0
+      feature_count = 0
+      distance = 0.0
+      prev_point = None
+
+      start_time = time.time()
+      for point in request_iterator:
+          point_count += 1
+          if get_feature(self.db, point):
+              feature_count += 1
+          if prev_point:
+              distance += get_distance(prev_point, point)
+          prev_point = point
+
+      elapsed_time = time.time() - start_time
+      return route_guide_pb2.RouteSummary(
+          point_count=point_count,
+          feature_count=feature_count,
+          distance=int(distance),
+          elapsed_time=int(elapsed_time),
+      )
+  ```
++ **双端流式**
+  ```python
+  # 请求参数 request_iterator 是一个请求迭代器，且此 handler 是一个迭代器
+  def RouteChat(self, request_iterator, context):
+      prev_notes = []
+      for new_note in request_iterator:
+          for prev_note in prev_notes:
+              if prev_note.location == new_note.location:
+                  yield prev_note
+          prev_notes.append(new_note)
+  ```
+可以注意到，每一个`handler`都会有一个`context`参数。`context`是`gRPC`服务端实现的上下文对象，
+提供了**与当前`RPC`调用上下文的交互接口**。下面给出部分`context`提供的功能说明，完整的可以看`gRPC`服务端源码。
+|功能分类|方法或属性|作用|
+|--------|------------|-----|
+|元信息|`context.invocation_metadata()`|获取客户端发来的`metadata`（通常是`headers`）|
+|客户端身份|`context.peer()`|获取客户端地址，格式如`ipv4:127.0.0.1:12345`|
+|状态控制|`context.set_code(code)`|设置返回状态码（如`grpc.StatusCode.OK`）|
+|错误信息|`context.set_details(details)`|设置错误详情文字|
+|取消检查|`context.is_active()`|客户端连接是否还在|
+|提前终止|`context.abort(code, details)`|立即终止并返回指定错误|
+|超时控制|`context.time_remaining()`|剩余允许的处理时间（秒）|
+|请求元数据|`context.auth_context()`|安全上下文，如证书、`SSL`信息等（如果启用）|
+|客户端断开回调|`add_callback(callback)`|客户端取消（或断开）`RPC`，自动触发注册的回调|
 
 ## 客户端 Stub
