@@ -332,3 +332,36 @@ Handler returned: RpcMethodHandler(request_streaming=False, response_streaming=F
 |客户端断开回调|`add_callback(callback)`|客户端取消（或断开）`RPC`，自动触发注册的回调|
 
 ## 客户端 Stub
+`gRPC`客户端的核心是`channel`，创建好`channel`就可以和服务端通信。以`Python`实现为例，下面是一个简单的同步方式实现的`gRPC`客户端。
+```python
+def run():
+    print("Will try to greet world ...")
+    with grpc.insecure_channel("localhost:50051") as channel:  # 创建一个 channel
+        stub = helloworld_pb2_grpc.GreeterStub(channel)
+        response = stub.SayHello(helloworld_pb2.HelloRequest(name="you"))  # 发起 RPC 调用
+    print("Greeter client received: " + response.message)
+
+# 创建 stub 的源码如下
+class GreeterStub(object):
+    def __init__(self, channel):
+        self.SayHello = channel.unary_unary(
+                '/helloworld.Greeter/SayHello',
+                request_serializer=helloworld__pb2.HelloRequest.SerializeToString,
+                response_deserializer=helloworld__pb2.HelloReply.FromString,
+                _registered_method=True)
+```
+`channel`提供了**对`Channel connectivity state`的跟踪与回调机制**，一旦`Channel`状态发生变化，通知感兴趣的调用方进行响应。
+样例说明如下：
+```python
+import grpc
+
+def connectivity_callback(state: grpc.ChannelConnectivity):
+    # 如果 channel 状态发生改变，此回调函数会被执行
+    print(f"[Callback] Channel state changed")
+
+def main():
+    channel = grpc.insecure_channel("localhost:50051")
+    # 如果 try_to_connect=True，状态是 IDLE，channel 会尝试连接服务器
+    channel.subscribe(callback=connectivity_callback, try_to_connect=True)
+```
+实现`channel`状态的跟踪与回调机制的入口函数是`subscribe`。其工作原理如下。
