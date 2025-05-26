@@ -365,3 +365,75 @@ def main():
     channel.subscribe(callback=connectivity_callback, try_to_connect=True)
 ```
 实现`channel`状态的跟踪与回调机制的入口函数是`subscribe`。其工作原理如下。
+
+![gRPC客户端状态跟踪回调流程](./images/gRPC客户端状态跟踪.png)
+
+`channel`的状态是如下几个枚举值。
++ **`IDLE`**：当前`channel`是空闲状态，还未建立连接。
++ **`CONNECTING`**：当前`channel`正在建立连接。
++ **`READY`**：当前`channel`连接建立成功，可以发起`RPC`请求。
++ **`TRANSIENT_FAILURE`**：当前`channel`有失败，会自动尝试恢复。
++ **`SHUTDOWN`**：当前`channel`已经失败，不可恢复。
+
+因为`gRPC`服务端有四种不同的服务类型，所以在客户端侧的`channel`对象也提供了**四种不同的`Stub`**。
++ **单请求-响应**：入口方法`channel.unary_unary`。
++ **客户端流式**：入口方法`channel.stream_unary`。
++ **服务端流式**：入口方法`channel.unary_stream`。
++ **双端流式**：入口方法`channel.stream_stream`。
+  ```python
+  # Stub 使用样例
+  class GreeterStub(object):
+      def __init__(self, channel):
+          self.SayHello = channel.unary_unary(
+                  '/helloworld.Greeter/SayHello',
+                  request_serializer=helloworld__pb2.HelloRequest.SerializeToString,
+                  response_deserializer=helloworld__pb2.HelloReply.FromString,
+                  _registered_method=True)
+          self.SayHelloStreamReply = channel.unary_stream(
+                  '/helloworld.Greeter/SayHelloStreamReply',
+                  request_serializer=helloworld__pb2.HelloRequest.SerializeToString,
+                  response_deserializer=helloworld__pb2.HelloReply.FromString,
+                  _registered_method=True)
+          self.SayHelloBidiStream = channel.stream_stream(
+                  '/helloworld.Greeter/SayHelloBidiStream',
+                  request_serializer=helloworld__pb2.HelloRequest.SerializeToString,
+                  response_deserializer=helloworld__pb2.HelloReply.FromString,
+                  _registered_method=True)
+  stub = helloworld_pb2_grpc.GreeterStub(channel)
+  response = stub.SayHello(helloworld_pb2.HelloRequest(name="you"))
+  ```
+
+`channel`提供的四种`Stub`工作原理总结如下。先看下`channel.unary_unary`类型`Stub`模式。
+
+![gRPC客户端单请求响应Stub](./images/gRPC客户端单请求响应Stub.png)
+
+其中`channel.unary_unary`模式的`Stub`**操作集合**步骤如下：
+```python
+operations = (
+    cygrpc.SendInitialMetadataOperation(
+        augmented_metadata, initial_metadata_flags
+    ),
+    cygrpc.SendMessageOperation(serialized_request, _EMPTY_FLAGS),
+    cygrpc.SendCloseFromClientOperation(_EMPTY_FLAGS),
+    cygrpc.ReceiveInitialMetadataOperation(_EMPTY_FLAGS),
+    cygrpc.ReceiveMessageOperation(_EMPTY_FLAGS),
+    cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),
+)
+```
+`_MultiThreadedRendezvous`对象的继承关系如下：
+```python
+class _MultiThreadedRendezvous(_Rendezvous, grpc.Call, grpc.Future)
+```
+其也是`grpc.Future`的子类，用于异步编程实现。`_MultiThreadedRendezvous`对象提供了获取底层`RPC`状态信息，例如：
+```python
+# 获取 initial_metadata 信息
+def initial_metadata(self) -> Optional[MetadataType]:
+    """See grpc.Call.initial_metadata"""
+    with self._state.condition:
+
+        def _done():
+            return self._state.initial_metadata is not None
+
+        _common.wait(self._state.condition.wait, _done)
+        return self._state.initial_metadata
+```
