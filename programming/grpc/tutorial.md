@@ -560,5 +560,3 @@ ReceiveStatusOnClient ◀───── SendStatusFromServer
 因为`_MultiThreadedRendezvous`是一个迭代器，在`__next__`方法中，会执行以下：
 + `cygrpc.ReceiveMessageOperation`操作读取一次消息。
 + 等待一次消息接收完成。
-
-# 开发实践
