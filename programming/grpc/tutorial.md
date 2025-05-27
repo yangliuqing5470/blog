@@ -403,7 +403,7 @@ def main():
   response = stub.SayHello(helloworld_pb2.HelloRequest(name="you"))
   ```
 
-`channel`提供的四种`Stub`工作原理总结如下。先看下`channel.unary_unary`类型`Stub`模式。
+`channel`提供的四种`Stub`工作原理总结如下。先看下 **`channel.unary_unary`类型`Stub`模式**。
 
 ![gRPC客户端单请求响应Stub](./images/gRPC客户端单请求响应Stub.png)
 
@@ -420,6 +420,8 @@ operations = (
     cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),
 )
 ```
+上面的操作集合作为一个`batch`，会批量一次执行完，然后返回一个事件对象。
+
 `_MultiThreadedRendezvous`对象的继承关系如下：
 ```python
 class _MultiThreadedRendezvous(_Rendezvous, grpc.Call, grpc.Future)
@@ -437,3 +439,126 @@ def initial_metadata(self) -> Optional[MetadataType]:
         _common.wait(self._state.condition.wait, _done)
         return self._state.initial_metadata
 ```
+**服务端流式`channel.unary_stream`类型的`Stub`工作原理**如下。
+
+![gRPC客户端服务端流式Stub](./images/gRPC客户端服务端流式Stub.png)
+
+`gRPC`为`channel.unary_stream`类型的`Stub`提供了**单线程**和**多线程（默认）** 两个类型。有如下两种方式开启单线程。
++ 通过环境变量`GRPC_SINGLE_THREADED_UNARY_STREAM`是否存在。
++ 通过`Channel`对象参数`options`传递`(grpc.experimental.ChannelOptions.SingleThreadedUnaryStream, any)`。
+
+其中**操作集合**是：
+```python
+# 单线程模式，3 个 batch
+operations = (
+    (
+        cygrpc.SendInitialMetadataOperation(
+            augmented_metadata, initial_metadata_flags
+        ),
+        cygrpc.SendMessageOperation(serialized_request, _EMPTY_FLAGS),
+        cygrpc.SendCloseFromClientOperation(_EMPTY_FLAGS),
+    ),
+    (cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),),
+    (cygrpc.ReceiveInitialMetadataOperation(_EMPTY_FLAGS),),
+)
+# 多线程模式，2 个 batch
+operations = (
+   (
+       cygrpc.SendInitialMetadataOperation(
+           augmented_metadata, initial_metadata_flags
+       ),
+       cygrpc.SendMessageOperation(
+           serialized_request, _EMPTY_FLAGS
+       ),
+       cygrpc.SendCloseFromClientOperation(_EMPTY_FLAGS),
+       cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),
+   ),
+   (cygrpc.ReceiveInitialMetadataOperation(_EMPTY_FLAGS),),
+)
+```
+在服务端流式模式下，**客户端必须发一次请求**（发送`metadata`和`message`后关闭发送端），**服务端返回多条响应消息**（流式）和`trailing metadata + status`。
+客户端必须处理：
++ 一次发送请求（`metadata` + 请求消息 + 关闭）。
++ 一次接收初始`metadata`（`headers`）。
++ 多次接收响应消息（每条消息一个`ReceiveMessageOperation`）。
++ 一次接收最终状态（`status` + `trailing metadata`）。
+
+`_SingleThreadedRendezvous`和`_MultiThreadedRendezvous`的继承关系一致。
+```python
+class _SingleThreadedRendezvous(_Rendezvous, grpc.Call, grpc.Future)
+class _MultiThreadedRendezvous(_Rendezvous, grpc.Call, grpc.Future)
+```
+其中`_Rendezvous`类是迭代器，在`__next__`方法中实现流式操作，包括执行：
++ `cygrpc.ReceiveMessageOperation`操作读取一次消息。
++ `call.next_event`获取一次`batch`完成事件`event`（对于`segregated_call`调用。`intergrated_call`自动完成，不需要此步骤）。
+
+**客户端流式`channel.stream_unary`类型`Stub`工作原理**如下。
+
+![gRPC客户端流式Stub工作原理](./images/gRPC客户端Stub客户端流式原理.png)
+
+其中**操作集合**如下：
+```python
+options = (
+    (
+        cygrpc.SendInitialMetadataOperation(
+            metadata, initial_metadata_flags
+        ),
+        cygrpc.ReceiveMessageOperation(_EMPTY_FLAGS),
+        cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),
+    ),
+    (cygrpc.ReceiveInitialMetadataOperation(_EMPTY_FLAGS),),
+)
+```
+在客户端流式模式下，请求流程图总结如下：
+```bash
+Client                               Server
+────────────────────────────────────────────────────────
+SendInitialMetadata ──────────────▶ ReceiveInitialMetadata
+SendMessage(x1) ──────────────────▶
+SendMessage(x2) ──────────────────▶
+...                                ...
+SendCloseFromClient ─────────────▶
+                                   ▶ handle all requests
+ReceiveStatusOnClient ◀─────────── SendUnaryResponse
+```
+**双端流式`channel.stream_stream`类型`Stub`工作原理**结合客户端和服务端流式，原理如下。
+
+![gRPC客户端双端流式原理](./images/gRPC客户端双端流式原理.png)
+
+其中**操作集合如下**
+```python
+operations = (
+    (
+        cygrpc.SendInitialMetadataOperation(
+            augmented_metadata, initial_metadata_flags
+        ),
+        cygrpc.ReceiveStatusOnClientOperation(_EMPTY_FLAGS),
+    ),
+    (cygrpc.ReceiveInitialMetadataOperation(_EMPTY_FLAGS),),
+)
+```
+在双端流式模式下，请求流程图总结如下：
+```bash
+Client                          Server
+──────────────────────────────────────────────────────────
+SendInitialMetadata ───────▶ ReceiveInitialMetadata
+ReceiveInitialMetadata ◀───── SendInitialMetadata
+
+SendMessage(x1) ───────────▶ ReceiveMessage(x1)
+ReceiveMessage(y1) ◀──────── SendMessage(y1)
+
+SendMessage(x2) ───────────▶ ReceiveMessage(x2)
+ReceiveMessage(y2) ◀──────── SendMessage(y2)
+
+...                          ...
+
+SendCloseFromClient ───────▶
+                             ▶ SendMessage(last_y)
+ReceiveMessage(last_y) ◀────
+ReceiveStatusOnClient ◀───── SendStatusFromServer
+```
+因为`_MultiThreadedRendezvous`是一个迭代器，在`__next__`方法中，会执行以下：
++ `cygrpc.ReceiveMessageOperation`操作读取一次消息。
++ 等待一次消息接收完成。
+
+# 开发实践
