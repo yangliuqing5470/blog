@@ -412,7 +412,189 @@ Greeter client received: Hello number 2, jack!
 **同时实现加密传输和身份认证**，可以将两种凭据组合起来使用。
 
 ## SSL/TLS 认证
+使用**证书认证**的样例如下。证书认证有两种：
++ **服务端证书认证**：只有服务端提供证书认证，客户端验证服务端。
++ **双端证书认证**：服务端和客户端都提供证书认证，双端互相验证。
+
+**服务端**代码如下：
+```python
+class SimpleGreeter(helloworld_pb2_grpc.GreeterServicer):
+    def SayHello(self, request, unused_context):
+        return helloworld_pb2.HelloReply(message="Hello, %s!" % request.name)
+
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor())
+    helloworld_pb2_grpc.add_GreeterServicer_to_server(SimpleGreeter(), server)
+    # Loading credentials
+    server_credentials = grpc.ssl_server_credentials(
+        (
+            (
+                _credentials.SERVER_CERTIFICATE_KEY,
+                _credentials.SERVER_CERTIFICATE,
+            ),
+        )
+    )
+    # Pass down credentials
+    server.add_secure_port(_LISTEN_ADDRESS_TEMPLATE % _PORT, server_credentials)
+    server.start()
+    logging.info("Server is listening at port :%d", _PORT)
+    server.wait_for_termination()
+```
+其中生成**服务端证书认证**对象的函数`grpc.ssl_server_credentials`函数签名如下：
+```python
+def ssl_server_credentials(
+    private_key_certificate_chain_pairs,
+    root_certificates=None,
+    require_client_auth=False,
+)
+```
++ `private_key_certificate_chain_pairs`：可迭代对象，每个元素是`(private_key, cert_chain)`的字节串`tuple`。
+  ```bash
+  [
+      (b"-----BEGIN PRIVATE KEY-----\n...", b"-----BEGIN CERTIFICATE-----\n...")
+  ]
+  ```
+  其中`private_key`是服务端的私钥，`cert_chain`是服务端的证书或证书链。
++ `root_certificates`：用于**验证客户端**的根证书（`CA`证书）。启动**双端认证**需要这个参数。
++ `require_client_auth`：是否要求客户端提供证书进行**双向认证**，取值`True`表示客户端需要提供根证书。
+
+**客户端**代码如下：
+```python
+def send_rpc(stub):
+    request = helloworld_pb2.HelloRequest(name="you")
+    try:
+        response = stub.SayHello(request)
+    except grpc.RpcError as rpc_error:
+        _LOGGER.error("Received error: %s", rpc_error)
+        return rpc_error
+    else:
+        _LOGGER.info("Received message: %s", response)
+        return response
+
+
+def main():
+    # 证书对象
+    channel_credential = grpc.ssl_channel_credentials(
+        _credentials.ROOT_CERTIFICATE
+    )
+    with grpc.secure_channel(
+        _SERVER_ADDR_TEMPLATE % _PORT, channel_credential  # 通道认证
+    ) as channel:
+        stub = helloworld_pb2_grpc.GreeterStub(channel)
+        send_rpc(stub)
+```
+其中生成**通道认证**对象函数`grpc.ssl_channel_credentials`签名如下：
+```python
+def ssl_channel_credentials(
+    root_certificates=None, private_key=None, certificate_chain=None
+)
+```
++ `root_certificates`：一个`bytes`序列，表示根证书。用于验证服务端身份。
++ `private_key`：一个`bytes`序列，客户端私钥。用于双端身份验证。
++ `certificate_chain`：一个`bytes`序列，客户端证书链，用于双端身份验证。
 
 ## Token 认证
+基于`token`认证的一般流程如下：
++ 客户端侧生成`token`。
++ 客户端侧使用`token`构造请求发送给服务端，一般是`HTTP Authorization header`的一部分。
++ 大多数情况下，服务端侧使用拦截器`interceptor`验证`token`。
+
+**服务端**侧代码如下：
+```python
+class SignatureValidationInterceptor(grpc.ServerInterceptor):
+    def __init__(self):
+        def abort(ignored_request, context):
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid signature")
+        self._abort_handler = grpc.unary_unary_rpc_method_handler(abort)
+
+    def intercept_service(self, continuation, handler_call_details):
+        expected_metadata = ("authorization", "Bearer example_oauth2_token")
+        if expected_metadata in handler_call_details.invocation_metadata:
+            # Token 认证成功，执行对应的 handler
+            return continuation(handler_call_details)
+        else:
+            return self._abort_handler
+
+class SimpleGreeter(helloworld_pb2_grpc.GreeterServicer):
+    def SayHello(self, request, unused_context):
+        return helloworld_pb2.HelloReply(message="Hello, %s!" % request.name)
+
+
+@contextlib.contextmanager
+def run_server(port):
+    # Bind interceptor to server
+    server = grpc.server(
+        futures.ThreadPoolExecutor(),
+        interceptors=(SignatureValidationInterceptor(),),
+    )
+    helloworld_pb2_grpc.add_GreeterServicer_to_server(SimpleGreeter(), server)
+    # Loading credentials
+    server_credentials = grpc.ssl_server_credentials(
+        (
+            (
+                _credentials.SERVER_CERTIFICATE_KEY,
+                _credentials.SERVER_CERTIFICATE,
+            ),
+        )
+    )
+    # Pass down credentials
+    port = server.add_secure_port(
+        _LISTEN_ADDRESS_TEMPLATE % port, server_credentials
+    )
+    server.start()
+    try:
+        yield server, port
+    finally:
+        server.stop(0)
+
+
+def main():
+    with run_server("50051") as (server, port):
+        server.wait_for_termination()
+
+if __name__ == "__main__":
+    main()
+```
+上述的服务端代码使用了**通道认证**和 **`token`认证**。在拦截器`SignatureValidationInterceptor`里面验证每个请求的`token`。
+
+**客户端**侧代码如下：
+```python
+@contextlib.contextmanager
+def create_client_channel(addr):
+    # Call credential object will be invoked for every single RPC
+    call_credentials = grpc.access_token_call_credentials(
+        "example_oauth2_token"
+    )
+    # Channel credential will be valid for the entire channel
+    channel_credential = grpc.ssl_channel_credentials(
+        _credentials.ROOT_CERTIFICATE
+    )
+    # Combining channel credentials and call credentials together
+    composite_credentials = grpc.composite_channel_credentials(
+        channel_credential,
+        call_credentials,
+    )
+    channel = grpc.secure_channel(addr, composite_credentials)
+    yield channel
+
+def send_rpc(channel):
+    stub = helloworld_pb2_grpc.GreeterStub(channel)
+    request = helloworld_pb2.HelloRequest(name="you")
+    try:
+        response = stub.SayHello(request)
+    except grpc.RpcError as rpc_error:
+        return rpc_error
+    else:
+        return response
+
+def main():
+    with create_client_channel("localhost:50051") as channel:
+        send_rpc(channel)
+
+if __name__ == "__main__":
+    main()
+```
+客户端先生成`token`，然后组合`token`和证书认证作为`channel`的认证参数。在`channel`的底层实现中，会将`token`放在`header`中发送给服务端。
 
 ## 自定义认证
+自定义认证的实现逻辑和基于`token`认证基本一致。服务端通过拦截器`interceptor`实现验证，客户端生成自定义认证通过请求发送。
