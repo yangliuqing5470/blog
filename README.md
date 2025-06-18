@@ -57,6 +57,7 @@
 ## 问题记录
 - [线上因python进程池导致的内存泄漏](./programming/issues/ProcessPollLeak.md)
 - [redis模拟实现租约模式](./programming/issues/RedisKeyWithLease.md)
+- [基于devpi实现的pip包镜像缓存搭建](./programming/devpi/tutorial.md)
 
 # 工具篇
 ## 网络数据共享
