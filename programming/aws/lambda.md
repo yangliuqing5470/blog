@@ -1,0 +1,162 @@
+# Lambda 原理
+`AWS Lambda`是一个**事件驱动**的**无服务器计算服务**。只需要写函数代码，不用关心服务器、容器、操作系统等任何基础设施，`AWS Lambda`服务会按需自动运行并计费。
+与传统方式对比如下：
+|传统方式|`AWS Lambda`方式|
+|--------|----------------|
+|要预配置服务器（`EC2`）|`AWS`提供运行基础设施|
+|要部署应用、维护系统|只需上传代码函数|
+|为闲时也付费|按实际执行时间（毫秒级）计费|
+|难以水平扩展|`AWS`自动扩容，处理并发|
+
+`Lambda`的工作流程如下：
++ 上传`Lambda`函数代码。配置`execution roles`管理`Lambda`函数可以交互哪些`AWS`服务、使用`policy`配置哪些资源可以和`Lambda`函数交互。
++ 配置**触发源**触发`Lambda`函数。触发源包括：`S3`上传文件、`API Gateway`接口调用、`EventBridge`配置的定时器、`DynamoDB`表更新等。
++ 当事件发生时，`AWS Lambda`会使用指定的**语言运行时**启动一个**执行环境**（类似容器）、加载代码、执行代码、返回结果并冻结或关闭执行环境。
+
+## 编程模式
+**编程模式定义了代码如何与`AWS Lambda`交互的接口**。编程模式定义了如下的交互流程：
++ `Lambda`收到一个事件。
++ `Lambda`使用语言相关的运行时准备事件对象为指定语言可以使用的格式。
++ 运行时将格式化的`event`对象发送给`Lambda`函数。
++ `Lambda`函数处理事件。
+
+下面以`Python`语言详细说明编程模式。
+
+`Lambda`函数的**入口签名**如下：
+```python
+def lambda_handler(event, context):
+    pass
+```
+当`AWS Lambda`唤醒此`handler`，运行时传递两个参数`event`和`context`给此`handler`。
++ **`event`**：`Lambda event`一般是一个`JSON object`，例如：
+  ```json
+  {
+      "Order_id": "12345",
+      "Amount": 199.99,
+      "Item": "Wireless Headphones"
+  }
+  ```
+  `Python`语言**运行时**会将其转为一个`dict`对象。当然也可以传递其它`JSON`数据类型作为`Lambda event`，下表给出`Python`运行时的转化规则：
+    |`JSON`数据类型|`Python`数据类型|
+    |--------------|----------------|
+    |`object`|`dict`|
+    |`array`|`list`|
+    |`number`|`int`或`float`|
+    |`string`|`str`|
+    |`Boolean`|`bool`|
+    |`null`|`None`|
+  
+  需要注意不同的事件源产生的`lambda event`内容不同，对于`AWS`服务需要查略相关文档，或者在`Lambda`函数输出`event`内容并在`CloudWatch Log`里面查看。
++ **`context`**：一个实例对象（[对象定义](https://github.com/aws/aws-lambda-python-runtime-interface-client/blob/main/awslambdaric/lambda_context.py)），包含**函数唤醒信息**和**执行环境信息**。
+  例如获取唤醒请求的`id`：
+  ```python
+  request = context.aws_request_id
+  ```
+  一个`context`对象包含方法或属性详细说明参考[文档](https://docs.aws.amazon.com/lambda/latest/dg/python-context.html)，`context`对象可以用于监控目的。
+
+**`Lambda`函数名字**是`{file-name}.{handler-name}`格式，例如默认名字是`lambda_function.lambda_handler`。默认名字也可以更改。
+
+**`Lambda`函数可以有返回值**，返回值必须是`JSON`可序列化的。返回值类型有`dict`、`list`、`str`、`int`等。根据不同的`invocation type`，返回值的行为也不同：
++ 如果`invocation type`是`RequestResponse`且**同步**唤醒`Lambda`函数，则`AWS Lambda`返回结果到唤醒`Lambda`函数的客户端。`Lambda`运行时对返回结果会使用`JSON`序列化作为响应返回。
+  因为`Lambda`控制台使用`RequestResponse`类型，所以可以在控制台看到返回值。
++ 如果`Lambda`函数返回对象不能用`JSON`系列化，运行时会返回一个错误。
++ 如果`Lambda`函数返回`None`，运行时返回`null`。
++ 如果使用`Event`的`invocation type`（异步唤醒`Lambda`函数），返回值被运行时丢弃。
+
+例如`Lambda`函数返回值是：
+```json
+{
+  "statusCode": 200,
+  "message": "Receipt processed successfully"
+}
+```
+运行时会将其序列化，作为一个`JSON`字符串返回给唤醒此`Lambda`函数的客户端。
+
+## 执行环境
+**执行环境定义了`AWS Lambda`如何管理代码的运行时环境**。执行环境类似容器，是一个安全、隔离的环境。
+
+![Lambda执行环境](./images/执行环境.png)
+
+运行在执行环境中的**函数运行时**和每一个**外部拓展**都是**进程**。进程之间共享设置好的环境变量、权限、认证、资源等。
+**每一个执行环境都有一个`/tmp`本地目录可以被使用**。
+
+**执行环境的生命周期**分三个阶段：
+
+![执行环境生命周期](./images/执行环境生命周期.png)
+
++ **初始化**：启动所有的拓展、运行时初始化、`Lambda`函数初始化等。初始化阶段默认超时时间`10s`（排除`provisioned concurrency or SnapStart`）。
+  如果在`10s`内没有完成初始化阶段，`AWS Lambda`服务会使用配置的**函数超时时间重试初始化阶段**。
++ **调用**：`Lambda`函数配置的超时时间作用于整个调用阶段。例如函数配置的超时时间是`360s`，则`Lambda`函数和所有的拓展都必须在`360s`内完成。
+  **调用阶段就是执行`Lambda handler`方法的阶段**。如果调用阶段失败了，`AWS Lambda`服务会**重置执行环境**，如下图说明。
+  ![调用阶段失败](./images/调用阶段失败.png)
++ **关闭**：`AWS Lambda`服务会发送`SHUTDOWN`事件给每一个注册的**外部拓展**以及**运行时**。关闭阶段超时事件如下：
+  + `0ms`：`Lambda`函数没有注册拓展。
+  + `500ms`：`Lambda`函数注册了一个**内部拓展**。
+  + `2000ms`：`Lambda`函数注册了一个或多个**外部拓展**。
+
+  如果在超时事件内拓展或运行时没有完成，则`AWS Lambda`会发送一个`SIGKILL`信号结束进程。当`Lambda`函数和所有的拓展完成后，
+  `AWS Lambda`会**保留执行环境一段事件在内存，为了下次调用重用执行环境**。但每隔几个小时，会终止执行环境以更新运行时。
+
+执行环境的每个阶段都以`AWS Lambda`发送到**运行时和所有注册的扩展的事件开始**。运行时和每个扩展通过**发送`Next API`请求来指示完成**。
+当运行时和每个扩展完成且没有挂起的事件时，`AWS Lambda`会冻结执行环境。
+
+![执行环境各阶段交互](./images/执行环境各阶段交互流程.png)
+
+**当`AWS Lambda`服务收到一个请求调用`Lambda`函数时，`AWS Lambda`服务首先准备一个执行环境**。在执行环境初始化阶段会执行代码下载、
+启动执行环境、执行初始化代码、最后运行`Lambda handler`（调用阶段）。
+
+![冷启动和延时](./images/冷启动和延时.png)
+
+调用完成后，执行环境被冻结。`AWS Lambda`会保留执行环境一段时间，在此期间新的调用请求带来会更快执行。**不是每次执行完一个请求就终止执行环境，
+而是由`AWS Lambda`决定啥时候终止执行环境（一段时间内`Lambda`函数没有收到任何调用），也就是让执行环境进入`SHUTDOWN`阶段**。
+
+如果需要进一步控制**避免每次冷启动执行环境**，可以使用[预留并发功能](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html)，也就是在请求之前提起准备好执行环境。
+
+## Lambda layers
+`Lambda`层是包含补充代码或数据的`.zip`文件。层通常包含库依赖项、[自定义运行时系统](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-custom.html)或配置文件。
+
+![Lambda 层说明](./images/Lambda层说明.png)
+
+**对于`go`或`rust`编写的`Lambda`函数，不要使用`Lambda`层**。因为他们是编译后的可执行文件，依赖都打包进可执行文件，直接运行。
+如果把相关依赖放进层里，如`xxx.so`依赖放进层里，启动`lambda`动态加载依赖会比较慢。
+
+`AWS Lambda`在**创建执行环境**的时候会将层的内容提取到执行环境的`/opt`本地目录，`Lambda`函数可以直接访问此目录。
+**每个`Lambda`最多可以使用`5`层，并且层只能用于基于`.zip`部署的方式**。基于容器部署方式不使用层。
+
+每个层都有一个版本号，版本号不可更改，每次更新层，版本号会增加，旧层会保留除非手动删除。**层里面的依赖需要兼容`Amazon Linux`系统**
+
+对于`Python`运行时，`PATH`环境变量包含`/opt/python`和`python/lib/python3.x/site-packages`。所以**打包层文件结构**如下可以保证`Lambda`函数正确加载依赖（以`/opt/python`路径为例）：
+```bash
+python/              # Required top-level directory
+└── requests/
+└── boto3/
+└── numpy/
+└── (dependencies of the other packages)
+```
+之后可以[创建层](https://docs.aws.amazon.com/lambda/latest/dg/creating-deleting-layers.html#layers-create)和在`Lambda`函数中[添加层](https://docs.aws.amazon.com/lambda/latest/dg/adding-layers.html)。
+## Lambda extensions
+[拓展](https://aws.amazon.com/cn/blogs/aws/getting-started-with-using-your-favorite-operational-tools-on-aws-lambda-extensions-are-now-generally-available/)分为**外部拓展**和**内部拓展**。内部拓展在运行时进程内执行（作为一个子线程），可以理解为使用的`import`模块。**外部拓展作为独立的进程**被执行，这里只关注外部拓展。
+
+可以**使用`Lambda`层给`Lambda`函数添加拓展**。一个`Lambda`函数最多注册`10`个拓展。
+
+在执行环境的**初始化阶段**，`AWS Lambda`提取层中的文件到`/opt`目录，并在`/opt/extensions/`下查找拓展，每一个文件作为一个拓展（一个进程启动），多个拓展并行启动。
+
+当然也可以在**容器镜像使用拓展**。
+```bash
+FROM public.ecr.aws/lambda/python:3.11
+
+# Copy and install the app
+COPY /app /app
+WORKDIR /app
+RUN pip install -r requirements.txt
+
+# Add an extension from the local directory into /opt/extensions
+ADD my-extension.zip /opt/extensions
+CMD python ./my-function.py
+```
+
+可以**使用`Extensions API`和执行环境交互**。在执行环境初始化阶段（**具体`Extension init`阶段**），每一个拓展需要向`AWS Lambda`注册以接收事件。
+当拓展注册完后，`AWS Lambda`开始`Runtime init`阶段。运行时进程调用`functionInit`开始`Function init`阶段。
+当运行时和每个拓展完成后（初始化阶段完成）会给`AWS Lambda`发送`Next`请求。
+
+![初始化阶段和Lambda交互](./images/初始化阶段和Lambda交互.png)
