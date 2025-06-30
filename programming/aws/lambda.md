@@ -125,7 +125,7 @@ def lambda_handler(event, context):
 
 每个层都有一个版本号，版本号不可更改，每次更新层，版本号会增加，旧层会保留除非手动删除。**层里面的依赖需要兼容`Amazon Linux`系统**
 
-对于`Python`运行时，`PATH`环境变量包含`/opt/python`和`python/lib/python3.x/site-packages`。所以**打包层文件结构**如下可以保证`Lambda`函数正确加载依赖（以`/opt/python`路径为例）：
+对于`Python`运行时，`PATH`环境变量包含`/opt/python`和`opt/python/lib/python3.x/site-packages`。所以**打包层文件结构**如下可以保证`Lambda`函数正确加载依赖（以`/opt/python`路径为例）：
 ```bash
 python/              # Required top-level directory
 └── requests/
@@ -160,3 +160,182 @@ CMD python ./my-function.py
 当运行时和每个拓展完成后（初始化阶段完成）会给`AWS Lambda`发送`Next`请求。
 
 ![初始化阶段和Lambda交互](./images/初始化阶段和Lambda交互.png)
+
+在执行环境**调用阶段**，`AWS Lambda`发送`Invoke`事件给每一个注册的拓展（内部拓展或外部拓展）。外部拓展作为独立的进程运行。
+`Lambda`函数即使完成，也不影响外部拓展继续运行。**当运行时和所有的拓展发送`Next`请求表示结束时，调用阶段才结束**。
+
+![调用阶段和Lambda交互](./images/调用阶段和Lambda交互.png)
+
+`Invoke`事件内容样例如下：
+```bash
+{
+    "eventType": "INVOKE",
+    "deadlineMs": 676051,  # 函数超时时间
+    "requestId": "3da1f2dc-3222-475e-9205-e2e6c6318895",
+    "invokedFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:ExtensionTest",
+    "tracing": {
+        "type": "X-Amzn-Trace-Id",
+        "value": "Root=1-5f35ae12-0c0fec141ab77a00bc047aa2;Parent=2be948a625588e32;Sampled=1"
+    }
+ }
+```
+
+在执行环境**关闭阶段**（由`AWS Lambda`服务决定啥时候关闭，一般是等一段事件没有调用），`AWS Lambda`发送事件`SHUTDOWN`给每一个注册的**外部拓展**。
+拓展收到`SHUTDOWN`事件后可以做一些清理工作。
+
+![关闭阶段和`Lambda`交互](./images/关闭阶段和Lambda交互.png)
+
+`SHUTDOWN`事件内容样例如下：
+```bash
+
+{ 
+  "eventType": "SHUTDOWN", 
+  "shutdownReason": "reason for shutdown",
+  "deadlineMs": "the time and date that the function times out in Unix time milliseconds" 
+}        
+```
+**拓展和`Lambda`函数共享资源（`CPU`、内存、`/tmp`存储、`IAM`等。拓展和`Lambda`函数也在同一个执行环境，共享文件系统和网络命名空间等。
+拓展可以访问`Lambda`函数配置的环境变量（不是在运行时设置的）**，但排除下面的给运行时进程的环境变量：
++ `AWS_EXECUTION_ENV`、`AWS_LAMBDA_LOG_GROUP_NAME`、`AWS_LAMBDA_LOG_STREAM_NAME`
++ `AWS_XRAY_CONTEXT_MISSING`、`AWS_XRAY_DAEMON_ADDRESS`、`LAMBDA_RUNTIME_DIR`
++ `LAMBDA_TASK_ROOT`、`_AWS_XRAY_DAEMON_ADDRESS`、`_AWS_XRAY_DAEMON_PORT`、`_HANDLER`
+
+**拓展的日志也被输出到`CloudWatch Logs`**。
+
+拓展`API`样例模版（注册`API`）如下：
+```bash
+http://${AWS_LAMBDA_RUNTIME_API}/2020-01-01/extension/register
+```
+各个`Extension API`说明如下：
++ **`Register`**：用于拓展向`AWS Lambda`服务注册的`API`接口。
+  + `Path`：`/extension/register`
+  + `Method`：`POST`
+  + `Request headers`：请求头有如下两个。
+    + `Lambda-Extension-Name`：**必传**。拓展的名字，包含文件拓展名，`AWS Lambda`使用此名字运行。
+    + `Lambda-Extension-Accept-Feature`：**非必传**，逗号分割字符串。用于注册拓展时候启动某些可选功能。
+      ```bash
+      Lambda-Extension-Accept-Feature: accountId
+      ```
+      如果指定`accountId`，此`API`响应会包含`accountId`字段（账户`ID`）。
+  + `Request body`：`events`字段表示一个注册事件的数组。有效值包括`INVOKE`、`SHUTDOWN`。
+    ```bash
+    {
+        'events': [ 'INVOKE', 'SHUTDOWN']
+    }
+    ```
+  + `Response headers`：响应头`Lambda-Extension-Identifier`表示一个`uuid`值，用于后续的请求。
+  + `Response codes`：响应码取值有`200`（返回成功响应）、`400`（`Bad Request`）、`403`、`500`（服务错误，拓展应该退出）。
+    ```bash
+    # 成功响应体
+    {
+        "functionName": "helloWorld",
+        "functionVersion": "$LATEST",
+        "handler": "lambda_function.lambda_handler",
+        "accountId": "123456789012"  # 可选字段
+    }
+    ```
++ **`Next`**：拓展发送`Next`请求告诉`AWS Lambda`表示自己准备完成，可以接收下一个事件。
+  + `Path`：`/extension/event/next`
+  + `Method`：`GET`（不要设置请求超时时间，没有事件到来，拓展可能会被挂起）
+  + `Request headers`：请求头`Lambda-Extension-Identifier`取值为`Register`返回的`uuid`值。
+  + `Response headers`：响应头`Lambda-Extension-Event-Identifier`一个`uuid`值。
+  + `Response codes`：响应码的取值有`200`（表示返回包含事件`EventInvoke`或事件`EventShutdown`的信息）、`403`、`500`（服务错误，拓展应该退出）。
++ **`Init error`**：当扩展在初始化（`Init`阶段）过程中发生错误，向`AWS Lambda`上报以中止整个函数初始化过程。`AWS Lambda`会终止函数初始化，
+  `CloudWatch Logs`会记录错误日志，`Lambda`函数不会被调用。拓展收到此`API`响应应该退出。
+  + `Path`：`/extension/init/error`
+  + `Method`：`POST`
+  + `Request headers`：请求头的取值有如下。
+    + `Lambda-Extension-Identifier`：**必传**。取值为`Register`阶段返回的`uuid`值。
+    + `Lambda-Extension-Function-Error-Type`：**必传**。错误类型，一个字符串。
+  + `Request body`：请求体参数是一个`JSON`对象。
+    ```json
+    {
+          errorMessage: string (text description of the error),
+          errorType: string,
+          stackTrace: array of strings
+    }
+    ```
+  + `Response codes`：响应码取值有`200`、`400`、`403`、`500`。
++ **`Exit error`**：拓展在退出之前向`AWS Lambda`上报错误。`AWS Lambda`收到此请求后，后续的`API`请求都不会成功，`CloudWatch Logs`会记录错误日志。拓展收到此`API`响应应该退出。
+  + `Path`：`/extension/exit/error`
+  + `Method`：`POST`
+  + `Request headers`：请求头的取值有如下。
+    + `Lambda-Extension-Identifier`：**必传**。取值为`Register`阶段返回的`uuid`值。
+    + `Lambda-Extension-Function-Error-Type`：**必传**。错误类型，一个字符串。
+  + `Request body`：请求体参数是一个`JSON`对象。
+    ```json
+    {
+          errorMessage: string (text description of the error),
+          errorType: string,
+          stackTrace: array of strings
+    }
+    ```
+  + `Response codes`：响应码取值有`200`、`400`、`403`、`500`。
+
+拓展可以接收`AWS Lambda`的[遥测数据](https://docs.aws.amazon.com/lambda/latest/dg/telemetry-api.html)，遥测数据是系统自动生成、收集并传输的运行时信息，用于 监控、诊断、性能分析和行为追踪。
+
+# Lambda 实践
+## 权限配置
+`Lambda`的权限类别有两种：
++ `Lambda`函数访问其它`AWS`资源的权限。
++ 其它`AWS`用户或实体访问`Lambda`函数的权限。
+
+**[Execution role](https://docs.aws.amazon.com/lambda/latest/dg/lambda-intro-execution-role.html)**（用于`Lambda`函数访问其它`AWS`资源）。必须指定**受信任委托人**为`lambda.amazonaws.com`。
+有了`Execution role`后，在分配具体的`policy`（没有需要先创建好）给`Execution role`。最后将`Execution role`绑定到`Lambda`函数。
+
+**[Access permissions](https://docs.aws.amazon.com/lambda/latest/dg/permissions-granting-access.html)**（用于其它`AWS`用户或实体访问`Lambda`函数）。有三种类型。
++ **`identity-based policies`**：授予其它用户、用户组、角色操作`Lambda`函数的权限。
++ **`resource-based policies`**：授予其它账户、`AWS`服务操作`Lambda`函数的权限。若用户尝试访问`Lambda`函数资源，则`AWS Lambda`验证用户的`identity-based policy`和资源的`resource-based policy`。
+  当`AWS`服务访问`Lambda`函数，则`AWS Lambda`只会验证`resource-based policy`。
+
+  > 用户访问`Lambda`时，必须同时通过两道“门禁”：你有没有权限做这件事（身份策略）和 资源是否允许你来做这件事（资源策略）。
++ **`attribute-based access control (ABAC)`**：可将标签附加到`Lambda`函数，在某些`API`请求中传递它们。
+
+## 代码部署
+`Lambda`函数代码部署到`AWS`上有两种方式：
++ 基于`.zip`方式
++ 基于容器镜像方式
+
+**[基于容器镜像方式](https://docs.aws.amazon.com/lambda/latest/dg/python-image.html)** 有三种实现。`AWS`提供了包含特定语言环境的基础镜像、`AWS`提供的只有`OS`的基础镜像、自定义基础镜像。
+为了简单，下面样例使用`AWS`提供的包含语言基础镜像。
+
+`dockerfile`样例如下：
+```bash
+FROM public.ecr.aws/lambda/python:3.12
+
+# Copy requirements.txt
+COPY requirements.txt ${LAMBDA_TASK_ROOT}
+
+# Install the specified packages
+RUN pip install -r requirements.txt
+
+# Copy function code
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}
+
+# Set the CMD to your handler (could also be done as a parameter override outside of the Dockerfile)
+CMD [ "lambda_function.handler" ]
+```
+将镜像编译好后，需要**部署到`AWS`的容器镜像仓库**，参考官方文档。最后创建`Lambda`函数指定镜像`URI`。
+
+**[基于`.zip`方式](https://docs.aws.amazon.com/lambda/latest/dg/python-package.html)** 将`Lambda`函数代码和依赖都打包为一个`.zip`文件，并上传`AWS`。
+其中`.zip`包的结构如下：
+```bash
+my_deployment_package.zip
+|- bin
+|  |-jp.py
+|- boto3
+|  |-compat.py
+|  |-data
+|  |-docs
+...
+|- lambda_function.py
+```
+需要注意`.zip`解压后不能超过`250MB`，包括所有上传层的大小。`Lambda`运行时需要`644`权限操作非可执行文件，需要`755`权限操作目录和可执行文件。
+
+## 函数配置
++ 部署操作：[基于`.zip`函数](https://docs.aws.amazon.com/lambda/latest/dg/configuration-function-zip.html)和[基于容器镜像](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html)。
++ 其它配置：[内存，超时，环境变量等](https://docs.aws.amazon.com/lambda/latest/dg/lambda-functions.html)
+
+## 事件触发
++ `AWS`服务
++ `EventBridge`
