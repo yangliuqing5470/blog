@@ -250,9 +250,9 @@ http://${AWS_LAMBDA_RUNTIME_API}/2020-01-01/extension/register
   + `Request body`：请求体参数是一个`JSON`对象。
     ```json
     {
-          errorMessage: string (text description of the error),
-          errorType: string,
-          stackTrace: array of strings
+          "errorMessage": "string (text description of the error)",
+          "errorType": "string",
+          "stackTrace": "array of strings"
     }
     ```
   + `Response codes`：响应码取值有`200`、`400`、`403`、`500`。
@@ -265,9 +265,9 @@ http://${AWS_LAMBDA_RUNTIME_API}/2020-01-01/extension/register
   + `Request body`：请求体参数是一个`JSON`对象。
     ```json
     {
-          errorMessage: string (text description of the error),
-          errorType: string,
-          stackTrace: array of strings
+          "errorMessage": "string (text description of the error)",
+          "errorType": "string"",
+          "stackTrace": "array of strings"
     }
     ```
   + `Response codes`：响应码取值有`200`、`400`、`403`、`500`。
