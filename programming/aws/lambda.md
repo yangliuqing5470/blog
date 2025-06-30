@@ -266,7 +266,7 @@ http://${AWS_LAMBDA_RUNTIME_API}/2020-01-01/extension/register
     ```json
     {
           "errorMessage": "string (text description of the error)",
-          "errorType": "string"",
+          "errorType": "string",
           "stackTrace": "array of strings"
     }
     ```
